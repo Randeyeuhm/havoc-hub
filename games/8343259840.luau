@@ -85,7 +85,7 @@ local DEFAULTS = {
     -- not look mechanical. TeamCheck off by default (most lobbies are solo).
     Aimbot   = { Enabled = false, Mode = "Hold RMB", FOV = 100, Smoothness = 6,
                  TeamCheck = false, VisibleOnly = true, FOVCircle = true },
-    Weapons  = { RecoilPct = 100, AutoApply = false, LiveApply = false, Suppressor = true },
+    Weapons  = { RecoilPct = 100, AutoApply = false, LiveApply = true, Suppressor = true },
     Misc     = { Fullbright = false, AntiAFK = true },
 }
 
@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v33"
+local SCRIPT_VERSION = "crim-v34"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -2870,6 +2870,10 @@ local function buildMenu()
         function() return Config.Weapons.RecoilPct end,
         function(v)
             Config.Weapons.RecoilPct = v
+            if not Config.Weapons.LiveApply then
+                -- store-only mode: flip "Live apply" on (or press Apply LIVE now)
+                return
+            end
             task.spawn(function()
                 local applied, blocked = applyRecoil()
                 local guns = applyGunRecoil()
@@ -2922,11 +2926,15 @@ local function buildMenu()
         end, 5, 0, 200)
     toggle(p3, "Auto apply (re-cycle gun)", function() return Config.Weapons.AutoApply end,
         function(v) Config.Weapons.AutoApply = v end)
-    toggle(p3, "Live apply (patch + Z refresh)", function() return Config.Weapons.LiveApply end,
-        function(v) Config.Weapons.LiveApply = v end)
+    toggle(p3, "Live apply (slider)", function() return Config.Weapons.LiveApply end,
+        function(v)
+            Config.Weapons.LiveApply = v
+            -- applying the stored % right away when the toggle goes on
+            if v then task.spawn(function() pcall(liveApplyNow, false) end) end
+        end)
     toggle(p3, "Suppressor (live hipfire cancel)", function() return Config.Weapons.Suppressor ~= false end,
         function(v) Config.Weapons.Suppressor = v end)
-    button(p3, "Apply LIVE now (patch + Z)", function()
+    button(p3, "Apply LIVE now", function()
         task.spawn(function()
             liveApplyNow(true)
         end)
@@ -3282,9 +3290,9 @@ local function buildMenu()
             recycleGunNow(false)
         end)
     end)
-    note(p3, "How it works: aimed-in recoil scales instantly on the slider (in-memory patch). Hipfire is cancelled " ..
-        "at the render level (Suppressor). 'Apply %' cycles the gun manually; 'Auto apply' does it for you after " ..
-        "the slider settles. 'Apply LIVE now' + 'Scan live copy' are the diagnostic pair.")
+    note(p3, "Live apply = the slider itself scales recoil instantly in memory (hipfire + aimed), no drop/pick needed. " ..
+        "Turn it off to make the slider store-only. 'Apply LIVE now' applies the stored % on demand; 'Apply %' cycles " ..
+        "the gun; the Suppressor mops up any visible leftovers.")
 
     -- ---------------- Misc ----------------
     local p4 = pages[4]
