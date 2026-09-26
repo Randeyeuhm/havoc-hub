@@ -57,7 +57,7 @@ local Players     = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
 local ESP = {}
-ESP.VERSION = "esp-v5-class-lib"
+ESP.VERSION = "esp-v6-class-lib"
 
 -- ============================================================
 -- SCHEMA
@@ -269,6 +269,7 @@ end
 -- vehicle NPCs (heli/tank/car) have a PrimaryPart (Chassis) or loose parts.
 local function npcRoot(inst)
     local r = inst:FindFirstChild("HumanoidRootPart")
+        or inst:FindFirstChild("humanoid_root_part")  -- Deadline rigs
         or inst:FindFirstChild("Torso")
         or inst.PrimaryPart
         or inst:FindFirstChild("Chassis")
@@ -413,7 +414,7 @@ local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRo
 
     local root = npcRoot(model)
     if not root then hideData(d); return true end
-    local head = model:FindFirstChild("Head") or root
+    local head = model:FindFirstChild("Head") or model:FindFirstChild("head") or root
 
     local rootPos, visible = cam:WorldToViewportPoint(root.Position)
     if not visible or rootPos.Z <= 0 then hideData(d); return true end
@@ -678,7 +679,9 @@ function ESPClass:Render(cam)
     local viewportH = cam.ViewportSize.Y
     local fovTan = math.tan(math.rad(cam.FieldOfView) * 0.5)
     local localRoot = LocalPlayer.Character
-        and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        and (LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            or LocalPlayer.Character:FindFirstChild("humanoid_root_part")
+            or LocalPlayer.Character.PrimaryPart)
 
     local removals = nil
     for model, d in pairs(self.Objects) do

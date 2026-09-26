@@ -25,6 +25,12 @@
                           (1 - value) -> 0, L364600) + noise_position pinned
                           (Perlin wander L356645 -> L357037 / L357050) + idle
                           fidget animations disabled (timer L364609)
+      • Aimbot / ESP - built around the match rigs: characters live in
+          Workspace.characters as <UserId>-named models (custom rig: head /
+          humanoid_root_part / torso_hitbox / *_vis - no Humanoid). The game
+          sets them as the players' .Character, so names resolve through
+          GetPlayerFromCharacter; the shared esp.luau library got rig
+          fallbacks (humanoid_root_part / lowercase head).
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -86,7 +92,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v7"
+local SCRIPT_VERSION = "dl-v8"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -111,6 +117,16 @@ local DEFAULTS = {
         SteadyAim = false, -- arm stamina drains + breathing shake -> 0
         InfStamina = false,-- sprint / lean / jump / vault drains -> 0
         ZeroSway = false,  -- walk bob + look sway -> 0 (knob + live spring stubs)
+    },
+    -- Deadline rigs are custom (no Humanoid, no client-side team data): the
+    -- aimbot locks the head part, ESP derives boxes from humanoid_root_part.
+    Aimbot = {
+        Enabled = false, Mode = "Hold RMB", FOV = 100, Smoothness = 5,
+        VisibleOnly = true, FOVCircle = true,
+    },
+    ESP = {
+        Enabled = false, VisibleOnly = false, MaxDistance = 2500,
+        Health = false,  -- no client-readable remote health in this game
     },
 }
 
@@ -154,6 +170,11 @@ do
             end
         end
     end
+end
+
+-- A corrupted config can't leave the activation mode invalid.
+if Config.Aimbot.Mode ~= "Hold RMB" and Config.Aimbot.Mode ~= "Always" then
+    Config.Aimbot.Mode = "Hold RMB"
 end
 
 -- ============================================================
@@ -621,6 +642,162 @@ local function applyAll()
 end
 
 -- ============================================================
+-- PLAYER RIGS  (Workspace.characters/<UserId> - custom, no Humanoid)
+-- ============================================================
+local function characterFolder()
+    return workspace:FindFirstChild("characters")
+end
+
+local function rigRoot(model)
+    return model:FindFirstChild("humanoid_root_part")
+        or model:FindFirstChild("HumanoidRootPart")
+        or model.PrimaryPart
+end
+
+local function rigHead(model)
+    return model:FindFirstChild("head") or model:FindFirstChild("Head") or rigRoot(model)
+end
+
+-- Ray from the camera to a point, ignoring our own rig and the target.
+local function isVisible(targetModel, camPos, targetPos)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local ignore = { targetModel }
+    if LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
+    local cam = workspace.CurrentCamera
+    if cam then table.insert(ignore, cam) end
+    params.FilterDescendantsInstances = ignore
+    return workspace:Raycast(camPos, targetPos - camPos, params) == nil
+end
+
+-- Every other player's rig in the characters folder (self excluded by
+-- identity and by UserId name, so the local rig never shows up).
+local function eachEnemyRig(callback)
+    local folder = characterFolder()
+    if not folder then return end
+    local localChar = LocalPlayer.Character
+    local myName = tostring(LocalPlayer.UserId)
+    for _, model in ipairs(folder:GetChildren()) do
+        if model:IsA("Model") and model ~= localChar and model.Name ~= myName then
+            local root = rigRoot(model)
+            if root then
+                callback(model, root)
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- ESP  (host adapter over the shared esp.luau engine)
+-- ============================================================
+-- created lazily: esp.luau is loaded later in the file than this section
+local espRenderer = nil
+local function getEspRenderer()
+    if not espRenderer and ESPUI then
+        espRenderer = ESPUI.newRenderer(function() return Config.ESP end)
+    end
+    return espRenderer
+end
+
+local function renderESP(cam)
+    local renderer = getEspRenderer()
+    if not renderer then return end
+    if not Config.ESP.Enabled then
+        renderer:render({}, cam)
+        return
+    end
+    local camPos = cam.CFrame.Position
+    local targets = {}
+    eachEnemyRig(function(model, root)
+        local head = rigHead(model) or root
+        local pass = true
+        if Config.ESP.VisibleOnly then
+            local ok, visible = pcall(isVisible, model, camPos, head.Position)
+            pass = ok and visible
+        end
+        if pass then
+            table.insert(targets, { key = model, model = model })
+        end
+    end)
+    renderer:render(targets, cam, UserInputService:GetMouseLocation())
+end
+
+-- ============================================================
+-- AIMBOT  (camera lock - head parts of the character folder rigs)
+-- ============================================================
+local fovCircle = nil
+local fovDrawingBroken = false
+
+local function aimingActive()
+    if not Config.Aimbot.Enabled then return false end
+    if Config.Aimbot.Mode == "Always" then return true end
+    return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+end
+
+local function findAimTargetPos(cam, mouse)
+    local cfg = Config.Aimbot
+    local candidates = {}
+    eachEnemyRig(function(model, root)
+        local head = rigHead(model) or root
+        local targetPos = head.Position
+        local sp = cam:WorldToViewportPoint(targetPos)
+        if sp.Z > 0 then
+            local d = (Vector2.new(sp.X, sp.Y) - mouse).Magnitude
+            if d <= cfg.FOV then
+                table.insert(candidates, { pos = targetPos, model = model, dist = d })
+            end
+        end
+    end)
+    table.sort(candidates, function(a, b) return a.dist < b.dist end)
+    local camPos = cam.CFrame.Position
+    for _, c in ipairs(candidates) do
+        if not cfg.VisibleOnly then return c.pos end
+        local ok, visible = pcall(isVisible, c.model, camPos, c.pos)
+        if ok and visible then return c.pos end
+    end
+    return nil
+end
+
+local function updateAimbot(cam, mouse)
+    if not aimingActive() then return end
+    local targetPos = findAimTargetPos(cam, mouse)
+    if not targetPos then return end
+    local camCF = cam.CFrame
+    local goal = CFrame.lookAt(camCF.Position, targetPos)
+    local alpha = 1 / math.clamp(Config.Aimbot.Smoothness, 1, 10)
+    cam.CFrame = camCF:Lerp(goal, alpha)
+end
+
+local function updateFovCircle(mouse)
+    local show = Config.Aimbot.Enabled and Config.Aimbot.FOVCircle
+    if not show or fovDrawingBroken then
+        if fovCircle then fovCircle.Visible = false end
+        return
+    end
+    if not Drawing then fovDrawingBroken = true; return end
+    if not fovCircle then
+        local ok, circle = pcall(function()
+            local c = Drawing.new("Circle")
+            c.Filled = false
+            c.NumSides = 64
+            c.Thickness = 1
+            c.Color = Color3.fromRGB(255, 255, 255)
+            c.Transparency = 0.4
+            return c
+        end)
+        if not ok then
+            fovDrawingBroken = true
+            warn("[deadline] FOV circle failed: " .. tostring(circle))
+            return
+        end
+        fovCircle = circle
+    end
+    fovCircle.Position = mouse
+    fovCircle.Radius = Config.Aimbot.FOV
+    fovCircle.Visible = true
+end
+
+-- ============================================================
 -- UI LIBRARY (uilib.luau, fetched by the hub loader)
 -- ============================================================
 local function moduleSource(name)
@@ -654,6 +831,33 @@ do
         end
     else
         warn("[Havoc Hub] uilib.luau not loaded (" .. tostring(res) .. ") - settings menu will be skipped")
+    end
+end
+
+-- ============================================================
+-- ESP LIBRARY (esp.luau, fetched by the hub loader)
+-- ============================================================
+local ESP_FILE = "esp.luau"
+local ESPUI
+do
+    local ok, res = pcall(function()
+        local src = moduleSource(ESP_FILE)
+        if not src then error("no source (loader stash empty, no local file)") end
+        local chunk, compileErr = loadstring(src, "@" .. ESP_FILE)
+        if not chunk then error("compile error: " .. tostring(compileErr)) end
+        return chunk()
+    end)
+    if ok and type(res) == "table" then
+        ESPUI = res
+        ESPUI.fill(Config.ESP)
+        ESPUI.sanitize(Config.ESP)
+        if ESPUI.VERSION then
+            print("[deadline] esp " .. tostring(ESPUI.VERSION) .. " loaded")
+        else
+            warn("[deadline] esp.luau has no version marker - it is an OLD build; re-run the loader to update it")
+        end
+    else
+        warn("[Havoc Hub] esp.luau not loaded (" .. tostring(res) .. ") - ESP disabled")
     end
 end
 
@@ -744,6 +948,20 @@ local Hotkeys = {
       Action = function()
           if screenGui then screenGui.Enabled = not screenGui.Enabled end
       end },
+
+    { Id = "ToggleAimbot", Key = Enum.KeyCode.LeftAlt, Desc = "Toggle Aimbot", Enabled = true,
+      Action = function()
+          Config.Aimbot.Enabled = not Config.Aimbot.Enabled
+          refreshGUI(); saveConfig()
+          notify("Aimbot: " .. (Config.Aimbot.Enabled and "on" or "off"))
+      end },
+
+    { Id = "ToggleESP", Key = Enum.KeyCode.KeypadOne, Desc = "Toggle Player ESP", Enabled = true,
+      Action = function()
+          Config.ESP.Enabled = not Config.ESP.Enabled
+          refreshGUI(); saveConfig()
+          notify("Player ESP: " .. (Config.ESP.Enabled and "on" or "off"))
+      end },
 }
 
 local hotkeyById = {}
@@ -801,7 +1019,7 @@ local function buildMenu()
         subtitle = ("PlaceId %d  ·  %s"):format(game.PlaceId, SCRIPT_VERSION),
         size = UDim2.new(0, winW, 0, winH),
         position = UDim2.new(0, 30, 0, 40),
-        tabs = { "Weapons" },
+        tabs = { "Aimbot", "ESP", "Weapons" },
         controls = guiControls,
         footerHint = "RightShift - show / hide this menu",
         onClose = function()
@@ -809,7 +1027,9 @@ local function buildMenu()
             notify("Menu hidden - press RightShift to reopen")
         end,
     }
-    local p1 = win.tab(1)
+    local pa = win.tab(1)  -- Aimbot
+    local pe = win.tab(2)  -- ESP
+    local p1 = win.tab(3)  -- Weapons
 
     local builtCount = 0
     local function guard(what, fn)
@@ -839,6 +1059,143 @@ local function buildMenu()
         pcall(function() lbl = UILib.makeNote(page, text, "auto") end)
         return lbl
     end
+    local function bindrow(page, entry, opts)
+        guard("keybind row " .. tostring(entry and entry.Desc or "?"), function()
+            return UILib.makeKeybindRow(page, entry, opts)
+        end)
+    end
+    local function dropdown(page, label, getItems, getSelected, onSelect)
+        guard("dropdown " .. label, function()
+            return UILib.makeDropdown(page, label, getItems, getSelected, function(v)
+                print(("[deadline] %s = %s"):format(label, tostring(v)))
+                onSelect(v)
+            end, win.popupLayer)
+        end)
+    end
+    local function color(page, label, cfgTable, prefix)
+        guard("colour " .. label, function()
+            return UILib.makeColorPicker(page, label, cfgTable, prefix, saveConfig)
+        end)
+    end
+    local function multiselect(page, text, items, cfgTable, prefix)
+        guard("multiselect " .. text, function()
+            return UILib.makeMultiSelect(page, text, items,
+                function(item) return cfgTable[prefix .. item] == true end,
+                function(item, on) cfgTable[prefix .. item] = on end,
+                { overlayParent = win.popupLayer })
+        end)
+    end
+
+    -- ---------------- Aimbot ----------------
+    section(pa, "Aimbot")
+    toggle(pa, "Aimbot Enabled",
+        function() return Config.Aimbot.Enabled end,
+        function(v) Config.Aimbot.Enabled = v end,
+        hotkeyById.ToggleAimbot)
+    dropdown(pa, "Activation",
+        function() return { "Hold RMB", "Always" } end,
+        function() return Config.Aimbot.Mode end,
+        function(v)
+            Config.Aimbot.Mode = v
+            if v == "Always" then Config.Aimbot.Enabled = true end
+            saveConfig(); refreshGUI()
+        end)
+    slider(pa, "FOV Radius",
+        function() return Config.Aimbot.FOV end,
+        function(v) Config.Aimbot.FOV = v end, 5, 20, 600)
+    slider(pa, "Smoothness",
+        function() return Config.Aimbot.Smoothness end,
+        function(v) Config.Aimbot.Smoothness = v end, 1, 1, 10)
+    toggle(pa, "Show FOV Circle",
+        function() return Config.Aimbot.FOVCircle end,
+        function(v) Config.Aimbot.FOVCircle = v end)
+    toggle(pa, "Visible Check",
+        function() return Config.Aimbot.VisibleOnly end,
+        function(v) Config.Aimbot.VisibleOnly = v end)
+    bindrow(pa, hotkeyById.ToggleAimbot)
+
+    -- ---------------- ESP ----------------
+    section(pe, "Player ESP")
+    toggle(pe, "Player ESP",
+        function() return Config.ESP.Enabled end,
+        function(v) Config.ESP.Enabled = v end,
+        hotkeyById.ToggleESP)
+    bindrow(pe, hotkeyById.ToggleESP)
+    section(pe, "Targeting")
+    toggle(pe, "Visible Only",
+        function() return Config.ESP.VisibleOnly end,
+        function(v) Config.ESP.VisibleOnly = v end)
+    slider(pe, "Max Distance",
+        function() return Config.ESP.MaxDistance end,
+        function(v) Config.ESP.MaxDistance = v end, 100, 100, 10000)
+    section(pe, "Box")
+    toggle(pe, "Box",
+        function() return Config.ESP.Box end,
+        function(v) Config.ESP.Box = v end)
+    dropdown(pe, "Box style",
+        function() return { "Corner", "Full" } end,
+        function() return Config.ESP.BoxStyle end,
+        function(v) Config.ESP.BoxStyle = v end)
+    slider(pe, "Corner length",
+        function() return Config.ESP.BoxCornerLength end,
+        function(v) Config.ESP.BoxCornerLength = v end, 1, 0, 40)
+    slider(pe, "Box thickness",
+        function() return Config.ESP.BoxThickness end,
+        function(v) Config.ESP.BoxThickness = v end, 1, 1, 6)
+    slider(pe, "Box opacity",
+        function() return Config.ESP.BoxTransparency end,
+        function(v) Config.ESP.BoxTransparency = v end, 0.05, 0, 1)
+    color(pe, "Box colour", Config.ESP, "Box")
+    section(pe, "Name")
+    toggle(pe, "Name",
+        function() return Config.ESP.Name end,
+        function(v) Config.ESP.Name = v end)
+    dropdown(pe, "Source",
+        function() return { "Username", "DisplayName" } end,
+        function() return Config.ESP.NameSource end,
+        function(v) Config.ESP.NameSource = v end)
+    slider(pe, "Name size",
+        function() return Config.ESP.NameSize end,
+        function(v) Config.ESP.NameSize = v end, 1, 8, 24)
+    slider(pe, "Name opacity",
+        function() return Config.ESP.NameTransparency end,
+        function(v) Config.ESP.NameTransparency = v end, 0.05, 0, 1)
+    color(pe, "Name colour", Config.ESP, "Name")
+    section(pe, "Distance")
+    toggle(pe, "Distance",
+        function() return Config.ESP.Distance end,
+        function(v) Config.ESP.Distance = v end)
+    slider(pe, "Distance size",
+        function() return Config.ESP.DistanceSize end,
+        function(v) Config.ESP.DistanceSize = v end, 1, 8, 24)
+    slider(pe, "Distance opacity",
+        function() return Config.ESP.DistanceTransparency end,
+        function(v) Config.ESP.DistanceTransparency = v end, 0.05, 0, 1)
+    color(pe, "Distance colour", Config.ESP, "Distance")
+    section(pe, "Chams")
+    multiselect(pe, "Parts to highlight", { "Head", "Body" }, Config.ESP, "Chams")
+    toggle(pe, "Filled",
+        function() return Config.ESP.ChamsFilled ~= false end,
+        function(v) Config.ESP.ChamsFilled = v end)
+    slider(pe, "Fill opacity",
+        function() return Config.ESP.ChamsTransparency end,
+        function(v) Config.ESP.ChamsTransparency = v end, 0.05, 0, 1)
+    color(pe, "Chams colour", Config.ESP, "Chams")
+    section(pe, "Tracers")
+    toggle(pe, "Tracers",
+        function() return Config.ESP.Tracers end,
+        function(v) Config.ESP.Tracers = v end)
+    dropdown(pe, "Origin",
+        function() return { "Bottom", "Center" } end,
+        function() return Config.ESP.TracerOrigin end,
+        function(v) Config.ESP.TracerOrigin = v end)
+    slider(pe, "Tracer thickness",
+        function() return Config.ESP.TracerThickness end,
+        function(v) Config.ESP.TracerThickness = v end, 1, 1, 5)
+    slider(pe, "Tracer opacity",
+        function() return Config.ESP.TracerTransparency end,
+        function(v) Config.ESP.TracerTransparency = v end, 0.05, 0, 1)
+    color(pe, "Tracer colour", Config.ESP, "Tracer")
 
     -- ---------------- Weapons ----------------
     section(p1, "Recoil")
@@ -960,6 +1317,25 @@ if UILib and screenGui then
 end
 
 -- ============================================================
+-- RENDER LOOPS  (ESP frame + camera aim after the game's camera)
+-- ============================================================
+track(RunService.RenderStepped:Connect(function()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    pcall(renderESP, cam)
+    pcall(updateFovCircle, UserInputService:GetMouseLocation())
+end))
+
+-- The game's camera module rewrites Camera.CFrame every frame, so the
+-- aim lock binds at Camera priority + 1 (same slot Havoc's aimbot uses).
+RunService:BindToRenderStep("HavocHubDeadlineAim", Enum.RenderPriority.Camera.Value + 1, function()
+    if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    pcall(updateAimbot, cam, UserInputService:GetMouseLocation())
+end)
+
+-- ============================================================
 -- BOOT: apply saved state + keep it applied
 -- ============================================================
 task.spawn(function()
@@ -1003,7 +1379,7 @@ end)
 
 print(("[Havoc Hub] Deadline script loaded (%s, PlaceId %d)"):format(SCRIPT_VERSION, game.PlaceId))
 if RESOURCES_OK then
-    notify("Deadline loaded - Weapons tab ready. Test in the shooting range")
+    notify("Deadline loaded - aimbot, ESP and weapons ready")
 else
-    notify("Deadline loaded - BUT the weapon framework was not found (armed features disabled)")
+    notify("Deadline loaded - BUT the weapon framework was not found (weapon features disabled)")
 end
