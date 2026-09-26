@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v34"
+local SCRIPT_VERSION = "crim-v35"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -592,8 +592,11 @@ local function camShakeModule()
     return ok and mod or nil
 end
 
+-- when the Live apply toggle is OFF, every apply path restores originals
+local recoilForcePct = nil
+
 local function applyRecoil()
-    local pct = tonumber(Config.Weapons.RecoilPct) or 100
+    local pct = recoilForcePct or tonumber(Config.Weapons.RecoilPct) or 100
     local mod = camShakeModule()
     if mod then
         local ok, cfg = pcall(require, mod)
@@ -661,7 +664,7 @@ local function equippedToolConfig()
 end
 
 local function applyGunRecoil()
-    local pct = tonumber(Config.Weapons.RecoilPct) or 100
+    local pct = recoilForcePct or tonumber(Config.Weapons.RecoilPct) or 100
     local cfg = equippedToolConfig()
     if cfg then trackGunCfg(cfg) end
     local applied = 0
@@ -1066,7 +1069,8 @@ local function liveFcfApply(pct, announce)
             n += 1
         end
         if b and b.Redution ~= nil then
-            safeSetField(c.t, "RecoilRedution", math.clamp(1 - f, 0, 1))
+            local rv = (pct >= 100) and b.Redution or math.clamp(1 - f, 0, 1)
+            safeSetField(c.t, "RecoilRedution", rv)
         end
         if b and b.sprayT then
             if b.sX then safeSetField(b.sprayT, "AngleX", b.sX * f) end
@@ -2411,7 +2415,7 @@ local function rescaleAndPatch()
     pcall(applySnapshotPatches)
     pcall(applyAnchoredPatches)
     pcall(applyCandidates)
-    local pctNow = tonumber(Config.Weapons.RecoilPct) or 100
+    local pctNow = recoilForcePct or tonumber(Config.Weapons.RecoilPct) or 100
     pcall(function() applyRecoilCopy(pctNow) end)
     local nowT = tick()
     -- (old RCL install/rewire retired: the RCL vector proved decorative;
@@ -2900,7 +2904,7 @@ local function buildMenu()
                         end
                         if autoApply.busy then return end
                         autoApply.busy = true
-                        pcall(liveFcfApply, tonumber(Config.Weapons.RecoilPct) or 100, false)
+                        pcall(liveFcfApply, recoilForcePct or tonumber(Config.Weapons.RecoilPct) or 100, false)
                         pcall(recycleGunNow, true)
                         autoApply.busy = false
                     end)
@@ -2929,8 +2933,22 @@ local function buildMenu()
     toggle(p3, "Live apply (slider)", function() return Config.Weapons.LiveApply end,
         function(v)
             Config.Weapons.LiveApply = v
-            -- applying the stored % right away when the toggle goes on
-            if v then task.spawn(function() pcall(liveApplyNow, false) end) end
+            task.spawn(function()
+                if v then
+                    -- ON = the slider % (applied right away)
+                    recoilForcePct = nil
+                    pcall(liveApplyNow, false)
+                else
+                    -- OFF = normal, original game recoil
+                    recoilForcePct = 100
+                    pcall(applyRecoil)
+                    pcall(applyGunRecoil)
+                    pcall(liveFcfApply, 100, false)
+                    pcall(applyRecoilCopy, 100)
+                    pcall(scaleOneTool, LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool"))
+                    notify("Live apply OFF - original recoil restored")
+                end
+            end)
         end)
     toggle(p3, "Suppressor (live hipfire cancel)", function() return Config.Weapons.Suppressor ~= false end,
         function(v) Config.Weapons.Suppressor = v end)
@@ -3290,9 +3308,9 @@ local function buildMenu()
             recycleGunNow(false)
         end)
     end)
-    note(p3, "Live apply = the slider itself scales recoil instantly in memory (hipfire + aimed), no drop/pick needed. " ..
-        "Turn it off to make the slider store-only. 'Apply LIVE now' applies the stored % on demand; 'Apply %' cycles " ..
-        "the gun; the Suppressor mops up any visible leftovers.")
+    note(p3, "Live apply ON = the slider % is what the gun kicks with (live, hipfire + aimed). " ..
+        "OFF = the game's NORMAL recoil (originals restored instantly). 'Apply LIVE now' applies the stored % on " ..
+        "demand; 'Apply %' cycles the gun; the Suppressor mops up any visible leftovers.")
 
     -- ---------------- Misc ----------------
     local p4 = pages[4]
@@ -3443,6 +3461,8 @@ RunService:BindToRenderStep("HavocHubAimbot", Enum.RenderPriority.Camera.Value +
 end)
 
 -- Apply the saved state once on load.
+-- OFF means the game's normal recoil: force originals from the very first frame.
+if not Config.Weapons.LiveApply then recoilForcePct = 100 end
 if Config.Misc.Fullbright then pcall(setFullbright, true) end
 task.spawn(function()
     local applied = applyRecoil()
