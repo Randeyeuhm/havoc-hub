@@ -42,6 +42,7 @@ local UNIVERSES = {
     [2862098693] = 7336302630,  -- Havoc Project Delta (all of its places)
     [1202096104] = 3351674303,  -- Driving Empire (all of its places)
     [1494262959] = 8343259840,  -- Criminality (all of its places)
+    [4283416256] = 12144402492, -- Deadline (lobby + its match places)
 }
 
 local RAW_BASE = ("https://raw.githubusercontent.com/%s/%s/%s/"):format(USER, REPO, BRANCH)

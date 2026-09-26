@@ -42,6 +42,13 @@ Built against the game's decompiled source — vehicle physics run client-side:
 - **Visuals** — player ESP with the full customizer, fullbright
 - **Misc** — anti-AFK, reset character, rejoin server
 
+### Deadline — `games/12144402492.luau` (PlaceId 12144402492, GameId 4283416256)
+
+Built against the game's decompiled source — weapon handling runs client-side and reads its tunables live every shot:
+
+- **Weapons** — Recoil % slider (scales the game's global `plr_recoil` multiplier plus every recoil trait through its own debug-values table) and Spread % slider (`plr_barrel_deviation` / `plr_buck_barrel_deviation`) — 100% = vanilla, 0% = dead straight / zero kick. Applies and restores live, no hooks, no remotes
+- The whole Deadline universe (lobby + match places) loads this one script via the loader's universe map
+
 ### Universal — `games/universal.luau` (any other game)
 
 Generic toolkit for games without a dedicated script:
@@ -64,6 +71,7 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
 | `games/7336302630.luau` | Havoc Project Delta (game-specific suite) |
 | `games/3351674303.luau` | Driving Empire (vehicle performance, teleports, speedometer HUD) |
 | `games/8343259840.luau` | Criminality (recoil & spread toolkit) |
+| `games/12144402492.luau` | Deadline (live recoil & spread multipliers) |
 | `games/universal.luau` | Universal aimbot / ESP / utilities fallback |
 | `uilib.luau` | Shared UI toolkit — Project Delta-style window shell (dot header, drawn-X close, searchable left-rail tabs, footer), widgets, toasts, rebind capture, popup management |
 | `esp.luau` | One-file ESP library — Project Delta based engine (corner box, name/health/distance, highlights) + two-window customizer (preview + settings) used by every script |
@@ -77,6 +85,7 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
   - `havoc_hub/driving_empire_config.json` — Driving Empire (plus its race/ATM/requeue support files)
   - `havoc_hub/universal_hub_config.json` — the universal script
   - `havoc_hub/criminality_hub_config.json` — Criminality
+  - `havoc_hub/deadline_config.json` — Deadline
 - An existing loose config is moved into the folder automatically on the first run and the old file is cleaned up
 - Persists keybinds (including enabled/disabled state), feature toggles and values
 - To reset a script: delete its config file from `havoc_hub/` and re-execute
