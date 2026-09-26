@@ -18,11 +18,13 @@
           Zero Sight Sway - every passive sight mover -> 0: offset clamp knob
                           (plr_max_directional_distance, L356757-850) + live
                           viewmodel springs stubbed (camera_nonrelative =
-                          camera offset L356669) + walk/run/directional/swayLag
+                          camera offset L356669; camera = damage/suppress/land
+                          jolts L356698) + walk/run/directional/swayLag
                           SmoothValues stubbed (weave tracks L356919-931) +
                           holding_breath stub (breathing track weight *=
                           (1 - value) -> 0, L364600) + noise_position pinned
-                          (Perlin wander L356645 -> L357037 / L357050)
+                          (Perlin wander L356645 -> L357037 / L357050) + idle
+                          fidget animations disabled (timer L364609)
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -84,7 +86,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v6"
+local SCRIPT_VERSION = "dl-v7"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -392,6 +394,9 @@ end
 local STUB_SPRINGS = {
     "camera_nonrelative", "sideways_bobbing", "camera_idle_rotation",
     "sway", "slow_sway", "aim_sway",
+    -- event camera shakes (damage / suppression / landing): their velocity
+    -- feeds the viewmodel roll and camera_movement (L356698-700, L357052)
+    "camera",
 }
 
 -- SmoothValues sit earlier in the same pipeline: the walk/run ANIMATION
@@ -587,6 +592,19 @@ track(RunService.RenderStepped:Connect(function()
     for controller in pairs(BOB_STATE.saved) do
         if type(controller) == "table" then
             controller.noise_position = 0
+            -- the weapon plays a random idle FIDGET animation every 5-15s
+            -- (L364609-611 + univ_fidget_1-3 L359141) - keep its timer from
+            -- ever expiring and pin any fidget track weight to 0
+            local ft = controller.fidget_timer
+            if type(ft) == "table" then ft.timeout = 1e9 end
+            local weapon = controller.weapon
+            local tracks = weapon and weapon.tracks
+            if type(tracks) == "table" then
+                for _, trackName in ipairs({ "univ_fidget_1", "univ_fidget_2", "univ_fidget_3" }) do
+                    local tr = tracks[trackName]
+                    if type(tr) == "table" then tr.weight = 0 end
+                end
+            end
         end
     end
 end))
