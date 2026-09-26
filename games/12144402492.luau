@@ -22,6 +22,15 @@
                           feed_* belt sequence tracks. No knobs, no hooks -
                           covers every variant (reload / full / quick / miss
                           / _alt, and belt-fed feed_start-feed_end).
+          Zero Weight   - walk at weightless speed: the movement chain
+                          divides by (collective_weight / 10 + 1) (L371469,
+                          formula L381775); char_data.overrides.speed =
+                          weight/10 + 1 is written every frame to cancel it
+                          exactly - the game's own override channel (the
+                          weapon editor uses overrides.camera_mode /
+                          jump_multiplier). Live per loadout, works through
+                          respawns, no side effects on stamina / vault /
+                          camera stiffness.
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
                           (shake = (1 - arm_stamina/max) * shake_mult, L364597)
           Infinite Stam - sprint / lean / jump / vault drains -> 0
@@ -110,7 +119,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v16"
+local SCRIPT_VERSION = "dl-v17"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -134,6 +143,8 @@ local DEFAULTS = {
         ErgoSpeed = 1,     -- plr_ergonomics_multiplier             (x vanilla)
         ReloadSpeed = 2,   -- reload anim speed (x vanilla; live track time
                            -- injection - see FAST RELOAD section)
+        ZeroWeight = false,-- walk at weightless speed: overrides.speed =
+                           -- weight/10 + 1 cancels the weight divisor
         SteadyAim = false, -- arm stamina drains + breathing shake -> 0
         InfStamina = false,-- sprint / lean / jump / vault drains -> 0
         ZeroSway = false,  -- walk bob + look sway -> 0 (knob + live spring stubs)
@@ -792,14 +803,15 @@ local function injectTrackTime(tr, mult, dt)
 end
 
 -- fresh character = fresh controller + fresh tracks: pick them up shortly
--- after spawn (retries - the controller is built over the first seconds)
+-- after spawn (retries - the controller is built over the first seconds).
+-- Also keeps the Zero Weight controller cache warm.
 track(LocalPlayer.CharacterAdded:Connect(function()
-    if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 then return end
+    if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight then return end
     task.spawn(function()
         for _, d in ipairs({ 1, 2, 3 }) do
             task.wait(d)
             if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
-            if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 then return end
+            if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight then return end
             pcall(refreshControllerCache)
         end
     end)
@@ -822,6 +834,79 @@ track(RunService.RenderStepped:Connect(function(dt)
                 end
             end
         end
+    end
+end))
+
+-- ============================================================
+-- ZERO WEIGHT  (walk at weightless speed)
+-- ============================================================
+-- The movement chain (7v7 dump L371469) computes the walkspeed as
+--   get_walkspeed(pose, aiming, leaning, char_data.collective_weight)
+--   * stamina terms * plr_speed * timescale * char_data.overrides.speed
+-- and get_walkspeed = walkspeed_table[pose] / (collective_weight / 10 + 1)
+-- (L381775-381791; collective_weight = equip weights + plr_base_weight).
+-- The weight penalty is a clean divisor, so writing
+--   overrides.speed = collective_weight / 10 + 1
+-- every frame cancels it EXACTLY: the player moves as if the whole loadout
+-- had zero weight. overrides is the game's own channel (the weapon editor
+-- writes overrides.camera_mode / jump_multiplier / animation_speed), it is
+-- read live every frame, and the multiplier follows the CURRENT weight -
+-- respawns and loadout switches stay covered. Unlike zeroing the weight
+-- itself, stamina drain / vault times / camera stiffness keep their normal
+-- (weight-based) values.
+local ZW_STATE = genv.__HAVOC_DEADLINE_ZW
+if type(ZW_STATE) ~= "table" then
+    ZW_STATE = { saved = setmetatable({}, { __mode = "k" }) }
+    genv.__HAVOC_DEADLINE_ZW = ZW_STATE
+end
+if type(ZW_STATE.saved) ~= "table" then
+    ZW_STATE.saved = setmetatable({}, { __mode = "k" })
+end
+
+-- only ever touches the LOCAL controller: remote rigs rep the network.
+local function isLocalCharData(controller, cd)
+    if rawget(cd, "is_local") == true then return true end
+    local ch = rawget(controller, "character")
+    return type(ch) == "table" and rawget(ch, "instance") == LocalPlayer.Character
+end
+
+local function zeroWeightStep()
+    if not Config.Weapons.ZeroWeight then return end
+    for controller in pairs(CTRL_STATE.tracked) do
+        if type(controller) == "table" then
+            local cd = rawget(controller, "char_data")
+            if type(cd) == "table" and isLocalCharData(controller, cd) then
+                local ov = rawget(cd, "overrides")
+                if type(ov) == "table" then
+                    local w = tonumber(rawget(cd, "collective_weight")) or 0
+                    if w < 0 then w = 0 end
+                    if ZW_STATE.saved[controller] == nil then
+                        ZW_STATE.saved[controller] = { cd = cd, orig = ov.speed }
+                    end
+                    ov.speed = (w / 10) + 1
+                end
+            end
+        end
+    end
+end
+
+local function zeroWeightRestore()
+    for controller, entry in pairs(ZW_STATE.saved) do
+        local ov = entry.cd and entry.cd.overrides
+        if type(ov) == "table" then
+            pcall(function() ov.speed = entry.orig end)
+        end
+        ZW_STATE.saved[controller] = nil
+    end
+end
+
+local zwErrCount = 0
+track(RunService.RenderStepped:Connect(function()
+    if not Config.Weapons.ZeroWeight then return end
+    local ok, err = pcall(zeroWeightStep)
+    if not ok and zwErrCount < 3 then
+        zwErrCount = zwErrCount + 1
+        warn(("[deadline] zero weight step error (%d): %s"):format(zwErrCount, tostring(err)))
     end
 end))
 
@@ -1005,26 +1090,6 @@ local function getEspRenderer()
     return espRenderer
 end
 
--- Visible-only checks are raycasts (engine work). Cached per target for
--- 0.15 s - a rig's line-of-sight does not change 60 times per second.
-local espVisCache = {}
-local espVisSweep = 0
-local function visibleCached(model, camPos, targetPos)
-    local now = os.clock()
-    local c = espVisCache[model]
-    if c and (now - c.t) < 0.15 then return c.v end
-    local ok, v = pcall(isVisible, model, camPos, targetPos)
-    v = (ok and v) or false
-    espVisCache[model] = { t = now, v = v }
-    if (now - espVisSweep) > 5 then
-        espVisSweep = now
-        for m in pairs(espVisCache) do
-            if not m.Parent then espVisCache[m] = nil end
-        end
-    end
-    return v
-end
-
 local function renderESP(cam)
     local renderer = getEspRenderer()
     if not renderer then return end
@@ -1038,7 +1103,8 @@ local function renderESP(cam)
         local head = rigHead(model) or root
         local pass = true
         if Config.ESP.VisibleOnly then
-            pass = visibleCached(model, camPos, head.Position)
+            local ok, visible = pcall(isVisible, model, camPos, head.Position)
+            pass = ok and visible
         end
         if pass then
             table.insert(targets, { key = model, model = model })
@@ -1538,13 +1604,6 @@ local function buildMenu()
     slider(pe, "Max Distance",
         function() return Config.ESP.MaxDistance end,
         function(v) Config.ESP.MaxDistance = v end, 100, 100, 10000)
-    dropdown(pe, "Update rate",
-        function() return { "Max", "30 FPS", "20 FPS" } end,
-        function() return Config.ESP.Rate or "Max" end,
-        function(v)
-            Config.ESP.Rate = v
-            saveConfig()
-        end)
     section(pe, "Box")
     toggle(pe, "Box",
         function() return Config.ESP.Box end,
@@ -1667,6 +1726,26 @@ local function buildMenu()
             Config.Weapons.ReloadSpeed = v
             if v > 1 then queueControllerCache() end
         end, 0.25, 1, 3, function(v) return ("%g×"):format(v) end)
+    toggle(p1, "Zero Weight",
+        function() return Config.Weapons.ZeroWeight end,
+        function(v)
+            Config.Weapons.ZeroWeight = v
+            if v then
+                notify("Zero weight: you walk at weightless speed")
+                task.spawn(function()
+                    if not gcScanAvailable() then
+                        warn("[deadline] GC scan unavailable in this executor - zero weight can't find the controller")
+                        return
+                    end
+                    pcall(refreshControllerCache)
+                    pcall(zeroWeightStep)
+                end)
+            else
+                pcall(zeroWeightRestore)
+                notify("Weight restored - normal walk speed")
+            end
+            refreshStatus()
+        end)
 
     section(p1, "Stability")
     toggle(p1, "Steady Aim",
@@ -1732,8 +1811,10 @@ local function buildMenu()
         w.InfStamina = false
         w.ZeroSway = false
         w.NoDeaf = false
+        w.ZeroWeight = false
         pcall(unstubSwaySprings)
         pcall(applyNoDeaf, false)
+        pcall(zeroWeightRestore)
         applyAll()
         refreshGUI()
         refreshStatus()
@@ -1754,23 +1835,14 @@ end
 -- ============================================================
 -- RENDER LOOPS  (ESP frame + camera aim after the game's camera)
 -- ============================================================
--- ESP update-rate gate: "Max" draws every frame; the others subsample to
--- 30/20 updates per second. The drawings persist between updates, so a
--- lower rate only lowers the refresh rate - nothing gets hidden.
-local ESP_RATE_SKIP = { ["Max"] = 1, ["30 FPS"] = 2, ["20 FPS"] = 3 }
 local espRenderErrors = 0
-local espFrame = 0
 track(RunService.RenderStepped:Connect(function()
     local cam = workspace.CurrentCamera
     if not cam then return end
-    espFrame = espFrame + 1
-    local skip = ESP_RATE_SKIP[Config.ESP.Rate or "Max"] or 1
-    if skip == 1 or (espFrame % skip) == 0 or not Config.ESP.Enabled then
-        local ok, err = pcall(renderESP, cam)
-        if not ok and espRenderErrors < 6 then
-            espRenderErrors = espRenderErrors + 1
-            warn(("[deadline] ESP render error (%d): %s"):format(espRenderErrors, tostring(err)))
-        end
+    local ok, err = pcall(renderESP, cam)
+    if not ok and espRenderErrors < 6 then
+        espRenderErrors = espRenderErrors + 1
+        warn(("[deadline] ESP render error (%d): %s"):format(espRenderErrors, tostring(err)))
     end
     pcall(updateFovCircle, UserInputService:GetMouseLocation())
 end))
@@ -1801,6 +1873,15 @@ task.spawn(function()
     if (tonumber(Config.Weapons.ReloadSpeed) or 1) > 1 then
         task.spawn(function() pcall(refreshControllerCache) end)
     end
+    if Config.Weapons.ZeroWeight then
+        task.spawn(function()
+            pcall(refreshControllerCache)
+            pcall(zeroWeightStep)
+        end)
+    else
+        -- reconcile: an earlier run can leave overrides.speed boosted
+        pcall(zeroWeightRestore)
+    end
     if Config.Weapons.NoDeaf then
         pcall(applyNoDeaf, true)
     end
@@ -1815,9 +1896,10 @@ task.spawn(function()
         task.wait(0.5)
         local w = Config.Weapons
         if w.RecoilPct < 100 or w.SpreadPct < 100 or w.AimSpeed ~= 1 or w.SwitchSpeed ~= 1
-            or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina or w.ZeroSway then
+            or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina or w.ZeroSway or w.ZeroWeight then
             local ok, err = pcall(function()
                 applyAll()
+                zeroWeightStep()
                 refreshStatus()
             end)
             if not ok and not warned then
@@ -1838,9 +1920,9 @@ task.spawn(function()
         else
             swayScanTick = 0
         end
-        -- keep the reload-speed controller cache warm (new characters /
-        -- controllers that appeared after boot)
-        if (tonumber(w.ReloadSpeed) or 1) > 1 then
+        -- keep the reload-speed / zero-weight controller cache warm (new
+        -- characters / controllers that appeared after boot)
+        if (tonumber(w.ReloadSpeed) or 1) > 1 or w.ZeroWeight then
             reloadScanTick = reloadScanTick + 1
             if reloadScanTick >= 60 then
                 reloadScanTick = 0
