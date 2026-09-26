@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v31"
+local SCRIPT_VERSION = "crim-v32"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -990,8 +990,15 @@ local function liveFcfScan(announce)
         for i, s in ipairs(liveFcf.states) do
             if i > 3 then break end
             pcall(function()
+                local rc
+                if rcredTrace.armed[s.t] then
+                    -- behind __index now; reading it here would just log ourselves
+                    rc = rcredWant()
+                else
+                    rc = safeField(s.t, "rCRED")
+                end
                 print(("  state[%d] rCRED=%s keys: %s"):format(
-                    i, tostring(safeField(s.t, "rCRED")), tostring(liveFcf.stateKeys or "?")))
+                    i, tostring(rc), tostring(liveFcf.stateKeys or "?")))
             end)
         end
         notify(("Live copy scan: %d match(es), %d state table(s) - console has details"):format(count, #liveFcf.states))
@@ -3347,11 +3354,23 @@ task.spawn(function()
                 local ok = pcall(function()
                     cur.Event:Connect(function()
                         supp.lastShotAt = os.clock()
+                        supp.shots = (supp.shots or 0) + 1
                     end)
                 end)
                 if ok then supp.binds += 1 end
             end
         end)
+    end
+end)
+
+-- shot reporter: proves shooting registered during tracer tests (quiet otherwise)
+task.spawn(function()
+    while true do
+        task.wait(5)
+        if supp.shots and supp.shots > 0 then
+            print(("[criminality] suppressor: %d shot(s) seen in the last 5s"):format(supp.shots))
+            supp.shots = 0
+        end
     end
 end)
 
