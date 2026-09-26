@@ -57,7 +57,7 @@ local Players     = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
 local ESP = {}
-ESP.VERSION = "esp-v8-diag"
+ESP.VERSION = "esp-v9-perf"
 
 -- ============================================================
 -- RENDER DIAGNOSTICS
@@ -392,7 +392,12 @@ local function newText()
     return t
 end
 
+-- Hide every drawing of one target. The `_vis` flag short-circuits
+-- repeats: writing Visible=false on 12 objects for every off-screen rig at
+-- 60 Hz was a large chunk of the old per-frame cost.
 local function hideData(d)
+    if d._vis == false then return end
+    d._vis = false
     for i = 1, #LABEL_KEYS do
         local o = d[LABEL_KEYS[i]]
         if o then o.Visible = false end
@@ -445,7 +450,15 @@ end
 -- ============================================================
 -- PER-TARGET RENDER (one frame)
 -- ============================================================
-local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRoot)
+-- Positions update every frame, but only the fast-changing values: box
+-- line endpoints, label positions and tracer endpoints. Colours, sizes,
+-- transparency, thickness, texts, chams and TextBounds reads re-assert on
+-- every SLOW_EVERY-th frame (~10 Hz at 60 fps). Every Drawing property
+-- write and TextBounds read crosses the executor boundary - re-writing
+-- unchanged values at 60 Hz is what made big ESPs chug.
+local SLOW_EVERY = 6
+
+local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRoot, slow)
     if not model or not model.Parent then return false end
     if model == LocalPlayer.Character then
         RDIAG.localChar = RDIAG.localChar + 1
@@ -461,12 +474,17 @@ local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRo
         end
     end
 
-    local root = npcRoot(model)
+    -- Root part cached across frames (a rig's root never changes);
+    -- re-resolve only when the cache is stale or gone.
+    local root = d._root
+    if not (root and root.Parent == model) then
+        root = npcRoot(model)
+        d._root = root
+    end
     if not root then
         RDIAG.noRoot = RDIAG.noRoot + 1
         hideData(d); return true
     end
-    local head = model:FindFirstChild("Head") or model:FindFirstChild("head") or root
 
     local rootPos, visible = cam:WorldToViewportPoint(root.Position)
     if not visible or rootPos.Z <= 0 then
@@ -474,13 +492,13 @@ local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRo
         hideData(d); return true
     end
 
-    local distance = math.huge
+    local distance
     if localRoot then
         distance = (localRoot.Position - root.Position).Magnitude
     else
-        -- No local character root (dead / loading / custom rig): the old
-        -- code left distance = math.huge here, which hid EVERY model while
-        -- still tracking it ("0/132 visible"). Measure from the camera.
+        -- No local character root (dead / loading / custom rig): measure
+        -- from the camera instead of leaving distance = math.huge (which
+        -- used to silently hide EVERY model).
         RDIAG.noLocalRoot = RDIAG.noLocalRoot + 1
         distance = (cam.CFrame.Position - root.Position).Magnitude
     end
@@ -491,6 +509,16 @@ local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRo
     if distance > cap then
         RDIAG.tooFar = RDIAG.tooFar + 1
         hideData(d); return true
+    end
+
+    -- Hidden -> shown runs a full refresh immediately; afterwards the
+    -- static properties re-assert on the slow tick only.
+    local full = false
+    if d._vis ~= true then
+        d._vis = true
+        full = true
+    elseif slow then
+        full = true
     end
 
     -- Projection: Project Delta's fixed world-size box (4.5 x 6.5 studs)
@@ -508,14 +536,9 @@ local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRo
     -- (4 edge lines); d.color (host-set) tints the box + chams.
     if cfg.Box then
         local cornerLen = math.min(tonumber(cfg.BoxCornerLength) or 6, math.min(width, height) * 0.3)
-        local th = tonumber(cfg.BoxThickness) or 2
-        -- d.color (host-set, optional) tints the box + chams, e.g. the
-        -- friend / moderator colours; labels keep their own colours.
-        local color = d.color or rgb(cfg.BoxR, cfg.BoxG, cfg.BoxB)
-        local transp = drawT(cfg.BoxTransparency)
         local L = LINE_TEMPLATE
-        local full = cfg.BoxStyle == "Full"
-        if full then
+        local fullBox = cfg.BoxStyle == "Full"
+        if fullBox then
             L[1][2], L[1][3], L[1][4], L[1][5] = boxX, hBottom, boxX, boxY
             L[2][2], L[2][3], L[2][4], L[2][5] = boxX, boxY, hRight, boxY
             L[3][2], L[3][3], L[3][4], L[3][5] = hRight, boxY, hRight, hBottom
@@ -530,80 +553,140 @@ local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRo
             L[7][2], L[7][3], L[7][4], L[7][5] = hRight, hBottom, hRight, hBottom - cornerLen
             L[8][2], L[8][3], L[8][4], L[8][5] = hRight - cornerLen, hBottom, hRight, hBottom
         end
+        -- Per frame: only the segment endpoints move. Colour, opacity,
+        -- thickness and visibility are (re-)written on the slow tick only.
+        local color, transp, th
+        if full then
+            th = tonumber(cfg.BoxThickness) or 2
+            color = d.color or rgb(cfg.BoxR, cfg.BoxG, cfg.BoxB)
+            transp = drawT(cfg.BoxTransparency)
+        end
         for i = 1, 8 do
             local e = L[i]
             local line = d[e[1]]
             if line then
-                if full and (i == 4 or i == 5 or i == 7 or i == 8) then
-                    line.Visible = false
-                else
+                local used = (not fullBox) or not (i == 4 or i == 5 or i == 7 or i == 8)
+                if used then
                     line.From = Vector2.new(e[2], e[3])
                     line.To = Vector2.new(e[4], e[5])
-                    line.Color = color
-                    line.Transparency = transp
-                    line.Thickness = th
-                    line.Visible = true
+                    if full then
+                        line.Color = color
+                        line.Transparency = transp
+                        line.Thickness = th
+                    end
+                end
+                if full then
+                    line.Visible = used
                 end
             end
         end
-    else
+    elseif full then
         for i = 1, 8 do
             local line = d[LABEL_KEYS[i]]
             if line then line.Visible = false end
         end
     end
 
-    -- Chams (Highlight): the multi-select decides which part(s) get
-    -- highlighted - any combination; colour, opacity and filled are shared.
-    if cfg.ChamsHead == true then
-        applyCham(d, cfg, "HeadHighlight", "HavocESPHeadCham", head, head, d.color)
-    elseif d.HeadHighlight then
-        d.HeadHighlight.Enabled = false
-    end
-    if cfg.ChamsBody == true then
-        applyCham(d, cfg, "BodyHighlight", "HavocESPBodyCham", model, model, d.color)
-    elseif d.BodyHighlight then
-        d.BodyHighlight.Enabled = false
+    -- Chams (Highlight): slow tick only - enabling / disabling writes to
+    -- the Highlight are pointless while the settings stay put.
+    if full then
+        if cfg.ChamsHead == true then
+            local head = d._head
+            if not (head and head.Parent == model) then
+                head = model:FindFirstChild("Head") or model:FindFirstChild("head") or root
+                d._head = head
+            end
+            applyCham(d, cfg, "HeadHighlight", "HavocESPHeadCham", head, head, d.color)
+        elseif d.HeadHighlight then
+            d.HeadHighlight.Enabled = false
+        end
+        if cfg.ChamsBody == true then
+            applyCham(d, cfg, "BodyHighlight", "HavocESPBodyCham", model, model, d.color)
+        elseif d.BodyHighlight then
+            d.BodyHighlight.Enabled = false
+        end
     end
 
-    -- Name - above the box, like Project Delta.
+    -- Name - above the box, like Project Delta. Text / size / colour only
+    -- refresh on the slow tick; the cached half-width keeps the centring
+    -- from re-reading TextBounds (an expensive executor call) every frame.
     if cfg.Name and d.NameLabel then
         local l = d.NameLabel
-        l.Text = entityName(model, cfg.NameSource)
-        l.Size = tonumber(cfg.NameSize) or 13
-        l.Color = rgb(cfg.NameR, cfg.NameG, cfg.NameB)
-        l.Transparency = drawT(cfg.NameTransparency)
-        l.Position = Vector2.new(math.floor(screenX - l.TextBounds.X / 2), boxY - 20)
-        l.Visible = true
-    elseif d.NameLabel then
+        if full then
+            local txt = entityName(model, cfg.NameSource)
+            if d._nameText ~= txt then
+                d._nameText = txt
+                l.Text = txt
+                d._nameHalf = nil
+            end
+            local sz = tonumber(cfg.NameSize) or 13
+            if d._nameSize ~= sz then
+                d._nameSize = sz
+                l.Size = sz
+                d._nameHalf = nil
+            end
+            l.Color = rgb(cfg.NameR, cfg.NameG, cfg.NameB)
+            l.Transparency = drawT(cfg.NameTransparency)
+            l.Visible = true
+            if not d._nameHalf then d._nameHalf = l.TextBounds.X * 0.5 end
+        end
+        l.Position = Vector2.new(math.floor(screenX - (d._nameHalf or 0)), boxY - 20)
+    elseif full and d.NameLabel then
         d.NameLabel.Visible = false
     end
 
-    -- Distance - metres, below the box, like Project Delta.
+    -- Distance - metres, below the box, like Project Delta. The text only
+    -- changes per metre, so it is rebuilt on the slow tick.
     if cfg.Distance and d.DistanceLabel then
         local l = d.DistanceLabel
-        l.Text = ("%dm"):format(math.floor(distance))
-        l.Size = tonumber(cfg.DistanceSize) or 12
-        l.Color = rgb(cfg.DistanceR, cfg.DistanceG, cfg.DistanceB)
-        l.Transparency = drawT(cfg.DistanceTransparency)
-        l.Position = Vector2.new(math.floor(screenX - l.TextBounds.X / 2), hBottom + 2)
-        l.Visible = true
-    elseif d.DistanceLabel then
+        if full then
+            local txt = ("%dm"):format(math.floor(distance))
+            if d._distText ~= txt then
+                d._distText = txt
+                l.Text = txt
+                d._distHalf = nil
+            end
+            local sz = tonumber(cfg.DistanceSize) or 12
+            if d._distSize ~= sz then
+                d._distSize = sz
+                l.Size = sz
+                d._distHalf = nil
+            end
+            l.Color = rgb(cfg.DistanceR, cfg.DistanceG, cfg.DistanceB)
+            l.Transparency = drawT(cfg.DistanceTransparency)
+            l.Visible = true
+            if not d._distHalf then d._distHalf = l.TextBounds.X * 0.5 end
+        end
+        l.Position = Vector2.new(math.floor(screenX - (d._distHalf or 0)), hBottom + 2)
+    elseif full and d.DistanceLabel then
         d.DistanceLabel.Visible = false
     end
 
     -- Health - the number above the name, coloured by fraction.
     if cfg.Health and d.HealthLabel then
         local l = d.HealthLabel
-        local hp, maxHp = entityHealth(model)
-        local frac = (maxHp and maxHp > 0) and math.clamp(hp / maxHp, 0, 1) or 1
-        l.Text = tostring(math.floor(hp))
-        l.Size = tonumber(cfg.HealthSize) or 11
-        l.Color = ESP.healthColor(frac)
-        l.Transparency = drawT(cfg.HealthTransparency)
-        l.Position = Vector2.new(math.floor(screenX - l.TextBounds.X / 2), boxY - 30)
-        l.Visible = true
-    elseif d.HealthLabel then
+        if full then
+            local hp, maxHp = entityHealth(model)
+            local frac = (maxHp and maxHp > 0) and math.clamp(hp / maxHp, 0, 1) or 1
+            local txt = tostring(math.floor(hp))
+            if d._hpText ~= txt then
+                d._hpText = txt
+                l.Text = txt
+                d._hpHalf = nil
+            end
+            local sz = tonumber(cfg.HealthSize) or 11
+            if d._hpSize ~= sz then
+                d._hpSize = sz
+                l.Size = sz
+                d._hpHalf = nil
+            end
+            l.Color = ESP.healthColor(frac)
+            l.Transparency = drawT(cfg.HealthTransparency)
+            l.Visible = true
+            if not d._hpHalf then d._hpHalf = l.TextBounds.X * 0.5 end
+        end
+        l.Position = Vector2.new(math.floor(screenX - (d._hpHalf or 0)), boxY - 30)
+    elseif full and d.HealthLabel then
         d.HealthLabel.Visible = false
     end
 
@@ -615,11 +698,13 @@ local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRo
             local orgY = (cfg.TracerOrigin == "Center") and vpY * 0.5 or vpY
             t.From = Vector2.new(vpX * 0.5, orgY)
             t.To = Vector2.new(screenX, screenY)
-            t.Color = rgb(cfg.TracerR, cfg.TracerG, cfg.TracerB)
-            t.Transparency = drawT(cfg.TracerTransparency)
-            t.Thickness = tonumber(cfg.TracerThickness) or 1
-            t.Visible = true
-        else
+            if full then
+                t.Color = rgb(cfg.TracerR, cfg.TracerG, cfg.TracerB)
+                t.Transparency = drawT(cfg.TracerTransparency)
+                t.Thickness = tonumber(cfg.TracerThickness) or 1
+                t.Visible = true
+            end
+        elseif full then
             d.Tracer.Visible = false
         end
     end
@@ -747,9 +832,15 @@ function ESPClass:Render(cam)
     local fovTan = math.tan(math.rad(cam.FieldOfView) * 0.5)
     local localRoot = localCharRoot()
 
+    -- The slow tick (every SLOW_EVERY-th frame, ~10 Hz at 60 fps) re-writes
+    -- the static half of the ESP; every other frame only moves things.
+    local tick = (self.tick or 0) + 1
+    self.tick = tick
+    local slow = (tick % SLOW_EVERY) == 0
+
     local removals = nil
     for model, d in pairs(self.Objects) do
-        local ok, keep = pcall(renderOne, cfg, model, d, cam, maxDist, viewportH, fovTan, localRoot)
+        local ok, keep = pcall(renderOne, cfg, model, d, cam, maxDist, viewportH, fovTan, localRoot, slow)
         if not ok then
             -- Record instead of silently dropping the model: a persistent
             -- error used to create + destroy 12 drawings every frame, which

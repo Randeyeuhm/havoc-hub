@@ -110,7 +110,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v15"
+local SCRIPT_VERSION = "dl-v16"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1005,6 +1005,26 @@ local function getEspRenderer()
     return espRenderer
 end
 
+-- Visible-only checks are raycasts (engine work). Cached per target for
+-- 0.15 s - a rig's line-of-sight does not change 60 times per second.
+local espVisCache = {}
+local espVisSweep = 0
+local function visibleCached(model, camPos, targetPos)
+    local now = os.clock()
+    local c = espVisCache[model]
+    if c and (now - c.t) < 0.15 then return c.v end
+    local ok, v = pcall(isVisible, model, camPos, targetPos)
+    v = (ok and v) or false
+    espVisCache[model] = { t = now, v = v }
+    if (now - espVisSweep) > 5 then
+        espVisSweep = now
+        for m in pairs(espVisCache) do
+            if not m.Parent then espVisCache[m] = nil end
+        end
+    end
+    return v
+end
+
 local function renderESP(cam)
     local renderer = getEspRenderer()
     if not renderer then return end
@@ -1018,8 +1038,7 @@ local function renderESP(cam)
         local head = rigHead(model) or root
         local pass = true
         if Config.ESP.VisibleOnly then
-            local ok, visible = pcall(isVisible, model, camPos, head.Position)
-            pass = ok and visible
+            pass = visibleCached(model, camPos, head.Position)
         end
         if pass then
             table.insert(targets, { key = model, model = model })
@@ -1519,6 +1538,13 @@ local function buildMenu()
     slider(pe, "Max Distance",
         function() return Config.ESP.MaxDistance end,
         function(v) Config.ESP.MaxDistance = v end, 100, 100, 10000)
+    dropdown(pe, "Update rate",
+        function() return { "Max", "30 FPS", "20 FPS" } end,
+        function() return Config.ESP.Rate or "Max" end,
+        function(v)
+            Config.ESP.Rate = v
+            saveConfig()
+        end)
     section(pe, "Box")
     toggle(pe, "Box",
         function() return Config.ESP.Box end,
@@ -1728,14 +1754,23 @@ end
 -- ============================================================
 -- RENDER LOOPS  (ESP frame + camera aim after the game's camera)
 -- ============================================================
+-- ESP update-rate gate: "Max" draws every frame; the others subsample to
+-- 30/20 updates per second. The drawings persist between updates, so a
+-- lower rate only lowers the refresh rate - nothing gets hidden.
+local ESP_RATE_SKIP = { ["Max"] = 1, ["30 FPS"] = 2, ["20 FPS"] = 3 }
 local espRenderErrors = 0
+local espFrame = 0
 track(RunService.RenderStepped:Connect(function()
     local cam = workspace.CurrentCamera
     if not cam then return end
-    local ok, err = pcall(renderESP, cam)
-    if not ok and espRenderErrors < 6 then
-        espRenderErrors = espRenderErrors + 1
-        warn(("[deadline] ESP render error (%d): %s"):format(espRenderErrors, tostring(err)))
+    espFrame = espFrame + 1
+    local skip = ESP_RATE_SKIP[Config.ESP.Rate or "Max"] or 1
+    if skip == 1 or (espFrame % skip) == 0 or not Config.ESP.Enabled then
+        local ok, err = pcall(renderESP, cam)
+        if not ok and espRenderErrors < 6 then
+            espRenderErrors = espRenderErrors + 1
+            warn(("[deadline] ESP render error (%d): %s"):format(espRenderErrors, tostring(err)))
+        end
     end
     pcall(updateFovCircle, UserInputService:GetMouseLocation())
 end))
