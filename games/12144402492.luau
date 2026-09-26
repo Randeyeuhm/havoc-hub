@@ -15,6 +15,11 @@
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
                           (shake = (1 - arm_stamina/max) * shake_mult, L364597)
           Infinite Stam - sprint / lean / jump / vault drains -> 0
+          Zero Sight Sway - walk/run camera bob + look-sway -> 0: the game's
+                          offset clamp knob (plr_max_directional_distance,
+                          L356757-850) plus the live viewmodel springs stubbed
+                          (camera_nonrelative applies as the camera offset at
+                          L356669; springs are shove-driven - L340986)
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -75,7 +80,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v3"
+local SCRIPT_VERSION = "dl-v4"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -99,6 +104,7 @@ local DEFAULTS = {
         ErgoSpeed = 1,     -- plr_ergonomics_multiplier             (x vanilla)
         SteadyAim = false, -- arm stamina drains + breathing shake -> 0
         InfStamina = false,-- sprint / lean / jump / vault drains -> 0
+        ZeroSway = false,  -- walk bob + look sway -> 0 (knob + live spring stubs)
     },
 }
 
@@ -183,6 +189,8 @@ local MOD_KNOBS = {
     "plr_stamina_lean_drain",
     "plr_stamina_jump_drain",
     "plr_vault_stamina_drain",
+    "plr_max_directional_distance",
+    "plr_laser_max_directional_distance",
 }
 
 local SHARED_STATE, plrRecoil, plrBarrel, plrBuck
@@ -350,6 +358,148 @@ local function applyInfStamina()
     end
 end
 
+-- ============================================================
+-- ZERO SIGHT SWAY  (walk bob + look sway, no hooks)
+-- ============================================================
+-- Two live pieces, both written as data:
+--  1) the game's own offset clamp knob - plr_max_directional_distance
+--     (and the laser variant) caps the directional `unlocked` offset
+--     (L356757 -> L356770 -> clamp at L356847). 0 = the look/turn sway
+--     offset can never grow.
+--  2) the viewmodel/camera springs themselves. They are plain class
+--     instances shoved every frame (shove only adds to .velocity and
+--     update() returns .position - L340986/340993), so replacing them with
+--     an inert stub (update -> zero vector, shove -> nothing) freezes their
+--     output without touching any game function. The real springs are kept
+--     and swapped back exactly when the toggle goes off.
+-- The controller is found with a GC scan on a very specific signature
+-- (springs.camera_nonrelative/sideways_bobbing/sway + smooth_values
+-- .swayLagX + state_lerps.final_aim). Re-scans happen on respawn and every
+-- 30s while the toggle is on, so new characters stay covered.
+local BOB_STATE = genv.__HAVOC_DEADLINE_BOB
+if type(BOB_STATE) ~= "table" then
+    BOB_STATE = { saved = setmetatable({}, { __mode = "k" }) }
+    genv.__HAVOC_DEADLINE_BOB = BOB_STATE
+end
+if type(BOB_STATE.saved) ~= "table" then
+    BOB_STATE.saved = setmetatable({}, { __mode = "k" })
+end
+
+local STUB_SPRINGS = {
+    "camera_nonrelative", "sideways_bobbing", "camera_idle_rotation",
+    "sway", "slow_sway", "aim_sway",
+}
+
+local function swayStub(name)
+    BOB_STATE.stubs = BOB_STATE.stubs or {}
+    local s = BOB_STATE.stubs[name]
+    if s == nil then
+        s = {
+            position = Vector3.new(),
+            velocity = Vector3.new(),
+            target = Vector3.new(),
+            mass = 0.8, force = 40, damping = 6, speed = 1.9,
+            shove = function(_self, _v) end,
+            update = function(_self, _dt) return Vector3.new() end,
+        }
+        BOB_STATE.stubs[name] = s
+    end
+    return s
+end
+
+local function isDeadlineController(t)
+    if type(t) ~= "table" then return false end
+    local springs = rawget(t, "springs")
+    if type(springs) ~= "table" then return false end
+    local smooth = rawget(t, "smooth_values")
+    if type(smooth) ~= "table" then return false end
+    local lerps = rawget(t, "state_lerps")
+    if type(lerps) ~= "table" then return false end
+    return type(rawget(springs, "camera_nonrelative")) == "table"
+        and type(rawget(springs, "sideways_bobbing")) == "table"
+        and type(rawget(springs, "sway")) == "table"
+        and type(rawget(smooth, "swayLagX")) == "table"
+        and type(rawget(lerps, "final_aim")) == "table"
+end
+
+local function findControllers()
+    local out = {}
+    local fn = getgc
+    if type(fn) ~= "function" then return out end
+    local ok, list = pcall(fn, true)
+    if not ok then ok, list = pcall(fn) end
+    if not ok or type(list) ~= "table" then return out end
+    for i = 1, #list do
+        local v = list[i]
+        if isDeadlineController(v) then
+            table.insert(out, v)
+        end
+    end
+    return out
+end
+
+-- Knob side: 0 while on, originals while off. Cheap - runs on the heartbeat.
+local function applySwayKnobs()
+    if not RESOURCES_OK then return end
+    if Config.Weapons.ZeroSway then
+        setKnob("plr_max_directional_distance", 0)
+        setKnob("plr_laser_max_directional_distance", 0)
+    else
+        restoreKnob("plr_max_directional_distance")
+        restoreKnob("plr_laser_max_directional_distance")
+    end
+end
+
+-- Spring side: swap the live springs for inert stubs (scan = find controllers).
+local function stubSwaySprings(scan)
+    if not Config.Weapons.ZeroSway or not scan then return end
+    for _, controller in ipairs(findControllers()) do
+        local springs = rawget(controller, "springs")
+        local entry = BOB_STATE.saved[controller]
+        if entry == nil then
+            entry = {}
+            BOB_STATE.saved[controller] = entry
+        end
+        for _, name in ipairs(STUB_SPRINGS) do
+            local stub = swayStub(name)
+            local current = rawget(springs, name)
+            if current == stub then
+                -- already stubbed (re-execution) - keep
+            elseif current ~= nil then
+                if entry[name] == nil then entry[name] = current end
+                springs[name] = stub
+            end
+        end
+    end
+end
+
+local function unstubSwaySprings()
+    for controller, entry in pairs(BOB_STATE.saved) do
+        local springs = type(controller) == "table" and rawget(controller, "springs")
+        if type(springs) == "table" then
+            for name, orig in pairs(entry) do
+                if rawget(springs, name) == swayStub(name) then
+                    springs[name] = orig
+                end
+                if type(orig) == "table" then
+                    pcall(function()
+                        orig.velocity = Vector3.new()
+                        orig.position = Vector3.new()
+                    end)
+                end
+            end
+        end
+    end
+    BOB_STATE.saved = setmetatable({}, { __mode = "k" })
+end
+
+-- new characters get a fresh controller - restub it shortly after spawn
+track(LocalPlayer.CharacterAdded:Connect(function()
+    task.delay(2, function()
+        if Config.Weapons.ZeroSway then pcall(stubSwaySprings, true) end
+    end)
+end))
+
 -- Everything this script applies, in one idempotent pass. Safe to call on
 -- a heartbeat: untouched features just rewrite their originals.
 local function applyAll()
@@ -358,6 +508,7 @@ local function applyAll()
     applySpeedKnobs()
     applySteadyAim()
     applyInfStamina()
+    applySwayKnobs()
 end
 
 -- ============================================================
@@ -648,8 +799,27 @@ local function buildMenu()
             refreshStatus()
             notify(v and "Infinite stamina: sprint and lean forever" or "Infinite stamina off")
         end)
+    toggle(p1, "Zero Sight Sway",
+        function() return Config.Weapons.ZeroSway end,
+        function(v)
+            Config.Weapons.ZeroSway = v
+            if v then
+                applySwayKnobs()
+                task.spawn(function()
+                    local ok, err = pcall(stubSwaySprings, true)
+                    if not ok then warn("[deadline] sight sway scan failed: " .. tostring(err)) end
+                end)
+            else
+                pcall(unstubSwaySprings)
+                applySwayKnobs()
+            end
+            refreshStatus()
+            notify(v and "Sight sway zeroed - no walk bob, no look lag" or "Sight sway restored")
+        end)
     note(p1, "Steady Aim: aiming and holding breath never drain arm stamina, and the breathing shake stops - " ..
-        "your aim stays planted between shots. Infinite Stamina: sprinting and leaning never tire you out.")
+        "your aim stays planted between shots. Infinite Stamina: sprinting and leaning never tire you out. " ..
+        "Zero Sight Sway: no camera bob while walking and no gun lag when you turn or strafe - the sight stays " ..
+        "glued where you aim (restored exactly when switched off).")
 
     statusLabel = note(p1, "loading...")
 
@@ -667,6 +837,8 @@ local function buildMenu()
         w.ErgoSpeed = 1
         w.SteadyAim = false
         w.InfStamina = false
+        w.ZeroSway = false
+        pcall(unstubSwaySprings)
         applyAll()
         refreshGUI()
         refreshStatus()
@@ -690,16 +862,20 @@ end
 task.spawn(function()
     pcall(applyAll)
     refreshStatus()
+    if Config.Weapons.ZeroSway then
+        task.spawn(function() pcall(stubSwaySprings, true) end)
+    end
 
     -- Slow re-assert: shared state is rebroadcast by the game on some
     -- events (joins / match transitions), and any piece that is not at
     -- vanilla should survive that without user action.
     local warned = false
+    local swayScanTick = 0
     while genv.__HAVOC_DEADLINE_GEN == MY_GEN do
         task.wait(0.5)
         local w = Config.Weapons
         if w.RecoilPct < 100 or w.SpreadPct < 100 or w.AimSpeed ~= 1 or w.SwitchSpeed ~= 1
-            or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina then
+            or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina or w.ZeroSway then
             local ok, err = pcall(function()
                 applyAll()
                 refreshStatus()
@@ -708,6 +884,16 @@ task.spawn(function()
                 warned = true
                 warn("[deadline] re-apply failed: " .. tostring(err))
             end
+        end
+        -- keep fresh controllers covered (respawns) - light rescan every 30s
+        if w.ZeroSway then
+            swayScanTick = swayScanTick + 1
+            if swayScanTick >= 60 then
+                swayScanTick = 0
+                pcall(stubSwaySprings, true)
+            end
+        else
+            swayScanTick = 0
         end
     end
 end)

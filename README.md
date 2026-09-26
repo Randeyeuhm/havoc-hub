@@ -48,7 +48,7 @@ Built against the game's decompiled source — weapon handling runs client-side 
 
 - **Recoil / Spread** — Recoil % (scales the game's global `plr_recoil` multiplier plus every recoil trait through its own debug-values table) and Spread % (`plr_barrel_deviation` / `plr_buck_barrel_deviation`) — 100% = vanilla, 0% = dead straight / zero kick
 - **Speed** — Aim In Speed (`plr_viewmodel_state_transition_speed` — the gun raises, leans and crouches faster), Weapon Switch speed and Ergonomics multiplier (the stat behind lean / handling timings) — x1 = vanilla
-- **Stability** — Steady Aim (aiming and holding breath never drain arm stamina, breathing shake off) and Infinite Stamina (sprint / lean / jump / vault drains → 0)
+- **Stability** — Steady Aim (aiming and holding breath never drain arm stamina, breathing shake off), Infinite Stamina (sprint / lean / jump / vault drains → 0) and Zero Sight Sway (no camera bob while walking, no gun lag when turning — the sight stays glued; uses the game's offset limit plus its live viewmodel springs)
 - Everything applies and restores live — no hooks, no remotes, nothing sent to the server; lowered values re-assert themselves
 - The whole Deadline universe (lobby + match places) loads this one script via the loader's universe map
 
