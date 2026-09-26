@@ -28,7 +28,24 @@ local HttpService       = R.game:GetService("HttpService")
 local Camera            = R.workspace.CurrentCamera
 local LocalPlayer       = Players.LocalPlayer
 
-local CONFIG_FILE         = "havoc_delta_config.json"
+-- every persistent file lives in one folder instead of loose files in the
+-- executor workspace root (created if missing)
+local CONFIG_DIR          = "havoc_hub"
+local CONFIG_FILE         = CONFIG_DIR .. "/havoc_delta_config.json"
+local LEGACY_CONFIG_FILE  = "havoc_delta_config.json"
+pcall(function()
+    if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(CONFIG_DIR) then
+        makefolder(CONFIG_DIR)
+    end
+end)
+-- one-time move of the old loose config into the folder
+pcall(function()
+    if type(isfile) == "function" and type(readfile) == "function" and type(writefile) == "function"
+        and not isfile(CONFIG_FILE) and isfile(LEGACY_CONFIG_FILE) then
+        writefile(CONFIG_FILE, readfile(LEGACY_CONFIG_FILE))
+        if type(delfile) == "function" then pcall(delfile, LEGACY_CONFIG_FILE) end
+    end
+end)
 local DEFAULT_WALKSPEED   = 14
 local OMNISPRINT_MIN      = 0
 local OMNISPRINT_MAX      = 20

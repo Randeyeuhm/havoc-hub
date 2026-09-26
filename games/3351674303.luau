@@ -53,9 +53,27 @@ local function track(conn)
 end
 
 -- ============================================================
--- CONFIG  (persisted to driving_empire_config.json)
+-- CONFIG  (persisted to havoc_hub/driving_empire_config.json)
 -- ============================================================
-local CONFIG_FILE = "driving_empire_config.json"
+-- every persistent file lives in one folder instead of loose files in the
+-- executor workspace root (created if missing)
+local CONFIG_DIR = "havoc_hub"
+local CONFIG_FILE = CONFIG_DIR .. "/driving_empire_config.json"
+local REQUEUE_FILE = CONFIG_DIR .. "/driving_empire_requeue.txt"
+local LEGACY_CONFIG_FILE = "driving_empire_config.json"
+pcall(function()
+    if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(CONFIG_DIR) then
+        makefolder(CONFIG_DIR)
+    end
+end)
+-- one-time move of the old loose config into the folder
+pcall(function()
+    if type(isfile) == "function" and type(readfile) == "function" and type(writefile) == "function"
+        and not isfile(CONFIG_FILE) and isfile(LEGACY_CONFIG_FILE) then
+        writefile(CONFIG_FILE, readfile(LEGACY_CONFIG_FILE))
+        if type(delfile) == "function" then pcall(delfile, LEGACY_CONFIG_FILE) end
+    end
+end)
 
 local DEFAULTS = {
     Vehicle  = { SpeedMult = 1, TorqueMult = 1, GripMult = 1, SteerMult = 1, BrakeMult = 1, InfNitro = false, NoSpeedCap = false, InstantShift = true },
@@ -1258,7 +1276,7 @@ end
 -- the server's FinalTime the difference is the exact compensation to apply
 -- on the next run (ping + server processing + the client's detect tick).
 -- ============================================================
-local RACE_EXACT_FILE = "driving_empire_race_exact.json"
+local RACE_EXACT_FILE = CONFIG_DIR .. "/driving_empire_race_exact.json"
 
 local function raceExactSave()
     if type(writefile) ~= "function" then return end
@@ -1867,7 +1885,7 @@ local function queueJoinNow()
         elseif not pok then
             notify("Queue join error - see console")
         elseif v1 == true then
-            pcall(function() if isfile("driving_empire_requeue.txt") then delfile("driving_empire_requeue.txt") end end)
+            pcall(function() if isfile(REQUEUE_FILE) then delfile(REQUEUE_FILE) end end)
             notify(("Queued for %s - waiting for the race"):format(tostring(track)))
         else
             notify(("Queue refused: %s"):format(tostring(v2 or v1)))
@@ -1926,7 +1944,7 @@ task.spawn(function()
                 -- place re-execs this script (teleport persistence) and
                 -- picks the flag up to keep the farm looping
                 pcall(function()
-                    writefile("driving_empire_requeue.txt", ("%s|%d"):format(tostring(farmRace.lastTrack or "Circuit"), os.time()))
+                    writefile(REQUEUE_FILE, ("%s|%d"):format(tostring(farmRace.lastTrack or "Circuit"), os.time()))
                 end)
             end
             if Config.Race.AutoRequeue and farmRace.pendingAt and not raceBusy
@@ -2026,15 +2044,15 @@ end
 -- A race ended before we got teleported out? The requeue flag carries that
 -- across the place hop - pick it up and continue the farm loop here.
 pcall(function()
-    if isfile("driving_empire_requeue.txt") then
-        local data = readfile("driving_empire_requeue.txt")
+    if isfile(REQUEUE_FILE) then
+        local data = readfile(REQUEUE_FILE)
         local track, at = tostring(data):match("^(.-)|(%d+)$")
         if track and at and (os.time() - tonumber(at)) < 900 and Config.Race.AutoRequeue then
             farmRace.lastTrack = track
             farmRace.pendingAt = os.clock() + 8
             notify(("Race auto-farm: continuing the loop - re-queuing %s"):format(track))
         end
-        delfile("driving_empire_requeue.txt")
+        delfile(REQUEUE_FILE)
     end
 end)
 
@@ -2550,7 +2568,7 @@ end)
 -- workspace:RequestStreamAroundAsync() - so finding an ATM no longer
 -- depends on where the player stands.
 
-local ATM_INDEX_FILE = "driving_empire_atm_index.json"
+local ATM_INDEX_FILE = CONFIG_DIR .. "/driving_empire_atm_index.json"
 local ATM_SITE_COOLDOWN = 150   -- empty site recheck delay
 local ATM_SITE_WAIT = 4         -- a site gets this long for its stream to deliver an ATM
 

@@ -17,7 +17,7 @@ Adding support for a new game is just dropping a `<PlaceId>.luau` file into `gam
 loadstring(game:HttpGet("https://raw.githubusercontent.com/Randeyeuhm/havoc-project-delta/main/loader.luau"))()
 ```
 
-Everything runs through `loadstring` — the loader fetches the matching script plus the shared modules (`uilib.luau` and `esp.luau`) and loads them straight into memory. Nothing is copied into your executor's workspace; only your config files are written there.
+Everything runs through `loadstring` — the loader fetches the matching script plus the shared modules (`uilib.luau` and `esp.luau`) and loads them straight into memory. Nothing is copied into your executor's workspace; only your config files are written there — all inside a single `havoc_hub/` folder.
 
 ## Games
 
@@ -63,6 +63,7 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
 | `loader.luau` | Hub loader — picks by PlaceId, fetches modules, runs everything via loadstring |
 | `games/7336302630.luau` | Havoc Project Delta (game-specific suite) |
 | `games/3351674303.luau` | Driving Empire (vehicle performance, teleports, speedometer HUD) |
+| `games/8343259840.luau` | Criminality (recoil & spread toolkit) |
 | `games/universal.luau` | Universal aimbot / ESP / utilities fallback |
 | `uilib.luau` | Shared UI toolkit — Project Delta-style window shell (dot header, drawn-X close, searchable left-rail tabs, footer), widgets, toasts, rebind capture, popup management |
 | `esp.luau` | One-file ESP library — Project Delta based engine (corner box, name/health/distance, highlights) + two-window customizer (preview + settings) used by every script |
@@ -71,9 +72,14 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
 
 ## Configuration
 
-- Havoc saves to `havoc_delta_config.json`, Driving Empire to `driving_empire_config.json` and the universal script to `universal_hub_config.json` — the only files the hub writes to the executor workspace
+- All persistent files live in one `havoc_hub/` folder (created automatically) instead of loose files cluttering the executor workspace root:
+  - `havoc_hub/havoc_delta_config.json` — Havoc Project Delta
+  - `havoc_hub/driving_empire_config.json` — Driving Empire (plus its race/ATM/requeue support files)
+  - `havoc_hub/universal_hub_config.json` — the universal script
+  - `havoc_hub/criminality_hub_config.json` — Criminality
+- An existing loose config is moved into the folder automatically on the first run and the old file is cleaned up
 - Persists keybinds (including enabled/disabled state), feature toggles and values
-- To reset a script: delete its config file from the workspace folder and re-execute
+- To reset a script: delete its config file from `havoc_hub/` and re-execute
 
 ## Disclaimer
 

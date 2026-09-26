@@ -1,5 +1,5 @@
 --[[
-    STRUCTURE DUMPER v8 — single file, no runtime hooks
+    STRUCTURE DUMPER v9 — single file, no runtime hooks
     One file with: game info, all decompiled scripts, full tree,
     every attribute, every ValueBase, remotes/bindables, assets,
     tags and game UI.
@@ -12,6 +12,10 @@
     real for the first time and the dump can take a while; it used to print
     nothing until the end and look frozen. Also skips identical sources
     (the same gun script replicated for every player) to keep it smaller.
+    v9: skips Luau-in-Luau (/ReplicatedStorage/data/luau_in_luau/LuauInLuau)
+    — its embedded VM is far too big for the decompiler/compiler (the dump
+    used to die at "[script 557]") and it is useless for feature work; the
+    skip lists at the top of the file are editable.
     Potassium-friendly.
 ]]
 
@@ -43,6 +47,13 @@ local DEFAULT_CLIENT_UI = {
 
 -- Character scripts every Roblox game ships (Animate/Health)
 local SKIP_DEFAULT_SCRIPTS = { Animate = true, Health = true }
+
+-- Scripts we never decompile: embedded runtimes (Luau-in-Luau) are too big
+-- for the decompiler/compiler and not useful for feature work. Extend
+-- SKIP_SCRIPT_NAMES for exact names, SKIP_SCRIPT_PATH_PARTS for any path
+-- substring (plain string match, not a Lua pattern).
+local SKIP_SCRIPT_NAMES = { LuauInLuau = true }
+local SKIP_SCRIPT_PATH_PARTS = { "luau_in_luau" }
 
 -- Everything we want script source from.
 -- v7 FIX: the game RENAMES services (the Workspace root literally prints as
@@ -214,7 +225,7 @@ local function flushDump()
 
     local parts = {
         string.rep("=", 66) .. "\n",
-        "HAVOC STRUCTURE DUMP v8 — single file\n",
+        "HAVOC STRUCTURE DUMP v9 — single file\n",
         ("Generated: %s\n"):format(os.date("%Y-%m-%d %H:%M:%S")),
         ("Payload:   %.1f KB across %d sections\n"):format(total / 1024, #sections),
         string.rep("=", 66) .. "\n\n",
@@ -336,6 +347,19 @@ local function dumpScript(inst, path)
     if not SCRIPT_CLASSES[inst.ClassName] then return end
     if isDefaultCharScript(inst) then
         scriptSkipped = scriptSkipped + 1
+        return
+    end
+    -- skip-listed giant scripts BEFORE the decompiler ever touches them
+    local skipPath = false
+    for _, part in ipairs(SKIP_SCRIPT_PATH_PARTS) do
+        if string.find(path, part, 1, true) then
+            skipPath = true
+            break
+        end
+    end
+    if SKIP_SCRIPT_NAMES[inst.Name] or skipPath then
+        scriptSkipped = scriptSkipped + 1
+        table.insert(scriptIndex, string.format("[SKIP ] %s  (skip-listed: too big / not needed)", path))
         return
     end
     scriptCount = scriptCount + 1
@@ -474,7 +498,7 @@ end
 -- ============================================================
 -- MAIN
 -- ============================================================
-print("===== DUMPER v8 START =====")
+print("===== DUMPER v9 START =====")
 local startTime = tick()
 
 local services = game:GetChildren()
@@ -553,7 +577,7 @@ end
 -- ============================================================
 do
     local lines = {}
-    table.insert(lines, "# Structure Summary (v8 — single file)")
+    table.insert(lines, "# Structure Summary (v9 — single file)")
     table.insert(lines, "")
     table.insert(lines, ("Generated:  %s"):format(os.date("%Y-%m-%d %H:%M:%S")))
     table.insert(lines, ("Elapsed:    %.1fs"):format(tick() - startTime))
