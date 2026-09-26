@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v38"
+local SCRIPT_VERSION = "crim-v39"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -2491,6 +2491,23 @@ local function scaleOneTool(tool)
         if mod then trackGunCfg(require(mod)) end
     end)
     pcall(applyGunRecoil)
+    -- No Spread: zero the spread family on the tool config BEFORE the gun
+    -- module snapshots it, so fresh loads start with dead-straight bullets
+    if Config.Weapons.NoSpread then
+        pcall(function()
+            local mod = tool:FindFirstChild("Config")
+            if not mod then return end
+            local cfg = require(mod)
+            if type(cfg) ~= "table" then return end
+            for _, key in ipairs({ "Spread", "WalkSpreadIncrease", "CrossExpansion" }) do
+                if type(safeField(cfg, key)) == "number" then pcall(function() cfg[key] = 0 end) end
+            end
+            local sni = safeField(cfg, "SniperSettings")
+            if type(sni) == "table" and type(safeField(sni, "WalkSpread")) == "number" then
+                pcall(function() sni.WalkSpread = 0 end)
+            end
+        end)
+    end
 end
 
 local function watchBackpackForRecoil(bp)
@@ -2947,7 +2964,12 @@ local function buildMenu()
         function(v)
             Config.Weapons.NoSpread = v
             task.spawn(function()
-                pcall(liveSpreadApply, v, true)
+                pcall(liveSpreadApply, v, false)
+                -- base spread bakes at gun load and the walk value at walk-start,
+                -- so bake the patched values in with the silent gun cycle
+                notify(v and "No Spread ON - cycling the gun to bake it in" or "No Spread OFF - cycling back")
+                pcall(recycleGunNow, true)
+                notify(v and "No Spread ON - bullets fly dead straight" or "No Spread OFF - normal accuracy")
             end)
         end)
     if false then -- old trace v2 (replaced by the read tracers; safe to delete later)
