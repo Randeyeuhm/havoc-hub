@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v32"
+local SCRIPT_VERSION = "crim-v33"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -744,7 +744,7 @@ end
 -- (the detector that caught that watches game metatables) - this touches a
 -- plain config proxy object. Values returned are unchanged (the backing
 -- table, which we already patch), so the game cannot tell the difference.
-local fcfTrace = { traced = setmetatable({}, { __mode = "k" }), logs = {}, count = 0 }
+local fcfTrace = { traced = setmetatable({}, { __mode = "k" }), logs = {}, count = 0, perKey = {}, lastLogAt = 0 }
 local FCF_WATCH = { Recoil = true, RecoilRedution = true, RecoilSpeed = true, RecoilDamper = true, CameraRecoilingEnabled = true }
 
 local function setupFcfTrace()
@@ -768,8 +768,10 @@ local function setupFcfTrace()
                     else
                         v = orig(self, k)
                     end
-                    if FCF_WATCH[k] then
+                    fcfTrace.perKey[tostring(k)] = (fcfTrace.perKey[tostring(k)] or 0) + 1
+                    if FCF_WATCH[k] and os.clock() - (fcfTrace.lastLogAt or 0) > 0.25 then
                         fcfTrace.count += 1
+                        fcfTrace.lastLogAt = os.clock()
                         pcall(function()
                             local s1, l1, s2, l2 = "?", "?", "?", "?"
                             if type(debug) == "table" and type(debug.info) == "function" then
@@ -796,6 +798,29 @@ local function setupFcfTrace()
     end
     return hooked > 0
 end
+
+-- full read histogram: EVERY config key read is counted; a non-zero batch
+-- prints every 5s - nothing connected to the config can hide from this
+task.spawn(function()
+    while true do
+        task.wait(5)
+        pcall(function()
+            local keys = {}
+            for k, n in pairs(fcfTrace.perKey) do
+                keys[#keys + 1] = { k = tostring(k), n = n }
+            end
+            if #keys > 0 then
+                table.sort(keys, function(a, b) return a.n > b.n end)
+                local parts = {}
+                for i = 1, math.min(#keys, 12) do
+                    parts[#parts + 1] = keys[i].k .. "=" .. keys[i].n
+                end
+                print("[criminality] fcf reads (last 5s): " .. table.concat(parts, ", "))
+                fcfTrace.perKey = {}
+            end
+        end)
+    end
+end)
 
 -- ============================================================
 -- rCRED READ TRACER + DYNAMIC OVERRIDE - crim-v30
@@ -966,6 +991,20 @@ local function liveFcfScan(announce)
                                         base.rZ = (type(rz) == "number") and (rz * sniff) or nil
                                     end
                                 end
+                                -- the rest of the recoil family (never scaled until v33):
+                                -- the angle ranges the kick rolls from, the spring speed,
+                                -- and the camera-recoil flag
+                                local famNames = { "AngleX_Min", "AngleX_Max", "AngleY_Min", "AngleY_Max", "AngleZ_Min", "AngleZ_Max", "AngleX", "AngleY", "AngleZ" }
+                                local fam = {}
+                                for _, fn2 in ipairs(famNames) do
+                                    local fv = safeField(obj, fn2)
+                                    if type(fv) == "number" then fam[fn2] = fv * sniff end
+                                end
+                                if next(fam) then base.fam = fam end
+                                local spd0 = safeField(obj, "RecoilSpeed")
+                                if type(spd0) == "number" then base.speed = spd0 end
+                                local cr0 = safeField(obj, "CameraRecoilingEnabled")
+                                if type(cr0) == "boolean" then base.camRec = cr0 end
                                 liveFcf.orig[obj] = base
                             end
                             liveFcf.cands[#liveFcf.cands + 1] = { t = obj, base = base }
@@ -1039,6 +1078,17 @@ local function liveFcfApply(pct, announce)
             if b.rX then safeSetField(b.redT, "RecoilReduction_X", b.rX * f) end
             if b.rY then safeSetField(b.redT, "RecoilReduction_Y", b.rY * f) end
             if b.rZ then safeSetField(b.redT, "RecoilReduction_Z", b.rZ * f) end
+        end
+        if b and b.fam then
+            for fn2, fv in pairs(b.fam) do
+                safeSetField(c.t, fn2, fv * f)
+            end
+        end
+        if b and b.speed then
+            safeSetField(c.t, "RecoilSpeed", b.speed * f)
+        end
+        if b and b.camRec ~= nil then
+            safeSetField(c.t, "CameraRecoilingEnabled", (pct <= 0) and false or b.camRec)
         end
     end
     local statesPatched = 0
