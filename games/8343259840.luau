@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v41"
+local SCRIPT_VERSION = "crim-v42"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -1198,10 +1198,37 @@ local function liveSpreadApply(noSpread, announce)
     return n
 end
 
--- zero the spread family on the Config module of EVERY tool in hands or
--- backpack - so any gun module load (even one racing our arrival hook)
--- reads zeros
-local function zeroToolConfigsNow()
+-- original spread values of each tool config, saved the first time we zero
+-- it - so turning No Spread OFF can write the real values back
+local toolCfgOrig = setmetatable({}, { __mode = "k" })
+local function captureToolCfg(cfg)
+    if toolCfgOrig[cfg] then return end
+    local rec = {}
+    for _, key in ipairs({ "Spread", "WalkSpreadIncrease", "CrossExpansion" }) do
+        local v = safeField(cfg, key)
+        if type(v) == "number" then rec[key] = v end
+    end
+    local sni = safeField(cfg, "SniperSettings")
+    if type(sni) == "table" then
+        local sw = safeField(sni, "WalkSpread")
+        if type(sw) == "number" then rec.sni = sw end
+    end
+    toolCfgOrig[cfg] = rec
+end
+local function restoreToolCfg(cfg)
+    local rec = toolCfgOrig[cfg]
+    if not rec then return end
+    for _, key in ipairs({ "Spread", "WalkSpreadIncrease", "CrossExpansion" }) do
+        if type(rec[key]) == "number" then pcall(function() cfg[key] = rec[key] end) end
+    end
+    local sni = safeField(cfg, "SniperSettings")
+    if type(rec.sni) == "number" and type(sni) == "table" then
+        pcall(function() sni.WalkSpread = rec.sni end)
+    end
+end
+
+-- walk every tool config in hands + backpack
+local function forEachToolCfg(fn)
     pcall(function()
         local roots = {}
         local char = LocalPlayer.Character
@@ -1214,20 +1241,34 @@ local function zeroToolConfigsNow()
                     local mod = tool:FindFirstChild("Config")
                     if mod and mod:IsA("ModuleScript") then
                         local cfg = require(mod)
-                        if type(cfg) == "table" then
-                            for _, key in ipairs({ "Spread", "WalkSpreadIncrease", "CrossExpansion" }) do
-                                if type(safeField(cfg, key)) == "number" then pcall(function() cfg[key] = 0 end) end
-                            end
-                            local sni = safeField(cfg, "SniperSettings")
-                            if type(sni) == "table" and type(safeField(sni, "WalkSpread")) == "number" then
-                                pcall(function() sni.WalkSpread = 0 end)
-                            end
-                        end
+                        if type(cfg) == "table" then fn(cfg) end
                     end
                 end
             end
         end
     end)
+end
+
+-- zero the spread family on the Config module of EVERY tool in hands or
+-- backpack - so any gun module load (even one racing our arrival hook)
+-- reads zeros
+local function zeroToolConfigsNow()
+    forEachToolCfg(function(cfg)
+        captureToolCfg(cfg)
+        for _, key in ipairs({ "Spread", "WalkSpreadIncrease", "CrossExpansion" }) do
+            if type(safeField(cfg, key)) == "number" then pcall(function() cfg[key] = 0 end) end
+        end
+        local sni = safeField(cfg, "SniperSettings")
+        if type(sni) == "table" and type(safeField(sni, "WalkSpread")) == "number" then
+            pcall(function() sni.WalkSpread = 0 end)
+        end
+    end)
+end
+
+-- put the saved originals back (No Spread gone OFF, or a gun arriving
+-- while OFF whose config was zeroed earlier)
+local function restoreToolConfigsNow()
+    forEachToolCfg(restoreToolCfg)
 end
 
 -- watchdog: hold the zero while No Spread is on. Gun loads can re-snapshot
@@ -2537,13 +2578,16 @@ local function scaleOneTool(tool)
     end)
     pcall(applyGunRecoil)
     -- No Spread: zero the spread family on the tool config BEFORE the gun
-    -- module snapshots it, so fresh loads start with dead-straight bullets
-    if Config.Weapons.NoSpread then
-        pcall(function()
-            local mod = tool:FindFirstChild("Config")
-            if not mod then return end
-            local cfg = require(mod)
-            if type(cfg) ~= "table" then return end
+    -- module snapshots it, so fresh loads start with dead-straight bullets.
+    -- With No Spread OFF: if this config was zeroed earlier, put the real
+    -- values back so the gun comes up with normal accuracy.
+    pcall(function()
+        local mod = tool:FindFirstChild("Config")
+        if not mod then return end
+        local cfg = require(mod)
+        if type(cfg) ~= "table" then return end
+        if Config.Weapons.NoSpread then
+            captureToolCfg(cfg)
             for _, key in ipairs({ "Spread", "WalkSpreadIncrease", "CrossExpansion" }) do
                 if type(safeField(cfg, key)) == "number" then pcall(function() cfg[key] = 0 end) end
             end
@@ -2551,8 +2595,10 @@ local function scaleOneTool(tool)
             if type(sni) == "table" and type(safeField(sni, "WalkSpread")) == "number" then
                 pcall(function() sni.WalkSpread = 0 end)
             end
-        end)
-    end
+        else
+            restoreToolCfg(cfg)
+        end
+    end)
 end
 
 local function watchBackpackForRecoil(bp)
@@ -3010,11 +3056,22 @@ local function buildMenu()
             Config.Weapons.NoSpread = v
             task.spawn(function()
                 pcall(liveSpreadApply, v, false)
+                if v then
+                    -- hold every tool config at zero BEFORE the cycle, so the
+                    -- reload (the bake) is guaranteed to read zeros
+                    pcall(zeroToolConfigsNow)
+                else
+                    -- put the original spread values back BEFORE the cycle,
+                    -- so the reload reads the real config again
+                    pcall(restoreToolConfigsNow)
+                end
                 -- base spread bakes at gun load and the walk value at walk-start,
                 -- so bake the patched values in with the silent gun cycle
                 notify(v and "No Spread ON - cycling the gun to bake it in" or "No Spread OFF - cycling back")
-                pcall(recycleGunNow, true)
-                notify(v and "No Spread ON - bullets fly dead straight" or "No Spread OFF - normal accuracy")
+                local _, cycled = pcall(recycleGunNow, true)
+                notify(v and (cycled and "No Spread ON - bullets fly dead straight"
+                        or "No Spread ON - grab your gun, it comes out dead straight")
+                    or "No Spread OFF - normal accuracy")
             end)
         end)
     if false then -- old trace v2 (replaced by the read tracers; safe to delete later)
