@@ -85,7 +85,7 @@ local DEFAULTS = {
     -- not look mechanical. TeamCheck off by default (most lobbies are solo).
     Aimbot   = { Enabled = false, Mode = "Hold RMB", FOV = 100, Smoothness = 6,
                  TeamCheck = false, VisibleOnly = true, FOVCircle = true },
-    Weapons  = { RecoilPct = 100, AutoApply = false, LiveApply = true, Suppressor = true },
+    Weapons  = { RecoilPct = 100, AutoApply = false, LiveApply = true, Suppressor = true, NoSpread = false },
     Misc     = { Fullbright = false, AntiAFK = true },
 }
 
@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v37"
+local SCRIPT_VERSION = "crim-v38"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -1008,6 +1008,23 @@ local function liveFcfScan(announce)
                                 if type(spd0) == "number" then base.speed = spd0 end
                                 local cr0 = safeField(obj, "CameraRecoilingEnabled")
                                 if type(cr0) == "boolean" then base.camRec = cr0 end
+                                -- spread family for the No Spread toggle (raw values:
+                                -- these are not tied to the recoil %)
+                                local spreadNames = { "Spread", "WalkSpreadIncrease", "CrossExpansion" }
+                                local spreadFam = {}
+                                for _, sn in ipairs(spreadNames) do
+                                    local sv = safeField(obj, sn)
+                                    if type(sv) == "number" then spreadFam[sn] = sv end
+                                end
+                                if next(spreadFam) then base.spreadFam = spreadFam end
+                                local sni = safeField(obj, "SniperSettings")
+                                if type(sni) == "table" then
+                                    local sw = safeField(sni, "WalkSpread")
+                                    if type(sw) == "number" then
+                                        base.sniT = sni
+                                        base.sniW = sw
+                                    end
+                                end
                                 liveFcf.orig[obj] = base
                             end
                             liveFcf.cands[#liveFcf.cands + 1] = { t = obj, base = base }
@@ -1146,6 +1163,39 @@ local function liveApplyNow(announce)
         end
     end
     return n, sent
+end
+
+-- No Spread: zeroes the spread family (base spread, walk spread, crosshair
+-- bloom, sniper walk spread) on every matched config copy - bullets fly dead
+-- straight and the crosshair never blooms. Same live mechanism the recoil
+-- family uses; OFF restores the captured originals.
+local function liveSpreadApply(noSpread, announce)
+    local charTool = nil
+    pcall(function()
+        local char = LocalPlayer.Character
+        charTool = char and char:FindFirstChildOfClass("Tool") or nil
+    end)
+    if #liveFcf.cands == 0 or charTool ~= liveFcf.toolRef then
+        liveFcfScan(false)
+    end
+    local n = 0
+    for _, c in ipairs(liveFcf.cands) do
+        local b = c.base
+        if b then
+            if b.spreadFam then
+                for k, v in pairs(b.spreadFam) do
+                    if safeSetField(c.t, k, noSpread and 0 or v) then n += 1 end
+                end
+            end
+            if b.sniT then
+                safeSetField(b.sniT, "WalkSpread", noSpread and 0 or b.sniW)
+            end
+        end
+    end
+    if announce then
+        notify(noSpread and "No Spread ON - bullets fly dead straight" or "No Spread OFF - normal accuracy")
+    end
+    return n
 end
 
 -- ============================================================
@@ -2400,6 +2450,9 @@ local function rescaleAndPatch()
     pcall(applyCandidates)
     local pctNow = recoilForcePct or tonumber(Config.Weapons.RecoilPct) or 100
     pcall(function() applyRecoilCopy(pctNow) end)
+    if Config.Weapons.NoSpread then
+        task.delay(0.3, function() pcall(liveSpreadApply, true) end)
+    end
     local nowT = tick()
     -- (old RCL install/rewire retired: the RCL vector proved decorative;
     -- see cleanup block near the rcl section for leftover swap restoration)
@@ -2890,6 +2943,13 @@ local function buildMenu()
                 end
             end)
         end)
+    toggle(p3, "No Spread", function() return Config.Weapons.NoSpread end,
+        function(v)
+            Config.Weapons.NoSpread = v
+            task.spawn(function()
+                pcall(liveSpreadApply, v, true)
+            end)
+        end)
     if false then -- old trace v2 (replaced by the read tracers; safe to delete later)
     button(p3, "Recoil trace v2 (fire 12s)", function()
         task.spawn(function()
@@ -3354,6 +3414,7 @@ if Config.Misc.Fullbright then pcall(setFullbright, true) end
 task.spawn(function()
     pcall(applyRecoil)
     pcall(applyGunRecoil)
+    if Config.Weapons.NoSpread then pcall(liveSpreadApply, true) end
 end)
 
 print(("[Havoc Hub] Criminality script loaded (PlaceId %d)"):format(game.PlaceId))
