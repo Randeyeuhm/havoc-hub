@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v42"
+local SCRIPT_VERSION = "crim-v43"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -704,6 +704,14 @@ local liveFcf = { cands = {}, states = {}, lastScan = 0, toolRef = nil, stateKey
 -- first-sight base values per candidate table (weak keys: dead tables drop out)
 -- so repeated scans/scaling never double-apply or lose the originals.
 liveFcf.orig = setmetatable({}, { __mode = "k" })
+-- gun-state tables (tbl_upv_9) found by field signature: the fire formula
+-- reads tbl_upv_9.LaserEnabled + u5.Customs.LaserAccuracy LIVE on every
+-- shot, so pinning the accuracy to 0 through that flag kills spread in
+-- EVERY state instantly (standing still included) - the spread twin of the
+-- recoil-family lever. laserSeen dedups finds; laserOrig keeps originals.
+liveFcf.laserStates = {}
+liveFcf.laserSeen = setmetatable({}, { __mode = "k" })
+liveFcf.laserOrig = setmetatable({}, { __mode = "k" })
 
 -- Metatable-proof field access. Game "strict" objects (Crosshair PhysicModule
 -- style) THROW from __index on unknown keys, and the gun config's protected
@@ -908,6 +916,40 @@ local function liveLooksLikeGunConfig(t)
         and type(safeField(t, "CrossExpansion")) == "number"
 end
 
+-- the gun's second state table (tbl_upv_9): a plain per-gun flag table
+-- holding fields like FireAnimLoop / hasSight / UBL / LaserM / mFiring.
+-- Those names are unique to the gun module (whole-dump verified), so this
+-- is a safe structural match. A plain attachment-less gun's table can sit
+-- EMPTY until it gains one of these - such guns fall back to the bake
+-- cycle instead (the toggle predicts which case you're in).
+local function liveLooksLikeGunState(t)
+    if rawget(t, "FireAnimLoop") == true or rawget(t, "hasSight") == true then return true end
+    if type(rawget(t, "mFiring")) == "boolean" and type(rawget(t, "mFireTick")) == "number" then return true end
+    if rawget(t, "UBL") ~= nil or rawget(t, "BarrelM") ~= nil then return true end
+    if rawget(t, "SMK4") ~= nil or rawget(t, "FLAM") ~= nil or rawget(t, "MGL") ~= nil then return true end
+    if rawget(t, "LaserM") ~= nil or rawget(t, "SightM") ~= nil or rawget(t, "FlashM") ~= nil then return true end
+    if type(rawget(t, "LaserEnabled")) == "boolean" or type(rawget(t, "FlashLEnabled")) == "boolean" then return true end
+    return false
+end
+
+-- mirror of the game's own init gates: does this gun config give its state
+-- table at least one findable field? (i.e. will the laser lever latch on
+-- this gun the moment the scan runs)
+local function liveGunFindable(cfg)
+    local cs = safeField(cfg, "Customs")
+    if type(cs) == "table" then
+        if safeField(cs, "ReticleSight") == true then return true end
+        if safeField(cs, "LaserSight") == true then return true end
+        if safeField(cs, "FireAnimLoop") or safeField(cs, "SMK4") or safeField(cs, "Flamethrower") or safeField(cs, "MGL_Stuff") then return true end
+        local ub = safeField(cs, "UnderbarrelLauncher")
+        if type(ub) == "table" and safeField(ub, "Enabled") then return true end
+        local fl = safeField(cs, "Flashlight")
+        if type(fl) == "table" and safeField(fl, "Enabled") then return true end
+    end
+    if safeField(cfg, "MinigunEnabled") then return true end
+    return false
+end
+
 local function liveFcfScan(announce)
     liveFcf.cands = {}
     liveFcf.states = {}
@@ -952,6 +994,28 @@ local function liveFcfScan(announce)
                             end
                             table.sort(keys)
                             liveFcf.stateKeys = table.concat(keys, ",")
+                        end
+                    end
+                    -- gun state table -> laser lever target (found once;
+                    -- later scans skip it via laserSeen)
+                    if liveLooksLikeGunState(obj) and not liveFcf.laserSeen[obj] and #liveFcf.laserStates < 48 then
+                        liveFcf.laserSeen[obj] = true
+                        liveFcf.laserStates[#liveFcf.laserStates + 1] = obj
+                        -- leftovers from a previous execution: strip our stub
+                        -- and flag before anything captures them as originals
+                        if not liveFcf.laserOrig[obj] then
+                            pcall(function()
+                                local m = rawget(obj, "__havocFlag")
+                                if m ~= nil then
+                                    rawset(obj, "LaserEnabled", (m == "en") and nil or m)
+                                    rawset(obj, "__havocFlag", nil)
+                                end
+                                local lm = rawget(obj, "LaserM")
+                                if type(lm) == "table" and lm.__havoc then
+                                    rawset(obj, "LaserM", nil)
+                                    if rawget(obj, "LaserEnabled") == true then rawset(obj, "LaserEnabled", nil) end
+                                end
+                            end)
                         end
                     end
                     if liveLooksLikeGunConfig(obj) then
@@ -1025,6 +1089,8 @@ local function liveFcfScan(announce)
                                         base.sniW = sw
                                     end
                                 end
+                                local cs0 = safeField(obj, "Customs")
+                                if type(cs0) == "table" then base.customsT = cs0 end
                                 liveFcf.orig[obj] = base
                             end
                             liveFcf.cands[#liveFcf.cands + 1] = { t = obj, base = base }
@@ -1190,6 +1256,72 @@ local function liveSpreadApply(noSpread, announce)
             if b.sniT then
                 safeSetField(b.sniT, "WalkSpread", noSpread and 0 or b.sniW)
             end
+        end
+    end
+    -- LASER LEVER: the fire formula multiplies spread by v107, read LIVE as
+    -- tbl_upv_9.LaserEnabled + u5.Customs.LaserAccuracy - pinning the
+    -- accuracy to 0 makes every shot dead straight in EVERY state (standing
+    -- still included), instantly, exactly like the recoil-family lever. If
+    -- any copy fails to verify, no flag is flipped (a nil multiplier would
+    -- error the shot).
+    if noSpread then
+        local accOk, accBad = 0, 0
+        for _, c in ipairs(liveFcf.cands) do
+            local b = c.base
+            if b and b.customsT then
+                if b.laserCaptured == nil then
+                    b.laserCaptured = true
+                    local v0 = safeField(b.customsT, "LaserAccuracy")
+                    b.laserOrigN = type(v0) == "number"
+                    b.laserOrig = b.laserOrigN and v0 or nil
+                end
+                if safeSetField(b.customsT, "LaserAccuracy", 0) then
+                    accOk += 1
+                else
+                    accBad += 1
+                end
+            end
+        end
+        if accOk > 0 and accBad == 0 then
+            for _, st in ipairs(liveFcf.laserStates) do
+                pcall(function()
+                    local rec = liveFcf.laserOrig[st]
+                    if not rec then
+                        local en0 = rawget(st, "LaserEnabled")
+                        rec = { enWasNil = (en0 == nil), en = (en0 == true) }
+                        liveFcf.laserOrig[st] = rec
+                    end
+                    if rawget(st, "LaserM") == nil then
+                        rawset(st, "LaserM", { __havoc = true, Running = false,
+                            Start = function() end, Stop = function() end,
+                            Toggle = function() end, Disconnect = function() end })
+                        rec.stub = true
+                    end
+                    rawset(st, "LaserEnabled", true)
+                    rawset(st, "__havocFlag", rec.enWasNil and "en" or rec.en)
+                end)
+            end
+        end
+    else
+        for _, c in ipairs(liveFcf.cands) do
+            local b = c.base
+            if b and b.customsT and b.laserCaptured then
+                if b.laserOrigN then
+                    safeSetField(b.customsT, "LaserAccuracy", b.laserOrig)
+                else
+                    pcall(rawset, b.customsT, "LaserAccuracy", nil)
+                end
+            end
+        end
+        for st, rec in pairs(liveFcf.laserOrig) do
+            pcall(function()
+                local lm = rawget(st, "LaserM")
+                if rec.stub and type(lm) == "table" and lm.__havoc then
+                    rawset(st, "LaserM", nil)
+                end
+                rawset(st, "LaserEnabled", rec.enWasNil and nil or rec.en)
+                rawset(st, "__havocFlag", nil)
+            end)
         end
     end
     if announce then
@@ -3055,23 +3187,32 @@ local function buildMenu()
         function(v)
             Config.Weapons.NoSpread = v
             task.spawn(function()
+                if v then
+                    pcall(liveFcfScan, false)
+                end
                 pcall(liveSpreadApply, v, false)
                 if v then
-                    -- hold every tool config at zero BEFORE the cycle, so the
-                    -- reload (the bake) is guaranteed to read zeros
                     pcall(zeroToolConfigsNow)
+                    -- laser lever live on this gun = instant, no cycle;
+                    -- otherwise keep the silent bake cycle as the fallback
+                    local live = false
+                    pcall(function()
+                        local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+                        local mod = tool and tool:FindFirstChild("Config")
+                        local cfg = mod and require(mod)
+                        if type(cfg) == "table" then live = liveGunFindable(cfg) end
+                    end)
+                    if live then
+                        notify("No Spread ON - bullets fly dead straight")
+                    else
+                        notify("No Spread ON - cycling the gun to bake it in")
+                        pcall(recycleGunNow, true)
+                        notify("No Spread ON - bullets fly dead straight")
+                    end
                 else
-                    -- put the original spread values back BEFORE the cycle,
-                    -- so the reload reads the real config again
                     pcall(restoreToolConfigsNow)
+                    notify("No Spread OFF - normal accuracy")
                 end
-                -- base spread bakes at gun load and the walk value at walk-start,
-                -- so bake the patched values in with the silent gun cycle
-                notify(v and "No Spread ON - cycling the gun to bake it in" or "No Spread OFF - cycling back")
-                local _, cycled = pcall(recycleGunNow, true)
-                notify(v and (cycled and "No Spread ON - bullets fly dead straight"
-                        or "No Spread ON - grab your gun, it comes out dead straight")
-                    or "No Spread OFF - normal accuracy")
             end)
         end)
     if false then -- old trace v2 (replaced by the read tracers; safe to delete later)
