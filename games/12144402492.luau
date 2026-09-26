@@ -92,7 +92,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v8"
+local SCRIPT_VERSION = "dl-v9"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -597,10 +597,38 @@ local function unstubSwaySprings()
     BOB_STATE.saved = setmetatable({}, { __mode = "k" })
 end
 
--- new characters get a fresh controller - restub it shortly after spawn
+local function localControllerStubbed()
+    local char = LocalPlayer.Character
+    if not char then return false end
+    local stub = swayStub("camera_nonrelative")
+    for controller in pairs(BOB_STATE.saved) do
+        if type(controller) == "table" then
+            local ch = rawget(controller, "character")
+            if type(ch) == "table" and rawget(ch, "instance") == char then
+                local springs = rawget(controller, "springs")
+                if type(springs) == "table" and rawget(springs, "camera_nonrelative") == stub then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- new characters get a fresh controller: restub it as soon as it exists.
+-- The controller is built over the first moments after spawn, so keep
+-- retrying instead of a single delayed scan - that single scan missing the
+-- fresh controller is why the stubs felt like they didn't reapply.
 track(LocalPlayer.CharacterAdded:Connect(function()
-    task.delay(2, function()
-        if Config.Weapons.ZeroSway then pcall(stubSwaySprings, true) end
+    if not Config.Weapons.ZeroSway then return end
+    task.spawn(function()
+        for _, delay in ipairs({ 0.5, 0.5, 1, 1, 2, 2, 3, 4 }) do
+            task.wait(delay)
+            if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
+            if not Config.Weapons.ZeroSway then return end
+            if localControllerStubbed() then return end
+            pcall(stubSwaySprings, true)
+        end
     end)
 end))
 
@@ -1364,12 +1392,15 @@ task.spawn(function()
                 warn("[deadline] re-apply failed: " .. tostring(err))
             end
         end
-        -- keep fresh controllers covered (respawns) - light rescan every 30s
+        -- keep fresh controllers covered (respawns) - light rescan every 30s,
+        -- skipped when the local rig is already stubbed
         if w.ZeroSway then
             swayScanTick = swayScanTick + 1
             if swayScanTick >= 60 then
                 swayScanTick = 0
-                pcall(stubSwaySprings, true)
+                if not localControllerStubbed() then
+                    pcall(stubSwaySprings, true)
+                end
             end
         else
             swayScanTick = 0
