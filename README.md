@@ -47,10 +47,10 @@ Built against the game's decompiled source — vehicle physics run client-side:
 Built against the game's decompiled source — weapon handling runs client-side and reads its tunables live every shot:
 
 - **Recoil / Spread** — Recoil % (scales the game's global `plr_recoil` multiplier plus every recoil trait through its own debug-values table) and Spread % (`plr_barrel_deviation` / `plr_buck_barrel_deviation`) — 100% = vanilla, 0% = dead straight / zero kick
-- **Speed** — Aim In Speed (`plr_viewmodel_state_transition_speed` — the gun raises, leans and crouches faster; capped at ×3 because the game's transition lerp overshoots past that and flails the viewmodel), Weapon Switch speed and Ergonomics multiplier (the stat behind lean / handling timings) — x1 = vanilla
+- **Speed** — Aim In Speed (`plr_viewmodel_state_transition_speed` — the gun raises, leans and crouches faster; capped at ×3 because the game's transition lerp overshoots past that and flails the viewmodel), Weapon Switch speed, Ergonomics multiplier (the stat behind lean / handling timings) and Reload Speed (×1–×3 — feeds the live reload animation track extra time per frame so the whole reload pipeline runs faster: mag out, mag in, chambering, completion) — x1 = vanilla
 - **Audio** — No Deafness: removes the game's death & explosion hearing-loss (the deafness distortion / equalizer effects) and mutes the tinnitus ringing
 - **Aimbot / ESP** — head-locking camera aimbot (FOV radius, smoothing, visible check, Hold-RMB / Always, FOV circle) and full player ESP (box, name, distance, chams, tracers) built around the game's custom rigs — characters are UserId-named models in `Workspace.characters`, names resolve through the Players service
-- **Stability** — Steady Aim (aiming and holding breath never drain arm stamina, breathing shake off), Infinite Stamina (sprint / lean / jump / vault drains → 0) and Zero Sight Sway (no camera bob while walking, no gun lag when turning, no walk/run weapon weave, no breathing wobble, idle fidgets or noise drift — the sight stays glued; uses the game's offset limit plus its live springs, animation weights, breath, fidget and noise sources)
+- **Stability** — Steady Aim (aiming and holding breath never drain arm stamina, breathing shake off), Infinite Stamina (sprint / lean / jump / vault drains → 0) and Zero Sight Sway (no camera bob while walking, no gun lag when turning, no walk/run weapon weave, no breathing wobble, idle fidgets or noise drift — the sight stays glued; uses the game's offset limit plus its live springs, animation weights, breath, fidget and noise sources, and switches off the breath equalizer so the pinned breath value can't leave a constant muffle on the mix)
 - Everything applies and restores live — no hooks, no remotes, nothing sent to the server; lowered values re-assert themselves
 - The whole Deadline universe (lobby + match places) loads this one script via the loader's universe map
 
@@ -76,7 +76,7 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
 | `games/7336302630.luau` | Havoc Project Delta (game-specific suite) |
 | `games/3351674303.luau` | Driving Empire (vehicle performance, teleports, speedometer HUD) |
 | `games/8343259840.luau` | Criminality (recoil & spread toolkit) |
-| `games/12144402492.luau` | Deadline (weapon mods, aimbot, ESP) |
+| `games/12144402492.luau` | Deadline (weapon mods, reload speed, aimbot, ESP) |
 | `games/universal.luau` | Universal aimbot / ESP / utilities fallback |
 | `uilib.luau` | Shared UI toolkit — Project Delta-style window shell (dot header, drawn-X close, searchable left-rail tabs, footer), widgets, toasts, rebind capture, popup management |
 | `esp.luau` | One-file ESP library — Project Delta based engine (corner box, name/health/distance, highlights) + two-window customizer (preview + settings) used by every script |

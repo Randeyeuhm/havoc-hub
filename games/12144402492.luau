@@ -15,6 +15,13 @@
                           overshoots past that -> twitching / flailing)
           Weapon Switch - plr_swift_switch_speed_multiplier      (dump L360193)
           Ergonomics x  - plr_ergonomics_multiplier              (dump L347293)
+          Reload Speed  - live reload animation speed: extra
+                          dt * speed * (x-1) fed into the active reload
+                          Canim track each frame (reload pipeline L375194-
+                          376102; completion = track.time >= length) plus the
+                          feed_* belt sequence tracks. No knobs, no hooks -
+                          covers every variant (reload / full / quick / miss
+                          / _alt, and belt-fed feed_start-feed_end).
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
                           (shake = (1 - arm_stamina/max) * shake_mult, L364597)
           Infinite Stam - sprint / lean / jump / vault drains -> 0
@@ -25,7 +32,10 @@
                           jolts L356698) + walk/run/directional/swayLag
                           SmoothValues stubbed (weave tracks L356919-931) +
                           holding_breath stub (breathing track weight *=
-                          (1 - value) -> 0, L364600) + noise_position pinned
+                          (1 - value) -> 0, L364600; the live breath
+                          equalizer is switched off too - the game drives its
+                          -21.5dB "hold breath" muffle from that same value,
+                          L369539-542) + noise_position pinned
                           (Perlin wander L356645 -> L357037 / L357050) + idle
                           fidget animations disabled (timer L364609)
           No Deafness   - death & explosion hearing loss removed: the cloned
@@ -100,7 +110,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v12"
+local SCRIPT_VERSION = "dl-v13"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -122,6 +132,8 @@ local DEFAULTS = {
         AimSpeed = 1,      -- plr_viewmodel_state_transition_speed  (x vanilla)
         SwitchSpeed = 1,   -- plr_swift_switch_speed_multiplier     (x vanilla)
         ErgoSpeed = 1,     -- plr_ergonomics_multiplier             (x vanilla)
+        ReloadSpeed = 2,   -- reload anim speed (x vanilla; live track time
+                           -- injection - see FAST RELOAD section)
         SteadyAim = false, -- arm stamina drains + breathing shake -> 0
         InfStamina = false,-- sprint / lean / jump / vault drains -> 0
         ZeroSway = false,  -- walk bob + look sway -> 0 (knob + live spring stubs)
@@ -189,6 +201,10 @@ end
 -- Aim In Speed past x3 destabilises the game's unclamped transition lerp
 -- (SlerpValue.update has no v3 clamp - see applySpeedKnobs).
 Config.Weapons.AimSpeed = math.clamp(tonumber(Config.Weapons.AimSpeed) or 1, 1, 3)
+
+-- Reload Speed: 1 = vanilla, capped x3 (mirrors Aim In Speed). Applied by
+-- feeding the live reload track extra time per frame - see FAST RELOAD.
+Config.Weapons.ReloadSpeed = math.clamp(tonumber(Config.Weapons.ReloadSpeed) or 2, 1, 3)
 
 -- ============================================================
 -- DEADLINE WEAPON FRAMEWORK  (the live levers)
@@ -586,6 +602,27 @@ local function stubSwaySprings(scan)
                 smooth[name] = stub
             end
         end
+        -- The holding_breath stub pins value = 1 - that pin is what kills
+        -- the breathing bob (L369544) and the breathing track weave
+        -- (L376859). But the game ALSO drives the breath equalizer from
+        -- that same value every frame (L369539-542):
+        --   MidGain = -21.5 * value, HighGain = -24 * value
+        -- -> a constant "holding breath" muffle would sit on the mix for as
+        -- long as the toggle is on. The game only ever writes the GAINS
+        -- (never Enabled), so switching the live instance off is safe and
+        -- silences that muffle; the saved Enabled state is restored when
+        -- the toggle goes off.
+        local eq = rawget(controller, "breath_equalizer")
+        if eq ~= nil then
+            if entry.breath_eq == nil then
+                local okc, was = pcall(function() return eq.Enabled end)
+                if okc then
+                    entry.breath_eq = eq
+                    entry.breath_eq_enabled = was
+                end
+            end
+            pcall(function() eq.Enabled = false end)
+        end
     end
 end
 
@@ -610,6 +647,12 @@ local function unstubSwaySprings()
                         smooth[name] = orig
                     end
                 end
+            end
+            -- re-enable the breath equalizer the stubs switched off
+            local eq = entry.breath_eq
+            if eq ~= nil then
+                local was = entry.breath_eq_enabled
+                pcall(function() eq.Enabled = (was == nil) or (was == true) end)
             end
         end
     end
@@ -687,6 +730,100 @@ local function applyAll()
     applyInfStamina()
     applySwayKnobs()
 end
+
+-- ============================================================
+-- FAST RELOAD  (reload animation speed, live)
+-- ============================================================
+-- Reload timing is purely animation-driven: the rifle reload pipeline
+-- (L375194-376102) plays a Canim track (reload / full_reload / quick_reload
+-- / miss / _alt variants) and EVERY step - mag out, mag in, chamber logic,
+-- completion - is a keyframe signal on that track. The animator advances
+-- tracks with track.time = track.time + dt * track.speed and fires every
+-- signal whose time has been crossed, so feeding a live reload track extra
+-- time each frame runs the whole pipeline faster.
+-- We inject dt * speed * (multiplier - 1) instead of editing track.speed,
+-- because the game re-writes the active reload track's speed EVERY frame
+-- for the run blend (L376890) - this way our boost rides on top of
+-- whatever speed the game currently wants.
+-- Covered: whatever weapon.current_reload_animation points at, plus the
+-- belt-feed sequence tracks (their .finished also gates completion).
+-- 1 = vanilla, no injection at all.
+local CTRL_STATE = genv.__HAVOC_DEADLINE_CTRL
+if type(CTRL_STATE) ~= "table" then
+    CTRL_STATE = { tracked = setmetatable({}, { __mode = "k" }) }
+    genv.__HAVOC_DEADLINE_CTRL = CTRL_STATE
+end
+if type(CTRL_STATE.tracked) ~= "table" then
+    CTRL_STATE.tracked = setmetatable({}, { __mode = "k" })
+end
+
+local RELOAD_FEED_TRACKS = {
+    "feed_start", "feed_feed", "feed_end",
+    "first_bullet_feed", "first_bullet_feed_cancel",
+}
+
+-- GC scan (same controller signature the sway stubs use) - event-driven,
+-- never per frame.
+local function refreshControllerCache()
+    if not gcScanAvailable() then return end
+    for _, controller in ipairs(findControllers()) do
+        CTRL_STATE.tracked[controller] = true
+    end
+end
+
+local ctrlScanQueued = false
+local function queueControllerCache()
+    if ctrlScanQueued then return end
+    ctrlScanQueued = true
+    task.delay(0.4, function()
+        ctrlScanQueued = false
+        if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
+        pcall(refreshControllerCache)
+    end)
+end
+
+local function injectTrackTime(tr, mult, dt)
+    if type(tr) ~= "table" or tr.playing ~= true then return end
+    local t = tonumber(tr.time)
+    local len = tonumber(tr.length)
+    if not t or not len or len <= 0 or t >= len then return end
+    local sp = tonumber(tr.speed) or 1
+    tr.time = t + (dt * sp * (mult - 1))
+end
+
+-- fresh character = fresh controller + fresh tracks: pick them up shortly
+-- after spawn (retries - the controller is built over the first seconds)
+track(LocalPlayer.CharacterAdded:Connect(function()
+    if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 then return end
+    task.spawn(function()
+        for _, d in ipairs({ 1, 2, 3 }) do
+            task.wait(d)
+            if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
+            if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 then return end
+            pcall(refreshControllerCache)
+        end
+    end)
+end))
+
+track(RunService.RenderStepped:Connect(function(dt)
+    local mult = tonumber(Config.Weapons.ReloadSpeed) or 1
+    if mult <= 1 then return end
+    for controller in pairs(CTRL_STATE.tracked) do
+        if type(controller) == "table" then
+            local weapon = rawget(controller, "weapon")
+            local tracks = weapon and rawget(weapon, "tracks")
+            if type(tracks) == "table" then
+                local cur = rawget(weapon, "current_reload_animation")
+                if cur ~= nil then
+                    injectTrackTime(tracks[cur], mult, dt)
+                end
+                for _, name in ipairs(RELOAD_FEED_TRACKS) do
+                    injectTrackTime(tracks[name], mult, dt)
+                end
+            end
+        end
+    end
+end))
 
 -- ============================================================
 -- AUDIO: NO DEAFNESS  (death + explosion hearing loss, ringing)
@@ -1423,6 +1560,12 @@ local function buildMenu()
             applySpeedKnobs()
             refreshStatus()
         end, 0.5, 1, 10, function(v) return ("%g×"):format(v) end)
+    slider(p1, "Reload Speed",
+        function() return Config.Weapons.ReloadSpeed end,
+        function(v)
+            Config.Weapons.ReloadSpeed = v
+            if v > 1 then queueControllerCache() end
+        end, 0.25, 1, 3, function(v) return ("%g×"):format(v) end)
 
     section(p1, "Stability")
     toggle(p1, "Steady Aim",
@@ -1483,6 +1626,7 @@ local function buildMenu()
         w.AimSpeed = 1
         w.SwitchSpeed = 1
         w.ErgoSpeed = 1
+        w.ReloadSpeed = 1
         w.SteadyAim = false
         w.InfStamina = false
         w.ZeroSway = false
@@ -1533,6 +1677,14 @@ task.spawn(function()
     refreshStatus()
     if Config.Weapons.ZeroSway then
         task.spawn(function() pcall(stubSwaySprings, true) end)
+    else
+        -- reconcile: a previous run can leave stubs (and a disabled breath
+        -- equalizer) behind when the script is re-executed while the
+        -- Zero Sight Sway toggle was still on
+        pcall(unstubSwaySprings)
+    end
+    if (tonumber(Config.Weapons.ReloadSpeed) or 1) > 1 then
+        task.spawn(function() pcall(refreshControllerCache) end)
     end
     if Config.Weapons.NoDeaf then
         pcall(applyNoDeaf, true)
@@ -1543,6 +1695,7 @@ task.spawn(function()
     -- vanilla should survive that without user action.
     local warned = false
     local swayScanTick = 0
+    local reloadScanTick = 0
     while genv.__HAVOC_DEADLINE_GEN == MY_GEN do
         task.wait(0.5)
         local w = Config.Weapons
@@ -1569,6 +1722,17 @@ task.spawn(function()
             end
         else
             swayScanTick = 0
+        end
+        -- keep the reload-speed controller cache warm (new characters /
+        -- controllers that appeared after boot)
+        if (tonumber(w.ReloadSpeed) or 1) > 1 then
+            reloadScanTick = reloadScanTick + 1
+            if reloadScanTick >= 60 then
+                reloadScanTick = 0
+                pcall(refreshControllerCache)
+            end
+        else
+            reloadScanTick = 0
         end
     end
 end)
