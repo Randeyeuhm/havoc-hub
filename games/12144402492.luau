@@ -9,7 +9,10 @@
       • Weapons tab - everything live via the game's own shared_state knobs:
           Recoil %      - plr_recoil + every recoil trait (debug values)
           Spread %      - plr_barrel_deviation / plr_buck_barrel_deviation
-          Aim In Speed  - plr_viewmodel_state_transition_speed   (dump L356495)
+          Aim In Speed  - plr_viewmodel_state_transition_speed   (dump L356495;
+                          capped at x3 - the game's SlerpValue double-lerp
+                          is UNCLAMPED (v3 = min(dt,0.05)*speed) and
+                          overshoots past that -> twitching / flailing)
           Weapon Switch - plr_swift_switch_speed_multiplier      (dump L360193)
           Ergonomics x  - plr_ergonomics_multiplier              (dump L347293)
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
@@ -92,7 +95,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v9"
+local SCRIPT_VERSION = "dl-v10"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -176,6 +179,10 @@ end
 if Config.Aimbot.Mode ~= "Hold RMB" and Config.Aimbot.Mode ~= "Always" then
     Config.Aimbot.Mode = "Hold RMB"
 end
+
+-- Aim In Speed past x3 destabilises the game's unclamped transition lerp
+-- (SlerpValue.update has no v3 clamp - see applySpeedKnobs).
+Config.Weapons.AimSpeed = math.clamp(tonumber(Config.Weapons.AimSpeed) or 1, 1, 3)
 
 -- ============================================================
 -- DEADLINE WEAPON FRAMEWORK  (the live levers)
@@ -348,7 +355,13 @@ local function applySpeedKnobs()
     local function mult(name, m)
         if o[name] ~= nil then setKnob(name, o[name] * (tonumber(m) or 1)) end
     end
-    mult("plr_viewmodel_state_transition_speed", w.AimSpeed)
+    -- plr_viewmodel_state_transition_speed: the transition time is divided
+    -- by this value, but the game's SlerpValue.update is an UNCLAMPED
+    -- double-lerp (v3 = min(dt,0.05) * speed). Past ~x3 the blend overshoots
+    -- (1 < v3 < 2 = ringing, v3 >= 2 = divergent) which flails the viewmodel
+    -- through the camera - so the multiplier is hard-capped at x3.
+    local aim = math.clamp(tonumber(w.AimSpeed) or 1, 1, 3)
+    mult("plr_viewmodel_state_transition_speed", aim)
     mult("plr_swift_switch_speed_multiplier", w.SwitchSpeed)
     mult("plr_ergonomics_multiplier", w.ErgoSpeed)
 end
@@ -1257,7 +1270,7 @@ local function buildMenu()
             Config.Weapons.AimSpeed = v
             applySpeedKnobs()
             refreshStatus()
-        end, 0.5, 1, 10, function(v) return ("%g×"):format(v) end)
+        end, 0.5, 1, 3, function(v) return ("%g×"):format(v) end)
     slider(p1, "Weapon Switch",
         function() return Config.Weapons.SwitchSpeed end,
         function(v)
