@@ -31,6 +31,17 @@
                           jump_multiplier). Live per loadout, works through
                           respawns, no side effects on stamina / vault /
                           camera stiffness.
+          Ballistics    - Bullet Velocity x1-x50 / Wallbang x1-x100: bullets
+                          are real client-simulated projectiles (caster
+                          module). Drop = gravity * t^2, and t = distance /
+                          velocity - so a high muzzle velocity removes the
+                          drop in practice (x15 flies essentially flat) and
+                          the mod zeroes velocity_drop to kill the drag. The
+                          values are written on weapon.build_result.
+                          ammunition (the exact table every shot reads).
+                          Wallbang scales plr_penetration_multiplier - the
+                          game's own projectile penetration multiplier
+                          (per-surface check L334985).
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
                           (shake = (1 - arm_stamina/max) * shake_mult, L364597)
           Infinite Stam - sprint / lean / jump / vault drains -> 0
@@ -119,7 +130,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v18"
+local SCRIPT_VERSION = "dl-v19"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -145,6 +156,8 @@ local DEFAULTS = {
                            -- injection - see FAST RELOAD section)
         ZeroWeight = false,-- walk at weightless speed: overrides.speed =
                            -- weight/10 + 1 cancels the weight divisor
+        BulletVelocity = 15,-- muzzle velocity x15 (drop ~gone; see BALLISTICS)
+        Wallbang = 1,      -- projectile penetration multiplier (x1 vanilla)
         SteadyAim = false, -- arm stamina drains + breathing shake -> 0
         InfStamina = false,-- sprint / lean / jump / vault drains -> 0
         ZeroSway = false,  -- walk bob + look sway -> 0 (knob + live spring stubs)
@@ -218,6 +231,12 @@ Config.Weapons.AimSpeed = math.clamp(tonumber(Config.Weapons.AimSpeed) or 1, 1, 
 -- feeding the live reload track extra time per frame - see FAST RELOAD.
 Config.Weapons.ReloadSpeed = math.clamp(tonumber(Config.Weapons.ReloadSpeed) or 2, 1, 3)
 
+-- Ballistics: Bullet Velocity multiplies the muzzle velocity written on the
+-- weapon build (see BALLISTICS section); Wallbang scales the game's live
+-- projectile penetration multiplier.
+Config.Weapons.BulletVelocity = math.clamp(tonumber(Config.Weapons.BulletVelocity) or 15, 1, 50)
+Config.Weapons.Wallbang = math.clamp(tonumber(Config.Weapons.Wallbang) or 1, 1, 100)
+
 -- ============================================================
 -- DEADLINE WEAPON FRAMEWORK  (the live levers)
 -- ============================================================
@@ -250,6 +269,7 @@ local MOD_KNOBS = {
     "plr_viewmodel_state_transition_speed",
     "plr_swift_switch_speed_multiplier",
     "plr_ergonomics_multiplier",
+    "plr_penetration_multiplier",
     "plr_arm_stamina_drain",
     "plr_arm_stamina_drain_hold_breath",
     "plr_stamina_shake_multiplier",
@@ -805,14 +825,16 @@ end
 
 -- fresh character = fresh controller + fresh tracks: pick them up shortly
 -- after spawn (retries - the controller is built over the first seconds).
--- Also keeps the Zero Weight controller cache warm.
+-- Also keeps the Zero Weight / Ballistics controller cache warm.
 track(LocalPlayer.CharacterAdded:Connect(function()
-    if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight then return end
+    if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight
+        and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1 then return end
     task.spawn(function()
         for _, d in ipairs({ 1, 2, 3 }) do
             task.wait(d)
             if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
-            if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight then return end
+            if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight
+                and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1 then return end
             pcall(refreshControllerCache)
         end
     end)
@@ -910,6 +932,117 @@ track(RunService.RenderStepped:Connect(function()
         warn(("[deadline] zero weight step error (%d): %s"):format(zwErrCount, tostring(err)))
     end
 end))
+
+-- ============================================================
+-- BALLISTICS  (bullet velocity / no drop + wallbang)
+-- ============================================================
+-- Bullets are real client-simulated projectiles (caster module). The path
+-- (L334935) is: pos = origin + dir * (v*t / (t*drag + 1)) + gravity*t^2,
+-- with gravity = workspace.Gravity (untouchable - it drives the whole
+-- game). The drop is g*t^2 in TIME though, and t = distance / velocity -
+-- so a high enough muzzle velocity makes it vanish (x15: 400 studs fly in
+-- ~1/60 s -> well under a stud of drop). velocity / velocity_drop live on
+-- the weapon's build result (weapon.build_result.ammunition - the exact
+-- table every shot reads: fire L374718, path use L335754), and
+-- velocity_drop is read per frame, so in-flight bullets flatten too.
+-- Wallbang: penetrate_bullet (L334942) compares
+--   bullet_penetration_ability * plr_penetration_multiplier
+-- against the surface cost (L334985) - the multiplier is the game's own
+-- "Projectile penetration multiplier", read live by the client sim.
+-- Explosive / physical rounds (rockets etc.) are left vanilla.
+-- Hygiene: originals captured once per table on genv (weak keys), so a
+-- re-execution while boosted can never learn boosted values as vanilla.
+local BALL_STATE = genv.__HAVOC_DEADLINE_BALL
+if type(BALL_STATE) ~= "table" then
+    BALL_STATE = { saved = setmetatable({}, { __mode = "k" }) }
+    genv.__HAVOC_DEADLINE_BALL = BALL_STATE
+end
+if type(BALL_STATE.saved) ~= "table" then
+    BALL_STATE.saved = setmetatable({}, { __mode = "k" })
+end
+
+local function ammoTableFor(controller)
+    local weapon = rawget(controller, "weapon")
+    local br = type(weapon) == "table" and rawget(weapon, "build_result") or nil
+    return type(br) == "table" and rawget(br, "ammunition") or nil
+end
+
+local function paintAmmo(amm, mult)
+    if type(amm) ~= "table" then return end
+    local list = { amm }
+    local mixing = rawget(amm, "ammo_mixing")
+    if type(mixing) == "table" then
+        for _, entry in ipairs(mixing) do
+            if type(entry) == "table" then table.insert(list, entry) end
+        end
+    end
+    for _, t in ipairs(list) do
+        local v = tonumber(rawget(t, "velocity"))
+        if v then
+            -- rockets / explosives keep their vanilla ballistics
+            local explosive = rawget(t, "explosion_on_hit") ~= nil or rawget(t, "is_physical") == true
+            if not explosive then
+                local entry = BALL_STATE.saved[t]
+                if entry == nil then
+                    entry = { velocity = v, velocity_drop = tonumber(rawget(t, "velocity_drop")) or 0 }
+                    BALL_STATE.saved[t] = entry
+                end
+                t.velocity = entry.velocity * mult
+                t.velocity_drop = 0
+            end
+        end
+    end
+end
+
+local function ballisticsRestore()
+    for tbl, entry in pairs(BALL_STATE.saved) do
+        if type(tbl) == "table" then
+            pcall(function()
+                tbl.velocity = entry.velocity
+                tbl.velocity_drop = entry.velocity_drop
+            end)
+        end
+        BALL_STATE.saved[tbl] = nil
+    end
+end
+
+local function ballisticsStep()
+    local mult = tonumber(Config.Weapons.BulletVelocity) or 1
+    if mult <= 1 then
+        if next(BALL_STATE.saved) ~= nil then pcall(ballisticsRestore) end
+        return
+    end
+    for controller in pairs(CTRL_STATE.tracked) do
+        if type(controller) == "table" then
+            local cd = rawget(controller, "char_data")
+            if type(cd) == "table" and isLocalCharData(controller, cd) then
+                paintAmmo(ammoTableFor(controller), mult)
+            end
+        end
+    end
+end
+
+local ballErrCount = 0
+track(RunService.RenderStepped:Connect(function()
+    if (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1 and next(BALL_STATE.saved) == nil then return end
+    local ok, err = pcall(ballisticsStep)
+    if not ok and ballErrCount < 3 then
+        ballErrCount = ballErrCount + 1
+        warn(("[deadline] ballistics step error (%d): %s"):format(ballErrCount, tostring(err)))
+    end
+end))
+
+-- Wallbang knob (heartbeat-managed like the other handling knobs).
+local function applyBallistics()
+    if not RESOURCES_OK then return end
+    local power = tonumber(Config.Weapons.Wallbang) or 1
+    local o = ORIG.knobs and ORIG.knobs["plr_penetration_multiplier"]
+    if power > 1 and o ~= nil then
+        setKnob("plr_penetration_multiplier", o * power)
+    else
+        restoreKnob("plr_penetration_multiplier")
+    end
+end
 
 -- ============================================================
 -- AUDIO: NO DEAFNESS  (death + explosion hearing loss, ringing)
@@ -1765,6 +1898,21 @@ local function buildMenu()
             refreshStatus()
         end)
 
+    section(p1, "Ballistics")
+    slider(p1, "Bullet Velocity",
+        function() return Config.Weapons.BulletVelocity end,
+        function(v)
+            Config.Weapons.BulletVelocity = v
+            refreshStatus()
+        end, 1, 1, 50, function(v) return ("%g×"):format(v) end)
+    slider(p1, "Wallbang",
+        function() return Config.Weapons.Wallbang end,
+        function(v)
+            Config.Weapons.Wallbang = v
+            applyBallistics()
+            refreshStatus()
+        end, 1, 1, 100, function(v) return ("%g×"):format(v) end)
+
     section(p1, "Stability")
     toggle(p1, "Steady Aim",
         function() return Config.Weapons.SteadyAim end,
@@ -1830,9 +1978,13 @@ local function buildMenu()
         w.ZeroSway = false
         w.NoDeaf = false
         w.ZeroWeight = false
+        w.BulletVelocity = 1
+        w.Wallbang = 1
         pcall(unstubSwaySprings)
         pcall(applyNoDeaf, false)
         pcall(zeroWeightRestore)
+        pcall(ballisticsRestore)
+        pcall(applyBallistics)
         applyAll()
         refreshGUI()
         refreshStatus()
@@ -1888,7 +2040,7 @@ task.spawn(function()
         -- Zero Sight Sway toggle was still on
         pcall(unstubSwaySprings)
     end
-    if (tonumber(Config.Weapons.ReloadSpeed) or 1) > 1 then
+    if (tonumber(Config.Weapons.ReloadSpeed) or 1) > 1 or (tonumber(Config.Weapons.BulletVelocity) or 1) > 1 then
         task.spawn(function() pcall(refreshControllerCache) end)
     end
     if Config.Weapons.ZeroWeight then
@@ -1900,6 +2052,16 @@ task.spawn(function()
         -- reconcile: an earlier run can leave overrides.speed boosted
         pcall(zeroWeightRestore)
     end
+    if (tonumber(Config.Weapons.BulletVelocity) or 1) > 1 then
+        task.spawn(function()
+            pcall(refreshControllerCache)
+            pcall(ballisticsStep)
+        end)
+    else
+        -- reconcile: an earlier run can leave caliber tables boosted
+        pcall(ballisticsRestore)
+    end
+    pcall(applyBallistics)
     if Config.Weapons.NoDeaf then
         pcall(applyNoDeaf, true)
     end
@@ -1914,10 +2076,13 @@ task.spawn(function()
         task.wait(0.5)
         local w = Config.Weapons
         if w.RecoilPct < 100 or w.SpreadPct < 100 or w.AimSpeed ~= 1 or w.SwitchSpeed ~= 1
-            or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina or w.ZeroSway or w.ZeroWeight then
+            or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina or w.ZeroSway or w.ZeroWeight
+            or (tonumber(w.BulletVelocity) or 1) > 1 or (tonumber(w.Wallbang) or 1) > 1 then
             local ok, err = pcall(function()
                 applyAll()
                 zeroWeightStep()
+                ballisticsStep()
+                applyBallistics()
                 refreshStatus()
             end)
             if not ok and not warned then
@@ -1938,9 +2103,10 @@ task.spawn(function()
         else
             swayScanTick = 0
         end
-        -- keep the reload-speed / zero-weight controller cache warm (new
-        -- characters / controllers that appeared after boot)
-        if (tonumber(w.ReloadSpeed) or 1) > 1 or w.ZeroWeight then
+        -- keep the reload-speed / zero-weight / ballistics controller cache
+        -- warm (new characters / controllers that appeared after boot)
+        if (tonumber(w.ReloadSpeed) or 1) > 1 or w.ZeroWeight
+            or (tonumber(w.BulletVelocity) or 1) > 1 then
             reloadScanTick = reloadScanTick + 1
             if reloadScanTick >= 60 then
                 reloadScanTick = 0
