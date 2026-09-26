@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v40"
+local SCRIPT_VERSION = "crim-v41"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -1198,6 +1198,38 @@ local function liveSpreadApply(noSpread, announce)
     return n
 end
 
+-- zero the spread family on the Config module of EVERY tool in hands or
+-- backpack - so any gun module load (even one racing our arrival hook)
+-- reads zeros
+local function zeroToolConfigsNow()
+    pcall(function()
+        local roots = {}
+        local char = LocalPlayer.Character
+        if char then roots[#roots + 1] = char end
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        if bp then roots[#roots + 1] = bp end
+        for _, root in ipairs(roots) do
+            for _, tool in ipairs(root:GetChildren()) do
+                if tool:IsA("Tool") then
+                    local mod = tool:FindFirstChild("Config")
+                    if mod and mod:IsA("ModuleScript") then
+                        local cfg = require(mod)
+                        if type(cfg) == "table" then
+                            for _, key in ipairs({ "Spread", "WalkSpreadIncrease", "CrossExpansion" }) do
+                                if type(safeField(cfg, key)) == "number" then pcall(function() cfg[key] = 0 end) end
+                            end
+                            local sni = safeField(cfg, "SniperSettings")
+                            if type(sni) == "table" and type(safeField(sni, "WalkSpread")) == "number" then
+                                pcall(function() sni.WalkSpread = 0 end)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
 -- watchdog: hold the zero while No Spread is on. Gun loads can re-snapshot
 -- values into fresh tables; this re-asserts twice a second (writes only -
 -- no GC scans unless the gun actually changed).
@@ -1206,6 +1238,7 @@ task.spawn(function()
         task.wait(0.5)
         if Config.Weapons.NoSpread then
             pcall(liveSpreadApply, true, false)
+            pcall(zeroToolConfigsNow)
         end
     end
 end)
