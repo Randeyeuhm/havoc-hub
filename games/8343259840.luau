@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v36"
+local SCRIPT_VERSION = "crim-v37"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -1136,15 +1136,6 @@ local function liveApplyNow(announce)
         sent = triggerBulletRefresh()
         task.wait(0.2)
     end
-    local toolName = "none"
-    pcall(function()
-        local char = LocalPlayer.Character
-        local tool = char and char:FindFirstChildOfClass("Tool")
-        toolName = tool and tool.Name or "none"
-    end)
-    -- one copyable line: tells us exactly which stage happened
-    print(("[criminality] live apply: tool=%s matches=%d states=%d patched=%d statesPatched=%d ubl=%s keySent=%s pct=%d"):format(
-        toolName, #liveFcf.cands, #liveFcf.states, n, sp, tostring(liveFcf.hasUBL), tostring(sent), math.floor(pct + 0.5)))
     if announce then
         if n == 0 and sp == 0 then
             notify("Live apply: no live copy found - use Apply % / Auto apply instead")
@@ -1585,7 +1576,6 @@ pcall(function()
         local cur = e2:FindFirstChild("RCL")
         if cur and cur ~= bak then pcall(function() cur:Destroy() end) end
         bak.Name = "RCL"
-        print("[criminality] cleaned up an old RCL swap (original restored)")
     end
 end)
 
@@ -2872,18 +2862,12 @@ local function buildMenu()
                 return
             end
             task.spawn(function()
-                local applied, blocked = applyRecoil()
-                local guns = applyGunRecoil()
-                local anchored = applyAnchoredPatches()
-                local cands = applyCandidates()
-                applyRecoilCopy(v)
+                pcall(applyRecoil)
+                pcall(applyGunRecoil)
+                pcall(applyAnchoredPatches)
+                pcall(applyCandidates)
+                pcall(applyRecoilCopy, v)
                 pcall(liveFcfApply, v, false)
-                print(("[criminality] recoil %d%% -> live %s, configs %d, CamShake %d | anchored %d, candidates %d%s"):format(
-                    math.floor(v + 0.5), rclHook.active and "on" or "off", guns, applied, anchored, cands,
-                    blocked > 0 and (" (" .. blocked .. " locked)") or ""))
-                if math.floor(v + 0.5) ~= 100 then
-                    -- (candidate hunts retired: they never found anything live)
-                end
             end)
         end, 5, 0, 200)
     toggle(p3, "Apply Recoil %", function() return Config.Weapons.LiveApply end,
@@ -3368,13 +3352,8 @@ end)
 if not Config.Weapons.LiveApply then recoilForcePct = 100 end
 if Config.Misc.Fullbright then pcall(setFullbright, true) end
 task.spawn(function()
-    local applied = applyRecoil()
-    local guns = applyGunRecoil()
-    local pct = tonumber(Config.Weapons.RecoilPct) or 100
-    if pct ~= 100 then
-        print(("[criminality] recoil %d%% active - gun configs %d, CamShake %d, live mode %s"):format(
-            math.floor(pct + 0.5), guns, applied, rclHook.mode))
-    end
+    pcall(applyRecoil)
+    pcall(applyGunRecoil)
 end)
 
 print(("[Havoc Hub] Criminality script loaded (PlaceId %d)"):format(game.PlaceId))
