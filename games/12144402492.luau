@@ -6,7 +6,15 @@
     Both places share the exact same client framework, so the loader maps the
     whole universe here (see UNIVERSES in loader.luau).
 
-      • Weapons - Recoil % / Spread % : live multipliers, no hooks
+      • Weapons tab - everything live via the game's own shared_state knobs:
+          Recoil %      - plr_recoil + every recoil trait (debug values)
+          Spread %      - plr_barrel_deviation / plr_buck_barrel_deviation
+          Aim In Speed  - plr_viewmodel_state_transition_speed   (dump L356495)
+          Weapon Switch - plr_swift_switch_speed_multiplier      (dump L360193)
+          Ergonomics x  - plr_ergonomics_multiplier              (dump L347293)
+          Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
+                          (shake = (1 - arm_stamina/max) * shake_mult, L364597)
+          Infinite Stam - sprint / lean / jump / vault drains -> 0
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -26,6 +34,13 @@
         own debug UI works ("unapply debug_values" = changed = false). At 0%
         every recoil spring gets a 0 coefficient, so a true-zero is guaranteed
         no matter which internal path feeds the camera.
+      * the handling knobs are plain SharedValues too, all read live client-side:
+        the aim/lean/crouch viewmodel transition time is divided by the
+        transition speed (L356495), weapon draw/holster lerps are multiplied by
+        swift switch (L360193), ergonomics scales the weapon stat behind lean /
+        handling timings (L347293), and breathing sway uses arm stamina + the
+        shake multiplier (L364589-364600 - fully suppressed while holding
+        breath, which arm stamina gates).
 
     Menu key: RightShift. Config: havoc_hub/deadline_config.json.
 ]]
@@ -60,7 +75,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v2"
+local SCRIPT_VERSION = "dl-v3"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -73,11 +88,17 @@ pcall(function()
     end
 end)
 
--- 100 = vanilla weapon, 0 = fully off (dead straight bullets / no kick)
+-- 100 = vanilla weapon, 0 = fully off (dead straight bullets / no kick);
+-- x1 = vanilla speed multiplier for the handling sliders.
 local DEFAULTS = {
     Weapons = {
         RecoilPct = 100,
         SpreadPct = 100,
+        AimSpeed = 1,      -- plr_viewmodel_state_transition_speed  (x vanilla)
+        SwitchSpeed = 1,   -- plr_swift_switch_speed_multiplier     (x vanilla)
+        ErgoSpeed = 1,     -- plr_ergonomics_multiplier             (x vanilla)
+        SteadyAim = false, -- arm stamina drains + breathing shake -> 0
+        InfStamina = false,-- sprint / lean / jump / vault drains -> 0
     },
 }
 
@@ -149,6 +170,21 @@ local RECOIL_TRAITS = {
 local DIRECTION_TRAIT_FLOOR = 0.01
 local DIRECTION_TRAITS = { horizontal_recoil = true, vertical_recoil = true }
 
+-- Extra shared_state knobs this script writes (dl-v3). Originals are
+-- captured once below and restored by every "off" path.
+local MOD_KNOBS = {
+    "plr_viewmodel_state_transition_speed",
+    "plr_swift_switch_speed_multiplier",
+    "plr_ergonomics_multiplier",
+    "plr_arm_stamina_drain",
+    "plr_arm_stamina_drain_hold_breath",
+    "plr_stamina_shake_multiplier",
+    "plr_stamina_run_drain",
+    "plr_stamina_lean_drain",
+    "plr_stamina_jump_drain",
+    "plr_vault_stamina_drain",
+}
+
 local SHARED_STATE, plrRecoil, plrBarrel, plrBuck
 local RECOIL_DEBUG
 local RESOURCES_OK = false
@@ -198,6 +234,17 @@ if RESOURCES_OK and genv.__HAVOC_DEADLINE_ORIG == nil then
 end
 local ORIG = genv.__HAVOC_DEADLINE_ORIG or { recoil = 1, barrel = 1, buck = 1, traits = {} }
 
+-- knob originals: backfill for ORIG caches created by older builds, so a
+-- re-execution after a dl-v2 run still learns the true vanilla values.
+if RESOURCES_OK then
+    if type(ORIG.knobs) ~= "table" then ORIG.knobs = {} end
+    for _, name in ipairs(MOD_KNOBS) do
+        if ORIG.knobs[name] == nil and SHARED_STATE[name] then
+            ORIG.knobs[name] = SHARED_STATE[name].value
+        end
+    end
+end
+
 -- ---- live apply / restore ------------------------------------------------
 -- All writes are consumed per shot by the game's own fire code:
 --   * plr_* SharedValues  -> read as .value every shot
@@ -238,6 +285,79 @@ local function applySpread(pct)
     local s = (tonumber(pct) or 100) / 100
     if plrBarrel then plrBarrel.value = ORIG.barrel * s end
     if plrBuck then plrBuck.value = ORIG.buck * s end
+end
+
+-- ---- handling / stamina knobs (dl-v3) -------------------------------------
+
+local function setKnob(name, value)
+    if not RESOURCES_OK then return false end
+    local kv = SHARED_STATE[name]
+    if not kv then return false end
+    kv.value = value
+    return true
+end
+
+local function restoreKnob(name)
+    local og = ORIG.knobs and ORIG.knobs[name]
+    if og == nil then return false end
+    return setKnob(name, og)
+end
+
+-- Handling multipliers are relative to vanilla: write = original x slider.
+-- plr_viewmodel_state_transition_speed: the transition time is DIVIDED by
+-- this value, so higher = the gun raises/leans/crouches faster.
+local function applySpeedKnobs()
+    if not RESOURCES_OK then return end
+    local w = Config.Weapons
+    local o = ORIG.knobs or {}
+    local function mult(name, m)
+        if o[name] ~= nil then setKnob(name, o[name] * (tonumber(m) or 1)) end
+    end
+    mult("plr_viewmodel_state_transition_speed", w.AimSpeed)
+    mult("plr_swift_switch_speed_multiplier", w.SwitchSpeed)
+    mult("plr_ergonomics_multiplier", w.ErgoSpeed)
+end
+
+-- Steady Aim: aiming never fatigues (arm stamina drains -> 0) and the
+-- breathing shake term (L364597) is zeroed, so the reticle stays put.
+local function applySteadyAim()
+    if not RESOURCES_OK then return end
+    if Config.Weapons.SteadyAim then
+        setKnob("plr_arm_stamina_drain", 0)
+        setKnob("plr_arm_stamina_drain_hold_breath", 0)
+        setKnob("plr_stamina_shake_multiplier", 0)
+    else
+        restoreKnob("plr_arm_stamina_drain")
+        restoreKnob("plr_arm_stamina_drain_hold_breath")
+        restoreKnob("plr_stamina_shake_multiplier")
+    end
+end
+
+-- Infinite Stamina: every stamina drain the client applies -> 0, so
+-- sprinting and leaning around corners never tire you out.
+local function applyInfStamina()
+    if not RESOURCES_OK then return end
+    local names = {
+        "plr_stamina_run_drain", "plr_stamina_lean_drain",
+        "plr_stamina_jump_drain", "plr_vault_stamina_drain",
+    }
+    for _, name in ipairs(names) do
+        if Config.Weapons.InfStamina then
+            setKnob(name, 0)
+        else
+            restoreKnob(name)
+        end
+    end
+end
+
+-- Everything this script applies, in one idempotent pass. Safe to call on
+-- a heartbeat: untouched features just rewrite their originals.
+local function applyAll()
+    applyRecoil(Config.Weapons.RecoilPct)
+    applySpread(Config.Weapons.SpreadPct)
+    applySpeedKnobs()
+    applySteadyAim()
+    applyInfStamina()
 end
 
 -- ============================================================
@@ -397,8 +517,14 @@ local statusLabel  -- live multiplier readout, refreshed on every change
 local function refreshStatus()
     if not statusLabel then return end
     if RESOURCES_OK then
-        statusLabel.Text = ("live multipliers:  recoil x%.2f  ·  spread x%.2f / x%.2f")
-            :format(plrRecoil.value, plrBarrel.value, plrBuck.value)
+        local function kv(name)
+            local o = SHARED_STATE[name]
+            return (o and tonumber(o.value)) or 0
+        end
+        statusLabel.Text = ("recoil x%.2f  ·  spread x%.2f / x%.2f  ·  aim x%.2f  ·  switch x%.2f  ·  ergo x%.2f")
+            :format(kv("plr_recoil"), kv("plr_barrel_deviation"), kv("plr_buck_barrel_deviation"),
+                kv("plr_viewmodel_state_transition_speed"), kv("plr_swift_switch_speed_multiplier"),
+                kv("plr_ergonomics_multiplier"))
     else
         statusLabel.Text = "weapon levers unavailable - re-execute in the game (framework not found)"
     end
@@ -479,17 +605,69 @@ local function buildMenu()
             if v == 100 and prev ~= 100 then notify("Spread back to vanilla") end
         end, 5, 0, 100, function(v) return ("%d%%"):format(v) end)
 
+    section(p1, "Speed")
+    slider(p1, "Aim In Speed",
+        function() return Config.Weapons.AimSpeed end,
+        function(v)
+            Config.Weapons.AimSpeed = v
+            applySpeedKnobs()
+            refreshStatus()
+        end, 0.5, 1, 10, function(v) return ("%g×"):format(v) end)
+    slider(p1, "Weapon Switch",
+        function() return Config.Weapons.SwitchSpeed end,
+        function(v)
+            Config.Weapons.SwitchSpeed = v
+            applySpeedKnobs()
+            refreshStatus()
+        end, 0.25, 1, 5, function(v) return ("%g×"):format(v) end)
+    slider(p1, "Ergonomics",
+        function() return Config.Weapons.ErgoSpeed end,
+        function(v)
+            Config.Weapons.ErgoSpeed = v
+            applySpeedKnobs()
+            refreshStatus()
+        end, 0.5, 1, 10, function(v) return ("%g×"):format(v) end)
+    note(p1, "Speed multipliers are relative to vanilla (x1). Aim In Speed = how fast the gun raises when you aim " ..
+        "(all viewmodel transitions: aim, lean, crouch, prone). Ergonomics drives the weapon stat behind leaning " ..
+        "and handling timings.")
+
+    section(p1, "Stability")
+    toggle(p1, "Steady Aim",
+        function() return Config.Weapons.SteadyAim end,
+        function(v)
+            Config.Weapons.SteadyAim = v
+            applySteadyAim()
+            refreshStatus()
+            notify(v and "Steady aim: arms never tire, breathing shake off" or "Steady aim off")
+        end)
+    toggle(p1, "Infinite Stamina",
+        function() return Config.Weapons.InfStamina end,
+        function(v)
+            Config.Weapons.InfStamina = v
+            applyInfStamina()
+            refreshStatus()
+            notify(v and "Infinite stamina: sprint and lean forever" or "Infinite stamina off")
+        end)
+    note(p1, "Steady Aim: aiming and holding breath never drain arm stamina, and the breathing shake stops - " ..
+        "your aim stays planted between shots. Infinite Stamina: sprinting and leaning never tire you out.")
+
     statusLabel = note(p1, "loading...")
 
     section(p1, "About")
-    note(p1, "These write the game's own live multipliers (module/shared_state + recoil debug values) " ..
-        "that the firing code reads on EVERY shot - no hooks, no remotes. The values keep re-asserting " ..
-        "while lowered, so they can't drift back. 100% = vanilla, 0% = off; test in the lobby shooting range.")
+    note(p1, "Everything above writes the game's own live multipliers (module/shared_state + recoil debug " ..
+        "values) that the game reads as you play - no hooks, no remotes, nothing sent to the server. " ..
+        "The values keep re-asserting, so they can't drift back. 100% / x1 = vanilla, everything restores " ..
+        "instantly. Test in the lobby shooting range.")
     button(p1, "Restore vanilla", function()
-        Config.Weapons.RecoilPct = 100
-        Config.Weapons.SpreadPct = 100
-        applyRecoil(100)
-        applySpread(100)
+        local w = Config.Weapons
+        w.RecoilPct = 100
+        w.SpreadPct = 100
+        w.AimSpeed = 1
+        w.SwitchSpeed = 1
+        w.ErgoSpeed = 1
+        w.SteadyAim = false
+        w.InfStamina = false
+        applyAll()
         refreshGUI()
         refreshStatus()
         saveConfig()
@@ -510,22 +688,21 @@ end
 -- BOOT: apply saved state + keep it applied
 -- ============================================================
 task.spawn(function()
-    pcall(function()
-        applyRecoil(Config.Weapons.RecoilPct)
-        applySpread(Config.Weapons.SpreadPct)
-    end)
+    pcall(applyAll)
     refreshStatus()
 
     -- Slow re-assert: shared state is rebroadcast by the game on some
-    -- events (joins / match transitions), and a lowered slider should
-    -- survive that without any user action.
+    -- events (joins / match transitions), and any piece that is not at
+    -- vanilla should survive that without user action.
     local warned = false
     while genv.__HAVOC_DEADLINE_GEN == MY_GEN do
         task.wait(0.5)
-        if Config.Weapons.RecoilPct < 100 or Config.Weapons.SpreadPct < 100 then
+        local w = Config.Weapons
+        if w.RecoilPct < 100 or w.SpreadPct < 100 or w.AimSpeed ~= 1 or w.SwitchSpeed ~= 1
+            or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina then
             local ok, err = pcall(function()
-                if Config.Weapons.RecoilPct < 100 then applyRecoil(Config.Weapons.RecoilPct) end
-                if Config.Weapons.SpreadPct < 100 then applySpread(Config.Weapons.SpreadPct) end
+                applyAll()
+                refreshStatus()
             end)
             if not ok and not warned then
                 warned = true
