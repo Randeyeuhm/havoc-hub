@@ -57,7 +57,7 @@ local Players     = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
 local ESP = {}
-ESP.VERSION = "esp-v6-class-lib"
+ESP.VERSION = "esp-v7-guarded"
 
 -- ============================================================
 -- SCHEMA
@@ -333,17 +333,29 @@ local LABEL_KEYS = {
 }
 
 local function newLine()
+    -- Knock on the door before indexing: pcall(Drawing.new, ..) itself
+    -- THROWS when Drawing is nil (the index happens before the call), and
+    -- that used to blow up the entire render call chain silently.
+    if not Drawing or type(Drawing.new) ~= "function" then return nil end
     local ok, l = pcall(Drawing.new, "Line")
     if not ok or not l then return nil end
-    l.Visible, l.Thickness, l.Transparency, l.ZIndex = false, 2, 1, 2
+    pcall(function()
+        l.Visible, l.Thickness, l.Transparency, l.ZIndex = false, 2, 1, 2
+    end)
     return l
 end
 
 local function newText()
+    if not Drawing or type(Drawing.new) ~= "function" then return nil end
     local ok, t = pcall(Drawing.new, "Text")
     if not ok or not t then return nil end
-    t.Visible, t.Font, t.Size = false, Drawing.Fonts.UI, 16
-    t.Outline, t.OutlineColor, t.Center = true, Color3.fromRGB(0, 0, 0), false
+    pcall(function()
+        t.Visible, t.Size = false, 16
+        t.Outline, t.OutlineColor, t.Center = true, Color3.fromRGB(0, 0, 0), false
+        if type(Drawing.Fonts) == "table" and Drawing.Fonts.UI ~= nil then
+            t.Font = Drawing.Fonts.UI
+        end
+    end)
     return t
 end
 
@@ -686,7 +698,13 @@ function ESPClass:Render(cam)
     local removals = nil
     for model, d in pairs(self.Objects) do
         local ok, keep = pcall(renderOne, cfg, model, d, cam, maxDist, viewportH, fovTan, localRoot)
-        if not ok or keep == false then
+        if not ok then
+            -- Record instead of silently dropping the model: a persistent
+            -- error used to create + destroy 12 drawings every frame, which
+            -- is invisible in-game AND hides the actual failure.
+            self.lastError = tostring(keep)
+            self.errorCount = (self.errorCount or 0) + 1
+        elseif keep == false then
             removals = removals or {}
             table.insert(removals, model)
         end

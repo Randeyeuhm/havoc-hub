@@ -110,7 +110,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v13"
+local SCRIPT_VERSION = "dl-v14"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1211,6 +1211,72 @@ else
     notify = function(text) print("[Havoc Hub]", tostring(text)) end
 end
 
+-- ESP diagnostics - fired whenever ESP flips on (menu toggle or hotkey).
+-- Prints one console line + a toast, then after 1.5s counts the engine's
+-- live drawing objects, so a dead link in the chain (no library / no
+-- Drawing API / no rigs / everything stuck hidden / render error) names
+-- itself instead of the ESP silently doing nothing.
+local function espOnDiagnostics()
+    local renderer = getEspRenderer()
+    local n = 0
+    eachEnemyRig(function() n = n + 1 end)
+    local c = Config.ESP
+    local els = {}
+    if c.Box then els[#els + 1] = "box" end
+    if c.Name then els[#els + 1] = "name" end
+    if c.Distance then els[#els + 1] = "dist" end
+    if c.Health then els[#els + 1] = "hp" end
+    if c.ChamsHead then els[#els + 1] = "cham:head" end
+    if c.ChamsBody then els[#els + 1] = "cham:body" end
+    if c.Tracers then els[#els + 1] = "tracers" end
+    local drawingOK = type(Drawing) == "table" and type(Drawing.new) == "function"
+    print(("[deadline] ESP diag - renderer:%s  drawing:%s  rigs:%d  elements:%s")
+        :format(renderer and "ok" or "MISSING", drawingOK and "ok" or "MISSING",
+            n, #els > 0 and table.concat(els, ",") or "NONE"))
+    if not renderer then
+        notify("ESP library not loaded - check the console (F9)")
+    elseif not drawingOK then
+        notify("ESP on, but this executor has no Drawing API - nothing can draw")
+    elseif #els == 0 then
+        notify("ESP on, but every element toggle is off (Box / Name / ...)")
+    elseif n == 0 then
+        notify("ESP on - no rigs in workspace.characters right now")
+    else
+        notify(("ESP on - %d rig(s)"):format(n))
+    end
+    if renderer and drawingOK and #els > 0 and n > 0 then
+        task.delay(1.5, function()
+            if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
+            if not Config.ESP.Enabled then return end
+            local engine = renderer.engine
+            local tracked, visible, total = 0, 0, 0
+            if engine then
+                local keys = { "TL_V", "TL_H", "TR_V", "TR_H", "BL_V", "BL_H", "BR_V", "BR_H",
+                    "NameLabel", "DistanceLabel", "HealthLabel", "Tracer" }
+                for _, d in pairs(engine.Objects) do
+                    tracked = tracked + 1
+                    for _, k in ipairs(keys) do
+                        local o = d[k]
+                        if o then
+                            total = total + 1
+                            if o.Visible == true then visible = visible + 1 end
+                        end
+                    end
+                end
+            end
+            local err = engine and engine.lastError
+            print(("[deadline] ESP check - %d rig(s) tracked, %d/%d drawings visible%s")
+                :format(tracked, visible, total,
+                    err and ("  render error: " .. tostring(err)) or ""))
+            if total == 0 then
+                notify("ESP check: no drawing objects were created - check the console (F9)")
+            elseif visible == 0 then
+                notify("ESP check: drawings stuck hidden - check the console (F9)")
+            end
+        end)
+    end
+end
+
 -- ============================================================
 -- GUI CONTROL REGISTRY + UILIB WIRING
 -- ============================================================
@@ -1265,7 +1331,11 @@ local Hotkeys = {
       Action = function()
           Config.ESP.Enabled = not Config.ESP.Enabled
           refreshGUI(); saveConfig()
-          notify("Player ESP: " .. (Config.ESP.Enabled and "on" or "off"))
+          if Config.ESP.Enabled then
+              espOnDiagnostics()
+          else
+              notify("Player ESP: off")
+          end
       end },
 }
 
@@ -1425,15 +1495,7 @@ local function buildMenu()
         function() return Config.ESP.Enabled end,
         function(v)
             Config.ESP.Enabled = v
-            if v then
-                if not getEspRenderer() then
-                    notify("ESP library not loaded - check the console (F9)")
-                else
-                    local n = 0
-                    eachEnemyRig(function() n = n + 1 end)
-                    print(("[deadline] ESP on - %d rig(s) found in workspace.characters"):format(n))
-                end
-            end
+            if v then espOnDiagnostics() end
         end,
         hotkeyById.ToggleESP)
     bindrow(pe, hotkeyById.ToggleESP)
@@ -1653,10 +1715,15 @@ end
 -- ============================================================
 -- RENDER LOOPS  (ESP frame + camera aim after the game's camera)
 -- ============================================================
+local espRenderErrors = 0
 track(RunService.RenderStepped:Connect(function()
     local cam = workspace.CurrentCamera
     if not cam then return end
-    pcall(renderESP, cam)
+    local ok, err = pcall(renderESP, cam)
+    if not ok and espRenderErrors < 6 then
+        espRenderErrors = espRenderErrors + 1
+        warn(("[deadline] ESP render error (%d): %s"):format(espRenderErrors, tostring(err)))
+    end
     pcall(updateFovCircle, UserInputService:GetMouseLocation())
 end))
 
