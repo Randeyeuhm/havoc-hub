@@ -60,7 +60,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v1"
+local SCRIPT_VERSION = "dl-v2"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -140,6 +140,15 @@ local RECOIL_TRAITS = {
     "animation_weight",
 }
 
+-- The fire code does `new_1.Unit * v19` (dump L362547) to normalise the kick
+-- direction. Vector2(0,0).Unit is NaN, and a single NaN shot permanently
+-- poisons the recoil springs = the gun breaks at exactly 0%. These two
+-- traits build that direction vector, so they never scale below a small
+-- floor. Every camera-spring coefficient (the traits below) still goes to
+-- exactly 0 at 0%, so the slider stays a visually true zero.
+local DIRECTION_TRAIT_FLOOR = 0.01
+local DIRECTION_TRAITS = { horizontal_recoil = true, vertical_recoil = true }
+
 local SHARED_STATE, plrRecoil, plrBarrel, plrBuck
 local RECOIL_DEBUG
 local RESOURCES_OK = false
@@ -212,7 +221,12 @@ local function applyRecoil(pct)
                     dv.changed = og.changed
                 else
                     dv.changed = true
-                    dv.value = og.value * s
+                    if DIRECTION_TRAITS[name] then
+                        -- never 0: a zero direction vector makes Unit() NaN
+                        dv.value = math.max(og.value * s, og.value * DIRECTION_TRAIT_FLOOR, 1e-5)
+                    else
+                        dv.value = og.value * s
+                    end
                 end
             end
         end
