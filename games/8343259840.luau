@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v30"
+local SCRIPT_VERSION = "crim-v31"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -1520,7 +1520,14 @@ local function installRCLHook()
 end
 
 pcall(function()
-    installRCLHook()
+    local e2 = ReplicatedStorage:FindFirstChild("Events2")
+    local bak = e2 and e2:FindFirstChild("RCLBackup")
+    if bak then
+        local cur = e2:FindFirstChild("RCL")
+        if cur and cur ~= bak then pcall(function() cur:Destroy() end) end
+        bak.Name = "RCL"
+        print("[criminality] cleaned up an old RCL swap (original restored)")
+    end
 end)
 print(("[criminality] rcl: getconnections=%s | mode=%s top=%d back=%d | %s"):format(
     tostring(type(getconnections)), rclHook.mode,
@@ -2350,20 +2357,8 @@ local function rescaleAndPatch()
     local pctNow = tonumber(Config.Weapons.RecoilPct) or 100
     pcall(function() applyRecoilCopy(pctNow) end)
     local nowT = tick()
-    if not rclHook.active then
-        if nowT - (rclHook.lastTry or 0) > 5 then
-            rclHook.lastTry = nowT
-            task.delay(0.6, function() pcall(installRCLHook) end)
-        end
-    elseif nowT - (rclHook.lastWire or 0) > 3 then
-        rclHook.lastWire = nowT
-        task.delay(0.6, function() pcall(rclWire) end)
-    end
-    -- full recoil hunt once per gun when the slider is off 100% (brief
-    -- one-time hitch, then every slider move is instant from the registry)
-    if pctNow ~= 100 then
-        task.delay(0.9, function() pcall(runHunt, "equip") end)
-    end
+    -- (old RCL install/rewire retired: the RCL vector proved decorative;
+    -- see cleanup block near the rcl section for leftover swap restoration)
 end
 
 local function watchToolsForRecoil(char)
@@ -2828,9 +2823,8 @@ local function buildMenu()
                 print(("[criminality] recoil %d%% -> live %s, configs %d, CamShake %d | anchored %d, candidates %d%s"):format(
                     math.floor(v + 0.5), rclHook.active and "on" or "off", guns, applied, anchored, cands,
                     blocked > 0 and (" (" .. blocked .. " locked)") or ""))
-                if math.floor(v + 0.5) ~= 100
-                    and #recoilCandidates.numbers.list == 0 and #recoilCandidates.fields.list == 0 then
-                    task.delay(0.7, function() pcall(runHunt, "slider") end)
+                if math.floor(v + 0.5) ~= 100 then
+                    -- (candidate hunts retired: they never found anything live)
                 end
             end)
             if Config.Weapons.AutoApply then
@@ -2885,29 +2879,7 @@ local function buildMenu()
             liveFcfScan(true)
         end)
     end)
-    button(p3, "Probe recoil (console)", function()
-        task.spawn(function()
-            local applied, blocked = applyRecoil()
-            local tracked = 0
-            for _ in pairs(recoilState.tables) do tracked += 1 end
-            local pct = math.floor((tonumber(Config.Weapons.RecoilPct) or 100) + 0.5)
-            notify(("Recoil: %d CamShake copy(ies) tracked, %d scaled%s (set %d%%)"):format(
-                tracked, applied, blocked > 0 and (", " .. blocked .. " locked") or "", pct))
-            recoilProbe()
-        end)
-    end)
-    button(p3, "Deep apply (one-time scan)", function()
-        task.spawn(function()
-            local cfgs, springs = deepScanAll()
-            local guns = applyGunRecoil()
-            local shake = applyRecoil()
-            local snaps = applySnapshotPatches()
-            runHunt("deep", true)
-            notify(("Deep scan: +%d config(s), +%d spring(s) - hunt running, watch the console"):format(cfgs, springs))
-            print(("[criminality] deep scan: +%d configs, +%d springs, %d guns, snapshots %d (pct %d%%)"):format(
-                cfgs, springs, guns, snaps, math.floor((tonumber(Config.Weapons.RecoilPct) or 100) + 0.5)))
-        end)
-    end)
+    if false then -- old trace v2 (replaced by the read tracers; safe to delete later)
     button(p3, "Recoil trace v2 (fire 12s)", function()
         task.spawn(function()
             if type(getgc) ~= "function" then
@@ -3247,124 +3219,15 @@ local function buildMenu()
             notify("Trace v2 done - copy the console output")
         end)
     end)
+    end -- end disabled trace v2
     button(p3, "Apply % (drop + re-equip)", function()
         task.spawn(function()
             recycleGunNow(false)
         end)
     end)
-    button(p3, "Find recoil copy (live patch)", function()
-        task.spawn(function()
-            findRecoilCopy(true)
-            local n = applyRecoilCopy(tonumber(Config.Weapons.RecoilPct) or 100, true)
-            if n > 0 then
-                notify(("Recoil copy: %d live cell(s) - the slider now changes recoil instantly"):format(n))
-            else
-                notify("Recoil copy: none found (this executor hides game closures) - the RCL hook is the live path")
-            end
-        end)
-    end)
-    button(p3, "Reinstall live hook (safe)", function()
-        task.spawn(function()
-            rclRelease()
-            local ok = installRCLHook()
-            notify(ok and ("Live recoil armed (" .. tostring(rclHook.wireNote) .. ")")
-                or ("No live mode: " .. tostring(rclHook.lastFail or "unknown")))
-        end)
-    end)
-    button(p3, "RCL probe (shoot 5s)", function()
-        task.spawn(function()
-            pcall(rclWire)
-            local cur = rclFindOrig()
-            local bak = rclE2() and rclE2():FindFirstChild("RCLBackup")
-            local s = rclState()
-            print(("[criminality] rcl probe: mode=%s active=%s topSaved=%d backSaved=%d"):format(
-                rclHook.mode, tostring(rclHook.active), #s.topSt.saved, #s.backSt.saved))
-            print(("[criminality] rcl probe: wire %s | RCL=%s backup=%s | getconnections=%s"):format(
-                tostring(rclHook.wireNote or "-"),
-                tostring(cur and cur.ClassName), tostring(bak and bak.ClassName),
-                tostring(type(getconnections))))
-            local function shape(ev, label)
-                if not (ev and ev:IsA("BindableEvent") and type(getconnections) == "function") then return end
-                local okC, conns = pcall(getconnections, ev.Event)
-                if not okC or type(conns) ~= "table" then
-                    print(("[criminality] rcl probe: %s read -> %s"):format(label, tostring(conns)))
-                    return
-                end
-                print(("[criminality] rcl probe: %s read -> %d conn(s)"):format(label, #conns))
-                for i = 1, math.min(#conns, 3) do
-                    local c = conns[i]
-                    pcall(function()
-                        print(("[criminality] rcl probe:   %s#%d Function=%s func=%s Thread=%s Disable=%s Enable=%s Disconnect=%s Enabled=%s"):format(
-                            label, i, tostring(type(c.Function)), tostring(type(c.func)), tostring(type(c.Thread)),
-                            tostring(type(c.Disable)), tostring(type(c.Enable)),
-                            tostring(type(c.Disconnect)), tostring(c.Enabled)))
-                    end)
-                end
-            end
-            shape(cur, "RCL")
-            shape(bak, "BACK")
-            local firesA, firesB = 0, 0
-            local c1 = cur and cur:IsA("BindableEvent") and cur.Event:Connect(function() firesA += 1 end)
-            local c2 = bak and bak:IsA("BindableEvent") and bak.Event:Connect(function() firesB += 1 end)
-            notify("RCL probe: SHOOT for 5 seconds")
-            print("[criminality] rcl probe: FIRE NOW (5s)")
-            task.wait(5)
-            if c1 then c1:Disconnect() end
-            if c2 then c2:Disconnect() end
-            print(("[criminality] rcl probe: kicks on 'RCL'=%d, on backup=%d | pct %d"):format(
-                firesA, firesB, math.floor((tonumber(Config.Weapons.RecoilPct) or 100) + 0.5)))
-        end)
-    end)
-    button(p3, "Test kick (watch camera)", function()
-        task.spawn(function()
-            local cur = rclFindOrig()
-            local bak = rclE2() and rclE2():FindFirstChild("RCLBackup")
-            notify("Kick test 1/2: CURRENT event - watch the camera")
-            if cur then pcall(function() cur:Fire(Vector3.new(0, 0, 8)) end) end
-            task.wait(2.5)
-            notify("Kick test 2/2: ORIGINAL event - watch the camera")
-            if bak then pcall(function() bak:Fire(Vector3.new(0, 0, 8)) end) end
-            task.wait(1)
-            print("[criminality] kick test done - which bumped the camera, 1st/2nd/both/neither? (use slider 100%)")
-            notify("Kick test done - tell Havoc which one bumped (1st/2nd/both/neither)")
-        end)
-    end)
-    button(p3, "RCL kick v2 (exact shot formula)", function()
-        task.spawn(function()
-            local e2 = rclE2()
-            local cur = e2 and e2:FindFirstChild("RCL")
-            local bak = e2 and e2:FindFirstChild("RCLBackup")
-            print(("[criminality] kick v2: RCL=%s backup=%s"):format(
-                tostring(cur and cur.ClassName), tostring(bak and bak.ClassName)))
-            if not (cur and cur:IsA("BindableEvent")) then
-                notify("Kick v2: RCL event not found")
-                return
-            end
-            local R = 21
-            pcall(function()
-                local cfg = equippedToolConfig()
-                local rec = cfg and recoilGun.tables[cfg]
-                if rec and tonumber(rec.Recoil) then R = tonumber(rec.Recoil) end
-            end)
-            if not (R and R > 5) then R = 21 end
-            local vec = Vector3.new(math.random() * (R / 2) - (R / 4), 0, math.random() * (R / 2) + (R / 2))
-            notify("Kick v2: firing the exact shot formula - watch the camera NOW")
-            pcall(function() cur:Fire(vec) end)
-            task.wait(2.5)
-            print(("[criminality] kick v2 fired Vector3(%.2f, 0, %.2f) on RCL - camera bump yes/no?"):format(vec.X, vec.Z))
-            notify("Kick v2 done - did the camera bump? (yes/no)")
-        end)
-    end)
-    button(p3, "Undo live hook (restore game recoil)", function()
-        task.spawn(function()
-            rclRelease()
-            notify("Live hook removed - the game's own recoil is back")
-        end)
-    end)
-    note(p3, "Final recoil facts: AIMED-IN recoil scales INSTANTLY on the slider (in-memory patch - no drop/pick). " ..
-        "HIPFIRE is cancelled at the render level by the Suppressor: shots open a 0.75s window and any small upward " ..
-        "camera drift while your mouse is still gets rotated back out ((1-%) of it) - the kick never reaches your " ..
-        "view. 'Auto apply' stays as backup: it silently cycles the gun ~1s after the slider settles. Keep both ON.")
+    note(p3, "How it works: aimed-in recoil scales instantly on the slider (in-memory patch). Hipfire is cancelled " ..
+        "at the render level (Suppressor). 'Apply %' cycles the gun manually; 'Auto apply' does it for you after " ..
+        "the slider settles. 'Apply LIVE now' + 'Scan live copy' are the diagnostic pair.")
 
     -- ---------------- Misc ----------------
     local p4 = pages[4]
