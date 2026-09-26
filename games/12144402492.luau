@@ -28,6 +28,11 @@
                           (1 - value) -> 0, L364600) + noise_position pinned
                           (Perlin wander L356645 -> L357037 / L357050) + idle
                           fidget animations disabled (timer L364609)
+          No Deafness   - death & explosion hearing loss removed: the cloned
+                          deafness_distortion/equalizer effects forced
+                          Enabled=false (live + RS templates) and the
+                          tinnitus ringing group muted (explosion_deaf_effect
+                          L201192-205, lobby_deaf_effect L131807)
       • Aimbot / ESP - built around the match rigs: characters live in
           Workspace.characters as <UserId>-named models (custom rig: head /
           humanoid_root_part / torso_hitbox / *_vis - no Humanoid). The game
@@ -95,7 +100,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v10"
+local SCRIPT_VERSION = "dl-v11"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -120,6 +125,7 @@ local DEFAULTS = {
         SteadyAim = false, -- arm stamina drains + breathing shake -> 0
         InfStamina = false,-- sprint / lean / jump / vault drains -> 0
         ZeroSway = false,  -- walk bob + look sway -> 0 (knob + live spring stubs)
+        NoDeaf = false,    -- kill death/explosion deafening + tinnitus ringing
     },
     -- Deadline rigs are custom (no Humanoid, no client-side team data): the
     -- aimbot locks the head part, ESP derives boxes from humanoid_root_part.
@@ -681,6 +687,123 @@ local function applyAll()
     applyInfStamina()
     applySwayKnobs()
 end
+
+-- ============================================================
+-- AUDIO: NO DEAFNESS  (death + explosion hearing loss, ringing)
+-- ============================================================
+-- The game deafens the mix with two cloned sound effects:
+--   deafness_distortion (DistortionSoundEffect) + deafness_equalizer
+--   (EqualizerSoundEffect). The lobby module (client/module/lobby_deaf_
+--   effect) keeps a pair under SoundService.master.ingame and tweens it ON
+--   on death; every explosion clones a pair onto each sound group for its
+--   deaf duration (client/namespace/explosion_effect/explosion_deaf_
+--   effect, L201192-205), plus a ringing_short sample into the tinnitus
+--   SoundGroup. The tweens only animate Level / gains - NOT .Enabled - so
+--   forcing Enabled = false (live instances AND the ReplicatedStorage
+--   templates, which clones copy) kills the effect without breaking any
+--   of the game's tween calls; muting the tinnitus group removes the ring.
+local DEAF_STATE = genv.__HAVOC_DEADLINE_DEAF
+if type(DEAF_STATE) ~= "table" then
+    DEAF_STATE = { saved = setmetatable({}, { __mode = "k" }) }
+    genv.__HAVOC_DEADLINE_DEAF = DEAF_STATE
+end
+if type(DEAF_STATE.saved) ~= "table" then
+    DEAF_STATE.saved = setmetatable({}, { __mode = "k" })
+end
+
+local function isDeafEffect(d)
+    return (d.Name == "deafness_equalizer" or d.Name == "deafness_distortion") and d:IsA("SoundEffect")
+end
+
+local function deafTemplates()
+    local out = {}
+    local ok = pcall(function()
+        local data = ReplicatedStorage:FindFirstChild("data")
+        local sound = data and data:FindFirstChild("sound")
+        local effects = sound and sound:FindFirstChild("effects")
+        if not effects then return end
+        local a = effects:FindFirstChild("deafness_distortion")
+        local b = effects:FindFirstChild("deafness_equalizer")
+        if a then table.insert(out, a) end
+        if b then table.insert(out, b) end
+    end)
+    if not ok then return {} end
+    return out
+end
+
+local function tinnitusGroup()
+    local ss = game:GetService("SoundService")
+    for _, d in ipairs(ss:GetDescendants()) do
+        if d:IsA("SoundGroup") and d.Name == "tinnitus" then
+            return d
+        end
+    end
+    return nil
+end
+
+local function setEffectEnabled(d, on)
+    local rec = DEAF_STATE.saved[d]
+    if rec == nil then
+        local ok, cur = pcall(function() return d.Enabled end)
+        if not ok then return end
+        rec = { enabled = cur }
+        DEAF_STATE.saved[d] = rec
+    end
+    pcall(function()
+        local want = on and false or rec.enabled
+        if d.Enabled ~= want then
+            d.Enabled = want
+        end
+    end)
+end
+
+local function applyNoDeaf(on)
+    -- templates first: clones copy Enabled, so future explosion clones
+    -- spawn already neutral
+    for _, t in ipairs(deafTemplates()) do
+        setEffectEnabled(t, on)
+    end
+    -- live effects (the lobby module pair + any explosion clones)
+    local ss = game:GetService("SoundService")
+    for _, d in ipairs(ss:GetDescendants()) do
+        if isDeafEffect(d) then
+            setEffectEnabled(d, on)
+        end
+    end
+    -- the ringing sample plays into the tinnitus group - mute it
+    local group = tinnitusGroup()
+    if group then
+        local rec = DEAF_STATE.saved[group]
+        if rec == nil then
+            local ok, cur = pcall(function() return group.Volume end)
+            if ok then
+                rec = { volume = cur }
+                DEAF_STATE.saved[group] = rec
+            end
+        end
+        if rec then
+            pcall(function()
+                local want = on and 0 or rec.volume
+                if group.Volume ~= want then
+                    group.Volume = want
+                end
+            end)
+        end
+    end
+end
+
+-- fast patrol while on: explosion clones are created per blast and tweened
+-- down - catching them within a quarter second keeps the muffle inaudible
+task.spawn(function()
+    while genv.__HAVOC_DEADLINE_GEN == MY_GEN do
+        if Config.Weapons.NoDeaf then
+            pcall(applyNoDeaf, true)
+            task.wait(0.25)
+        else
+            task.wait(1)
+        end
+    end
+end)
 
 -- ============================================================
 -- PLAYER RIGS  (Workspace.characters/<UserId> - custom, no Humanoid)
@@ -1326,6 +1449,15 @@ local function buildMenu()
             notify(v and "Sight sway zeroed - no walk bob, no look lag" or "Sight sway restored")
         end)
 
+    section(p1, "Audio")
+    toggle(p1, "No Deafness",
+        function() return Config.Weapons.NoDeaf end,
+        function(v)
+            Config.Weapons.NoDeaf = v
+            pcall(applyNoDeaf, v)
+            notify(v and "Deafness and ringing disabled" or "Deafness restored")
+        end)
+
     statusLabel = note(p1, "loading...")
 
     section(p1, "Reset")
@@ -1339,7 +1471,9 @@ local function buildMenu()
         w.SteadyAim = false
         w.InfStamina = false
         w.ZeroSway = false
+        w.NoDeaf = false
         pcall(unstubSwaySprings)
+        pcall(applyNoDeaf, false)
         applyAll()
         refreshGUI()
         refreshStatus()
@@ -1384,6 +1518,9 @@ task.spawn(function()
     refreshStatus()
     if Config.Weapons.ZeroSway then
         task.spawn(function() pcall(stubSwaySprings, true) end)
+    end
+    if Config.Weapons.NoDeaf then
+        pcall(applyNoDeaf, true)
     end
 
     -- Slow re-assert: shared state is rebroadcast by the game on some
