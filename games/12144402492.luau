@@ -15,11 +15,13 @@
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
                           (shake = (1 - arm_stamina/max) * shake_mult, L364597)
           Infinite Stam - sprint / lean / jump / vault drains -> 0
-          Zero Sight Sway - walk/run camera bob + look-sway -> 0: the game's
+          Zero Sight Sway - walk/run camera bob + look-sway + gun weave -> 0:
                           offset clamp knob (plr_max_directional_distance,
-                          L356757-850) plus the live viewmodel springs stubbed
-                          (camera_nonrelative applies as the camera offset at
-                          L356669; springs are shove-driven - L340986)
+                          L356757-850) + live viewmodel springs stubbed
+                          (camera_nonrelative = camera offset L356669) + the
+                          walk/run/directional/swayLag SmoothValues stubbed
+                          (walk weave tracks L356919-931, swayLag offsets
+                          L357041)
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -80,7 +82,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v4"
+local SCRIPT_VERSION = "dl-v5"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -390,6 +392,26 @@ local STUB_SPRINGS = {
     "sway", "slow_sway", "aim_sway",
 }
 
+-- SmoothValues sit earlier in the same pipeline: the walk/run ANIMATION
+-- weights (the skeletal weave of the gun while moving) and the directional /
+-- sway-lag offsets (the gun easing behind your aim). Swapping them for a
+-- stub whose update() returns 0 zeroes that whole pipeline:
+--   walk weight -> track weights 0 (no weave), run weight -> run pose 0,
+--   directional -> rotational offset 0, swayLag -> positional offset 0.
+local SMOOTH_STUBS = {
+    "walk_animation_weight", "run_animation_weight",
+    "directional_x", "directional_y",
+    "swayLagX", "swayLagY",
+}
+
+local SPRING_STUB_MAP = {}
+for _, name in ipairs(STUB_SPRINGS) do SPRING_STUB_MAP[name] = true end
+local SMOOTH_STUB_MAP = {}
+for _, name in ipairs(SMOOTH_STUBS) do SMOOTH_STUB_MAP[name] = true end
+
+-- canary used to verify the executor's GC scan actually returns tables
+local GC_CANARY = { havocDeadlineCanary = true }
+
 local function swayStub(name)
     BOB_STATE.stubs = BOB_STATE.stubs or {}
     local s = BOB_STATE.stubs[name]
@@ -405,6 +427,37 @@ local function swayStub(name)
         BOB_STATE.stubs[name] = s
     end
     return s
+end
+
+local function smoothStub(name)
+    BOB_STATE.smoothStubs = BOB_STATE.smoothStubs or {}
+    local s = BOB_STATE.smoothStubs[name]
+    if s == nil then
+        s = {
+            value = 0, valueb = 0, delta = 0, speed = 15, target = 0,
+            clamp_min = -math.huge, clamp_max = math.huge, lerp_limit = 0.5,
+            set = function(_self, _v) end,
+            force_value = function(_self, _v) end,
+            increment = function(_self, _v) end,
+            multiply = function(_self, _v) end,
+            lerp = function(_self, _a, _b) end,
+            update = function(_self, _dt) return 0 end,
+        }
+        BOB_STATE.smoothStubs[name] = s
+    end
+    return s
+end
+
+local function gcScanAvailable()
+    local fn = getgc
+    if type(fn) ~= "function" then return false end
+    local ok, list = pcall(fn, true)
+    if not ok then ok, list = pcall(fn) end
+    if not ok or type(list) ~= "table" then return false end
+    for i = 1, #list do
+        if list[i] == GC_CANARY then return true end
+    end
+    return false
 end
 
 local function isDeadlineController(t)
@@ -454,12 +507,12 @@ end
 local function stubSwaySprings(scan)
     if not Config.Weapons.ZeroSway or not scan then return end
     for _, controller in ipairs(findControllers()) do
-        local springs = rawget(controller, "springs")
         local entry = BOB_STATE.saved[controller]
         if entry == nil then
             entry = {}
             BOB_STATE.saved[controller] = entry
         end
+        local springs = rawget(controller, "springs")
         for _, name in ipairs(STUB_SPRINGS) do
             local stub = swayStub(name)
             local current = rawget(springs, name)
@@ -470,22 +523,40 @@ local function stubSwaySprings(scan)
                 springs[name] = stub
             end
         end
+        local smooth = rawget(controller, "smooth_values")
+        for _, name in ipairs(SMOOTH_STUBS) do
+            local stub = smoothStub(name)
+            local current = rawget(smooth, name)
+            if current == stub then
+                -- already stubbed - keep
+            elseif current ~= nil then
+                if entry[name] == nil then entry[name] = current end
+                smooth[name] = stub
+            end
+        end
     end
 end
 
 local function unstubSwaySprings()
     for controller, entry in pairs(BOB_STATE.saved) do
-        local springs = type(controller) == "table" and rawget(controller, "springs")
-        if type(springs) == "table" then
+        if type(controller) == "table" then
+            local springs = rawget(controller, "springs")
+            local smooth = rawget(controller, "smooth_values")
             for name, orig in pairs(entry) do
-                if rawget(springs, name) == swayStub(name) then
-                    springs[name] = orig
-                end
-                if type(orig) == "table" then
-                    pcall(function()
-                        orig.velocity = Vector3.new()
-                        orig.position = Vector3.new()
-                    end)
+                if SPRING_STUB_MAP[name] and type(springs) == "table" then
+                    if rawget(springs, name) == swayStub(name) then
+                        springs[name] = orig
+                    end
+                    if type(orig) == "table" then
+                        pcall(function()
+                            orig.velocity = Vector3.new()
+                            orig.position = Vector3.new()
+                        end)
+                    end
+                elseif SMOOTH_STUB_MAP[name] and type(smooth) == "table" then
+                    if rawget(smooth, name) == smoothStub(name) then
+                        smooth[name] = orig
+                    end
                 end
             end
         end
@@ -778,9 +849,6 @@ local function buildMenu()
             applySpeedKnobs()
             refreshStatus()
         end, 0.5, 1, 10, function(v) return ("%g×"):format(v) end)
-    note(p1, "Speed multipliers are relative to vanilla (x1). Aim In Speed = how fast the gun raises when you aim " ..
-        "(all viewmodel transitions: aim, lean, crouch, prone). Ergonomics drives the weapon stat behind leaning " ..
-        "and handling timings.")
 
     section(p1, "Stability")
     toggle(p1, "Steady Aim",
@@ -806,6 +874,11 @@ local function buildMenu()
             if v then
                 applySwayKnobs()
                 task.spawn(function()
+                    if not gcScanAvailable() then
+                        warn("[deadline] GC scan unavailable in this executor - sway springs can't be stubbed")
+                        notify("Sway limits applied, but this executor blocks the GC scan - spring sway stays")
+                        return
+                    end
                     local ok, err = pcall(stubSwaySprings, true)
                     if not ok then warn("[deadline] sight sway scan failed: " .. tostring(err)) end
                 end)
@@ -816,18 +889,10 @@ local function buildMenu()
             refreshStatus()
             notify(v and "Sight sway zeroed - no walk bob, no look lag" or "Sight sway restored")
         end)
-    note(p1, "Steady Aim: aiming and holding breath never drain arm stamina, and the breathing shake stops - " ..
-        "your aim stays planted between shots. Infinite Stamina: sprinting and leaning never tire you out. " ..
-        "Zero Sight Sway: no camera bob while walking and no gun lag when you turn or strafe - the sight stays " ..
-        "glued where you aim (restored exactly when switched off).")
 
     statusLabel = note(p1, "loading...")
 
-    section(p1, "About")
-    note(p1, "Everything above writes the game's own live multipliers (module/shared_state + recoil debug " ..
-        "values) that the game reads as you play - no hooks, no remotes, nothing sent to the server. " ..
-        "The values keep re-asserting, so they can't drift back. 100% / x1 = vanilla, everything restores " ..
-        "instantly. Test in the lobby shooting range.")
+    section(p1, "Reset")
     button(p1, "Restore vanilla", function()
         local w = Config.Weapons
         w.RecoilPct = 100
