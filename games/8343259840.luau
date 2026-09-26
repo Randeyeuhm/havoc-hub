@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v35"
+local SCRIPT_VERSION = "crim-v36"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -1045,8 +1045,6 @@ local function liveFcfScan(announce)
         end
         notify(("Live copy scan: %d match(es), %d state table(s) - console has details"):format(count, #liveFcf.states))
     end
-    pcall(setupFcfTrace)
-    pcall(setupRcredTrace)
     return count
 end
 
@@ -1590,11 +1588,6 @@ pcall(function()
         print("[criminality] cleaned up an old RCL swap (original restored)")
     end
 end)
-print(("[criminality] rcl: getconnections=%s | mode=%s top=%d back=%d | %s"):format(
-    tostring(type(getconnections)), rclHook.mode,
-    (rclState().topSt and #rclState().topSt.saved) or 0,
-    (rclState().backSt and #rclState().backSt.saved) or 0,
-    tostring(rclHook.lastFail or rclHook.wireNote or "-")))
 
 -- ============================================================
 -- SNAPSHOT PATCHING (slider changes without re-picking the gun)
@@ -2875,7 +2868,7 @@ local function buildMenu()
         function(v)
             Config.Weapons.RecoilPct = v
             if not Config.Weapons.LiveApply then
-                -- store-only mode: flip "Live apply" on (or press Apply LIVE now)
+                -- toggle off: stored only, the gun keeps its original recoil
                 return
             end
             task.spawn(function()
@@ -2892,45 +2885,8 @@ local function buildMenu()
                     -- (candidate hunts retired: they never found anything live)
                 end
             end)
-            if Config.Weapons.AutoApply then
-                autoApply.token += 1
-                local tok = autoApply.token
-                task.delay(1.25, function()
-                    if tok ~= autoApply.token or not Config.Weapons.AutoApply then return end
-                    task.spawn(function()
-                        if autoApply.busy then
-                            task.wait(0.8)
-                            if tok ~= autoApply.token or not Config.Weapons.AutoApply then return end
-                        end
-                        if autoApply.busy then return end
-                        autoApply.busy = true
-                        pcall(liveFcfApply, recoilForcePct or tonumber(Config.Weapons.RecoilPct) or 100, false)
-                        pcall(recycleGunNow, true)
-                        autoApply.busy = false
-                    end)
-                end)
-            end
-            if Config.Weapons.LiveApply then
-                autoApply.token += 1
-                local tok = autoApply.token
-                task.delay(1.0, function()
-                    if tok ~= autoApply.token or not Config.Weapons.LiveApply then return end
-                    task.spawn(function()
-                        if autoApply.busy then
-                            task.wait(0.8)
-                            if tok ~= autoApply.token or not Config.Weapons.LiveApply then return end
-                        end
-                        if autoApply.busy then return end
-                        autoApply.busy = true
-                        pcall(liveApplyNow, false)
-                        autoApply.busy = false
-                    end)
-                end)
-            end
         end, 5, 0, 200)
-    toggle(p3, "Auto apply (re-cycle gun)", function() return Config.Weapons.AutoApply end,
-        function(v) Config.Weapons.AutoApply = v end)
-    toggle(p3, "Live apply (slider)", function() return Config.Weapons.LiveApply end,
+    toggle(p3, "Apply Recoil %", function() return Config.Weapons.LiveApply end,
         function(v)
             Config.Weapons.LiveApply = v
             task.spawn(function()
@@ -2946,22 +2902,10 @@ local function buildMenu()
                     pcall(liveFcfApply, 100, false)
                     pcall(applyRecoilCopy, 100)
                     pcall(scaleOneTool, LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool"))
-                    notify("Live apply OFF - original recoil restored")
+                    notify("Apply Recoil % OFF - original recoil restored")
                 end
             end)
         end)
-    toggle(p3, "Suppressor (live hipfire cancel)", function() return Config.Weapons.Suppressor ~= false end,
-        function(v) Config.Weapons.Suppressor = v end)
-    button(p3, "Apply LIVE now", function()
-        task.spawn(function()
-            liveApplyNow(true)
-        end)
-    end)
-    button(p3, "Scan live copy (console)", function()
-        task.spawn(function()
-            liveFcfScan(true)
-        end)
-    end)
     if false then -- old trace v2 (replaced by the read tracers; safe to delete later)
     button(p3, "Recoil trace v2 (fire 12s)", function()
         task.spawn(function()
@@ -3303,14 +3247,6 @@ local function buildMenu()
         end)
     end)
     end -- end disabled trace v2
-    button(p3, "Apply % (drop + re-equip)", function()
-        task.spawn(function()
-            recycleGunNow(false)
-        end)
-    end)
-    note(p3, "Live apply ON = the slider % is what the gun kicks with (live, hipfire + aimed). " ..
-        "OFF = the game's NORMAL recoil (originals restored instantly). 'Apply LIVE now' applies the stored % on " ..
-        "demand; 'Apply %' cycles the gun; the Suppressor mops up any visible leftovers.")
 
     -- ---------------- Misc ----------------
     local p4 = pages[4]
@@ -3417,38 +3353,6 @@ local function updateRecoilSuppressor(cam)
     supp.lastPitch = pitch
 end
 
--- keep the shot detector attached to whatever the current RCL event is
--- (our old swap machinery may replace the child; reconnect when it changes)
-task.spawn(function()
-    while true do
-        task.wait(1)
-        pcall(function()
-            local e2 = ReplicatedStorage:FindFirstChild("Events2")
-            local cur = e2 and e2:FindFirstChild("RCL")
-            if cur and cur ~= supp.rcl then
-                supp.rcl = cur
-                local ok = pcall(function()
-                    cur.Event:Connect(function()
-                        supp.lastShotAt = os.clock()
-                        supp.shots = (supp.shots or 0) + 1
-                    end)
-                end)
-                if ok then supp.binds += 1 end
-            end
-        end)
-    end
-end)
-
--- shot reporter: proves shooting registered during tracer tests (quiet otherwise)
-task.spawn(function()
-    while true do
-        task.wait(5)
-        if supp.shots and supp.shots > 0 then
-            print(("[criminality] suppressor: %d shot(s) seen in the last 5s"):format(supp.shots))
-            supp.shots = 0
-        end
-    end
-end)
 
 -- Camera aim runs at Camera priority + 1: the game's camera module rewrites
 -- Camera.CFrame every frame, so a plain RenderStepped write is overwritten
@@ -3457,7 +3361,6 @@ RunService:BindToRenderStep("HavocHubAimbot", Enum.RenderPriority.Camera.Value +
     local cam = workspace.CurrentCamera
     if not cam then return end
     pcall(updateAimbot, cam, UserInputService:GetMouseLocation())
-    pcall(updateRecoilSuppressor, cam)
 end)
 
 -- Apply the saved state once on load.
