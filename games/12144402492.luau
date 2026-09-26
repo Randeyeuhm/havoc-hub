@@ -15,13 +15,14 @@
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
                           (shake = (1 - arm_stamina/max) * shake_mult, L364597)
           Infinite Stam - sprint / lean / jump / vault drains -> 0
-          Zero Sight Sway - walk/run camera bob + look-sway + gun weave -> 0:
-                          offset clamp knob (plr_max_directional_distance,
-                          L356757-850) + live viewmodel springs stubbed
-                          (camera_nonrelative = camera offset L356669) + the
-                          walk/run/directional/swayLag SmoothValues stubbed
-                          (walk weave tracks L356919-931, swayLag offsets
-                          L357041)
+          Zero Sight Sway - every passive sight mover -> 0: offset clamp knob
+                          (plr_max_directional_distance, L356757-850) + live
+                          viewmodel springs stubbed (camera_nonrelative =
+                          camera offset L356669) + walk/run/directional/swayLag
+                          SmoothValues stubbed (weave tracks L356919-931) +
+                          holding_breath stub (breathing track weight *=
+                          (1 - value) -> 0, L364600) + noise_position pinned
+                          (Perlin wander L356645 -> L357037 / L357050)
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -58,6 +59,7 @@ if setstackhidden then pcall(setstackhidden, true) end
 -- SERVICES / STATE
 -- ============================================================
 local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local HttpService      = game:GetService("HttpService")
 local LocalPlayer      = Players.LocalPlayer
@@ -82,7 +84,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v5"
+local SCRIPT_VERSION = "dl-v6"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -402,6 +404,7 @@ local SMOOTH_STUBS = {
     "walk_animation_weight", "run_animation_weight",
     "directional_x", "directional_y",
     "swayLagX", "swayLagY",
+    "holding_breath",
 }
 
 local SPRING_STUB_MAP = {}
@@ -443,6 +446,10 @@ local function smoothStub(name)
             lerp = function(_self, _a, _b) end,
             update = function(_self, _dt) return 0 end,
         }
+        -- holding_breath: the game multiplies the breathing track weight and
+        -- the breathing camera bob by (1 - value) - pinning value = 1 stills
+        -- both; update() stays 0 so no FOV zoom engages from the stub.
+        if name == "holding_breath" then s.value = 1 end
         BOB_STATE.smoothStubs[name] = s
     end
     return s
@@ -569,6 +576,19 @@ track(LocalPlayer.CharacterAdded:Connect(function()
     task.delay(2, function()
         if Config.Weapons.ZeroSway then pcall(stubSwaySprings, true) end
     end)
+end))
+
+-- The game feeds a slow Perlin noise into the sight position/rotation
+-- (noise_position grows with time - L356645, read at L357037 and L357050).
+-- Holding it at 0 every frame pins that noise to a constant instead of a
+-- drift, removing the last passive wander.
+track(RunService.RenderStepped:Connect(function()
+    if not Config.Weapons.ZeroSway then return end
+    for controller in pairs(BOB_STATE.saved) do
+        if type(controller) == "table" then
+            controller.noise_position = 0
+        end
+    end
 end))
 
 -- Everything this script applies, in one idempotent pass. Safe to call on
