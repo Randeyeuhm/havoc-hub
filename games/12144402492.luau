@@ -110,7 +110,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v14"
+local SCRIPT_VERSION = "dl-v15"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1217,6 +1217,7 @@ end
 -- Drawing API / no rigs / everything stuck hidden / render error) names
 -- itself instead of the ESP silently doing nothing.
 local function espOnDiagnostics()
+    if ESPUI and ESPUI.resetRenderDiag then ESPUI.resetRenderDiag() end
     local renderer = getEspRenderer()
     local n = 0
     eachEnemyRig(function() n = n + 1 end)
@@ -1265,13 +1266,25 @@ local function espOnDiagnostics()
                 end
             end
             local err = engine and engine.lastError
-            print(("[deadline] ESP check - %d rig(s) tracked, %d/%d drawings visible%s")
-                :format(tracked, visible, total,
+            local lr = nil
+            if ESPUI and ESPUI.getLocalRoot then lr = ESPUI.getLocalRoot() end
+            print(("[deadline] ESP check - %d rig(s) tracked, %d/%d drawings visible, localRoot:%s%s")
+                :format(tracked, visible, total, lr and ("ok (" .. lr.Name .. ")") or "MISSING",
                     err and ("  render error: " .. tostring(err)) or ""))
+            local rd = ESPUI and ESPUI.renderDiag
+            if rd then
+                print(("[deadline] ESP debug - shown:%d localChar:%d team:%d noRoot:%d offScreen:%d tooFar:%d noRef:%d")
+                    :format(rd.shown or 0, rd.localChar or 0, rd.team or 0, rd.noRoot or 0,
+                        rd.offScreen or 0, rd.tooFar or 0, rd.noLocalRoot or 0))
+            end
             if total == 0 then
                 notify("ESP check: no drawing objects were created - check the console (F9)")
             elseif visible == 0 then
-                notify("ESP check: drawings stuck hidden - check the console (F9)")
+                if rd and (rd.shown or 0) > 0 then
+                    notify("ESP is drawing - nothing was on screen at the exact check moment")
+                else
+                    notify("ESP check: drawings stuck hidden - check the console (F9)")
+                end
             end
         end)
     end

@@ -57,7 +57,29 @@ local Players     = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
 local ESP = {}
-ESP.VERSION = "esp-v7-guarded"
+ESP.VERSION = "esp-v8-diag"
+
+-- ============================================================
+-- RENDER DIAGNOSTICS
+-- ============================================================
+-- Per-frame counters of every hide reason and successful draws. Hosts can
+-- read this (and reset it) to see why drawings are (not) showing up:
+--   shown       - passed every check and was marked visible
+--   localChar   - it was the local player's own model
+--   team        - team check hit
+--   noRoot      - model had no resolvable root part
+--   offScreen   - behind the camera / outside the viewport at check time
+--   tooFar      - beyond the host's max distance
+--   noLocalRoot - no local character to measure from (falls back to the
+--                 camera instead of treating distance as infinite)
+local RDIAG = {
+    shown = 0, localChar = 0, team = 0, noRoot = 0,
+    offScreen = 0, tooFar = 0, noLocalRoot = 0,
+}
+ESP.renderDiag = RDIAG
+function ESP.resetRenderDiag()
+    for k in pairs(RDIAG) do RDIAG[k] = 0 end
+end
 
 -- ============================================================
 -- SCHEMA
@@ -281,6 +303,17 @@ local function npcRoot(inst)
 end
 ESP.npcRoot = npcRoot
 
+-- Root part of the LOCAL character (distance reference): HRP, Deadline's
+-- humanoid_root_part, or PrimaryPart. Exposed for host diagnostics.
+local function localCharRoot()
+    local ch = LocalPlayer.Character
+    if not ch then return nil end
+    return ch:FindFirstChild("HumanoidRootPart")
+        or ch:FindFirstChild("humanoid_root_part")
+        or ch.PrimaryPart
+end
+ESP.getLocalRoot = localCharRoot
+
 local function entityName(model, nameSource)
     local p = Players:GetPlayerFromCharacter(model)
     if p then
@@ -414,30 +447,51 @@ end
 -- ============================================================
 local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRoot)
     if not model or not model.Parent then return false end
-    if model == LocalPlayer.Character then hideData(d); return true end
+    if model == LocalPlayer.Character then
+        RDIAG.localChar = RDIAG.localChar + 1
+        hideData(d); return true
+    end
 
     if cfg.TeamCheck then
         local p = Players:GetPlayerFromCharacter(model)
         if p and p.Team and LocalPlayer.Team and p.Team == LocalPlayer.Team then
+            RDIAG.team = RDIAG.team + 1
             hideData(d)
             return true
         end
     end
 
     local root = npcRoot(model)
-    if not root then hideData(d); return true end
+    if not root then
+        RDIAG.noRoot = RDIAG.noRoot + 1
+        hideData(d); return true
+    end
     local head = model:FindFirstChild("Head") or model:FindFirstChild("head") or root
 
     local rootPos, visible = cam:WorldToViewportPoint(root.Position)
-    if not visible or rootPos.Z <= 0 then hideData(d); return true end
+    if not visible or rootPos.Z <= 0 then
+        RDIAG.offScreen = RDIAG.offScreen + 1
+        hideData(d); return true
+    end
 
     local distance = math.huge
-    if localRoot then distance = (localRoot.Position - root.Position).Magnitude end
+    if localRoot then
+        distance = (localRoot.Position - root.Position).Magnitude
+    else
+        -- No local character root (dead / loading / custom rig): the old
+        -- code left distance = math.huge here, which hid EVERY model while
+        -- still tracking it ("0/132 visible"). Measure from the camera.
+        RDIAG.noLocalRoot = RDIAG.noLocalRoot + 1
+        distance = (cam.CFrame.Position - root.Position).Magnitude
+    end
     -- Per-target cap (d.maxDistance, set by the host - e.g. landmine ranges)
     -- can only tighten the global range.
     local cap = tonumber(d.maxDistance) or maxDist
     if cap > maxDist then cap = maxDist end
-    if distance > cap then hideData(d); return true end
+    if distance > cap then
+        RDIAG.tooFar = RDIAG.tooFar + 1
+        hideData(d); return true
+    end
 
     -- Projection: Project Delta's fixed world-size box (4.5 x 6.5 studs)
     -- through the camera's real vertical FOV and viewport height.
@@ -570,6 +624,7 @@ local function renderOne(cfg, model, d, cam, maxDist, viewportH, fovTan, localRo
         end
     end
 
+    RDIAG.shown = RDIAG.shown + 1
     return true
 end
 
@@ -690,10 +745,7 @@ function ESPClass:Render(cam)
     local maxDist = tonumber(cfg.MaxDistance) or 2000
     local viewportH = cam.ViewportSize.Y
     local fovTan = math.tan(math.rad(cam.FieldOfView) * 0.5)
-    local localRoot = LocalPlayer.Character
-        and (LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-            or LocalPlayer.Character:FindFirstChild("humanoid_root_part")
-            or LocalPlayer.Character.PrimaryPart)
+    local localRoot = localCharRoot()
 
     local removals = nil
     for model, d in pairs(self.Objects) do
