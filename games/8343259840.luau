@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v43"
+local SCRIPT_VERSION = "crim-v44"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -1245,26 +1245,22 @@ local function liveSpreadApply(noSpread, announce)
         liveFcfScan(false)
     end
     local n = 0
-    for _, c in ipairs(liveFcf.cands) do
-        local b = c.base
-        if b then
-            if b.spreadFam then
-                for k, v in pairs(b.spreadFam) do
-                    if safeSetField(c.t, k, noSpread and 0 or v) then n += 1 end
-                end
-            end
-            if b.sniT then
-                safeSetField(b.sniT, "WalkSpread", noSpread and 0 or b.sniW)
-            end
-        end
-    end
-    -- LASER LEVER: the fire formula multiplies spread by v107, read LIVE as
-    -- tbl_upv_9.LaserEnabled + u5.Customs.LaserAccuracy - pinning the
-    -- accuracy to 0 makes every shot dead straight in EVERY state (standing
-    -- still included), instantly, exactly like the recoil-family lever. If
-    -- any copy fails to verify, no flag is flipped (a nil multiplier would
-    -- error the shot).
+    liveFcf.laserLatched = false
     if noSpread then
+        -- LASER LEVER first: the fire formula multiplies spread by v107,
+        -- read LIVE as tbl_upv_9.LaserEnabled + u5.Customs.LaserAccuracy -
+        -- pinning the accuracy to 0 makes every shot dead straight in EVERY
+        -- state (standing still included), instantly, exactly like the
+        -- recoil-family lever. Only latch when the held gun is one the scan
+        -- can reach AND every copy verified - otherwise no flag flips (a
+        -- nil multiplier would error the shot).
+        local leverHeld = false
+        pcall(function()
+            local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+            local mod = tool and tool:FindFirstChild("Config")
+            local cfg = mod and require(mod)
+            if type(cfg) == "table" then leverHeld = liveGunFindable(cfg) end
+        end)
         local accOk, accBad = 0, 0
         for _, c in ipairs(liveFcf.cands) do
             local b = c.base
@@ -1282,7 +1278,7 @@ local function liveSpreadApply(noSpread, announce)
                 end
             end
         end
-        if accOk > 0 and accBad == 0 then
+        if accOk > 0 and accBad == 0 and #liveFcf.laserStates > 0 then
             for _, st in ipairs(liveFcf.laserStates) do
                 pcall(function()
                     local rec = liveFcf.laserOrig[st]
@@ -1301,8 +1297,41 @@ local function liveSpreadApply(noSpread, announce)
                     rawset(st, "__havocFlag", rec.enWasNil and "en" or rec.en)
                 end)
             end
+            liveFcf.laserLatched = leverHeld
+        end
+        -- lever covers the held gun: NOTHING ELSE gets written - the v107
+        -- multiply already kills every state, and leaving all values
+        -- untouched is what makes OFF a true instant undo. Plain gun
+        -- (the lever cannot reach it): keep the raw zero writes as fallback.
+        if not liveFcf.laserLatched then
+            for _, c in ipairs(liveFcf.cands) do
+                local b = c.base
+                if b then
+                    if b.spreadFam then
+                        for k, v in pairs(b.spreadFam) do
+                            if safeSetField(c.t, k, 0) then n += 1 end
+                        end
+                    end
+                    if b.sniT then
+                        safeSetField(b.sniT, "WalkSpread", 0)
+                    end
+                end
+            end
         end
     else
+        for _, c in ipairs(liveFcf.cands) do
+            local b = c.base
+            if b then
+                if b.spreadFam then
+                    for k, v in pairs(b.spreadFam) do
+                        if safeSetField(c.t, k, v) then n += 1 end
+                    end
+                end
+                if b.sniT then
+                    safeSetField(b.sniT, "WalkSpread", b.sniW)
+                end
+            end
+        end
         for _, c in ipairs(liveFcf.cands) do
             local b = c.base
             if b and b.customsT and b.laserCaptured then
@@ -1381,11 +1410,14 @@ local function forEachToolCfg(fn)
     end)
 end
 
--- zero the spread family on the Config module of EVERY tool in hands or
--- backpack - so any gun module load (even one racing our arrival hook)
--- reads zeros
+-- zero the spread family on the Config module of every PLAIN tool in
+-- hands or backpack. Findable guns are covered by the live laser lever -
+-- keeping their configs untouched is what makes OFF a true undo; plain
+-- guns get the config-bake treatment (the only standing-still fix the
+-- lever cannot reach). Also skips non-zero configs in any case.
 local function zeroToolConfigsNow()
     forEachToolCfg(function(cfg)
+        if liveGunFindable(cfg) then return end
         captureToolCfg(cfg)
         for _, key in ipairs({ "Spread", "WalkSpreadIncrease", "CrossExpansion" }) do
             if type(safeField(cfg, key)) == "number" then pcall(function() cfg[key] = 0 end) end
@@ -2718,7 +2750,9 @@ local function scaleOneTool(tool)
         if not mod then return end
         local cfg = require(mod)
         if type(cfg) ~= "table" then return end
-        if Config.Weapons.NoSpread then
+        if Config.Weapons.NoSpread and not liveGunFindable(cfg) then
+            -- only plain guns get the config-bake treatment; findable ones
+            -- stay pristine and rely on the live laser lever
             captureToolCfg(cfg)
             for _, key in ipairs({ "Spread", "WalkSpreadIncrease", "CrossExpansion" }) do
                 if type(safeField(cfg, key)) == "number" then pcall(function() cfg[key] = 0 end) end
@@ -2727,7 +2761,7 @@ local function scaleOneTool(tool)
             if type(sni) == "table" and type(safeField(sni, "WalkSpread")) == "number" then
                 pcall(function() sni.WalkSpread = 0 end)
             end
-        else
+        elseif not Config.Weapons.NoSpread then
             restoreToolCfg(cfg)
         end
     end)
@@ -3193,16 +3227,9 @@ local function buildMenu()
                 pcall(liveSpreadApply, v, false)
                 if v then
                     pcall(zeroToolConfigsNow)
-                    -- laser lever live on this gun = instant, no cycle;
-                    -- otherwise keep the silent bake cycle as the fallback
-                    local live = false
-                    pcall(function()
-                        local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
-                        local mod = tool and tool:FindFirstChild("Config")
-                        local cfg = mod and require(mod)
-                        if type(cfg) == "table" then live = liveGunFindable(cfg) end
-                    end)
-                    if live then
+                    -- the apply above latched (or not) the live lever for the
+                    -- held gun; latched = instant, no cycle
+                    if liveFcf.laserLatched then
                         notify("No Spread ON - bullets fly dead straight")
                     else
                         notify("No Spread ON - cycling the gun to bake it in")
