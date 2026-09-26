@@ -100,7 +100,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v11"
+local SCRIPT_VERSION = "dl-v12"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -805,6 +805,11 @@ task.spawn(function()
     end
 end)
 
+-- esp.luau loads later in this file (UI library section) - declare the
+-- handle HERE so the ESP features below close over this local instead of a
+-- nil global (that scoping miss is why ESP silently did nothing).
+local ESPUI
+
 -- ============================================================
 -- PLAYER RIGS  (Workspace.characters/<UserId> - custom, no Humanoid)
 -- ============================================================
@@ -1002,7 +1007,6 @@ end
 -- ESP LIBRARY (esp.luau, fetched by the hub loader)
 -- ============================================================
 local ESP_FILE = "esp.luau"
-local ESPUI
 do
     local ok, res = pcall(function()
         local src = moduleSource(ESP_FILE)
@@ -1282,7 +1286,18 @@ local function buildMenu()
     section(pe, "Player ESP")
     toggle(pe, "Player ESP",
         function() return Config.ESP.Enabled end,
-        function(v) Config.ESP.Enabled = v end,
+        function(v)
+            Config.ESP.Enabled = v
+            if v then
+                if not getEspRenderer() then
+                    notify("ESP library not loaded - check the console (F9)")
+                else
+                    local n = 0
+                    eachEnemyRig(function() n = n + 1 end)
+                    print(("[deadline] ESP on - %d rig(s) found in workspace.characters"):format(n))
+                end
+            end
+        end,
         hotkeyById.ToggleESP)
     bindrow(pe, hotkeyById.ToggleESP)
     section(pe, "Targeting")
