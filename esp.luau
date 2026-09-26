@@ -57,7 +57,7 @@ local Players     = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
 local ESP = {}
-ESP.VERSION = "esp-v8-diag"
+ESP.VERSION = "esp-v10-uidname"
 
 -- ============================================================
 -- RENDER DIAGNOSTICS
@@ -316,6 +316,13 @@ ESP.getLocalRoot = localCharRoot
 
 local function entityName(model, nameSource)
     local p = Players:GetPlayerFromCharacter(model)
+    if not p then
+        -- Custom rig systems (Deadline: Workspace.characters/<UserId>) don't
+        -- always link .Character for remote players client-side - fall back
+        -- to resolving the model's UserId name the way the game itself does.
+        local uid = tonumber(model.Name)
+        if uid then p = Players:GetPlayerByUserId(uid) end
+    end
     if p then
         if nameSource == "DisplayName" then return p.DisplayName end
         return p.Name

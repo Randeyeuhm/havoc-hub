@@ -119,7 +119,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v17"
+local SCRIPT_VERSION = "dl-v18"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -159,6 +159,7 @@ local DEFAULTS = {
     ESP = {
         Enabled = false, VisibleOnly = false, MaxDistance = 2500,
         Health = false,  -- no client-readable remote health in this game
+        NPCs = true,     -- show non-player (NPC / bot) rigs in the ESP
     },
 }
 
@@ -1049,6 +1050,17 @@ local function rigHead(model)
     return model:FindFirstChild("head") or model:FindFirstChild("Head") or rigRoot(model)
 end
 
+-- Player behind a rig: the engine character link when it exists, else the
+-- <UserId> model name (the game itself resolves players this way - remote
+-- rigs are not always linked to a Player object client-side).
+local function rigPlayer(model)
+    local p = Players:GetPlayerFromCharacter(model)
+    if p then return p end
+    local uid = tonumber(model.Name)
+    if uid then return Players:GetPlayerByUserId(uid) end
+    return nil
+end
+
 -- Ray from the camera to a point, ignoring our own rig and the target.
 local function isVisible(targetModel, camPos, targetPos)
     local params = RaycastParams.new()
@@ -1102,7 +1114,10 @@ local function renderESP(cam)
     eachEnemyRig(function(model, root)
         local head = rigHead(model) or root
         local pass = true
-        if Config.ESP.VisibleOnly then
+        if Config.ESP.NPCs == false and not rigPlayer(model) then
+            pass = false
+        end
+        if pass and Config.ESP.VisibleOnly then
             local ok, visible = pcall(isVisible, model, camPos, head.Position)
             pass = ok and visible
         end
@@ -1601,6 +1616,9 @@ local function buildMenu()
     toggle(pe, "Visible Only",
         function() return Config.ESP.VisibleOnly end,
         function(v) Config.ESP.VisibleOnly = v end)
+    toggle(pe, "NPCs",
+        function() return Config.ESP.NPCs end,
+        function(v) Config.ESP.NPCs = v end)
     slider(pe, "Max Distance",
         function() return Config.ESP.MaxDistance end,
         function(v) Config.ESP.MaxDistance = v end, 100, 100, 10000)
