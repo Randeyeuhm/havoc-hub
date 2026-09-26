@@ -163,7 +163,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v39"
+local SCRIPT_VERSION = "crim-v40"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -1197,6 +1197,18 @@ local function liveSpreadApply(noSpread, announce)
     end
     return n
 end
+
+-- watchdog: hold the zero while No Spread is on. Gun loads can re-snapshot
+-- values into fresh tables; this re-asserts twice a second (writes only -
+-- no GC scans unless the gun actually changed).
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if Config.Weapons.NoSpread then
+            pcall(liveSpreadApply, true, false)
+        end
+    end
+end)
 
 -- ============================================================
 -- SPRING INTERCEPTION (the bulletproof lever)
