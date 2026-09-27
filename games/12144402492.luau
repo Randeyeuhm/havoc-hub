@@ -136,7 +136,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v27"
+local SCRIPT_VERSION = "dl-v28"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -2111,7 +2111,7 @@ local function buildMenu()
         function(v)
             Config.Weapons.ZeroWeight = v
             if v then
-                notify("Zero weight: you walk at weightless speed")
+                notify("Zero weight on - movement changes are server-detected")
                 task.spawn(function()
                     if not gcScanAvailable() then
                         warn("[deadline] GC scan unavailable in this executor - zero weight can't find the controller")
@@ -2128,6 +2128,7 @@ local function buildMenu()
             end
             refreshStatus()
         end)
+    local speedBanWarned = false
     slider(pm, "Speed",
         function() return Config.Misc.SpeedMult end,
         function(v)
@@ -2138,6 +2139,10 @@ local function buildMenu()
                 -- 30s heartbeat tick
                 queueControllerCache()
                 pcall(movementDiag, "speed")
+                if not speedBanWarned then
+                    speedBanWarned = true
+                    notify("Speed changes are server-detected - the game bans for this instantly")
+                end
             end
             refreshStatus()
         end, 0.25, 1, 5, function(v) return ("%g×"):format(v) end)
