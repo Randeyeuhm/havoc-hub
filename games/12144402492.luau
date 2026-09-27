@@ -72,13 +72,19 @@
                           build_viewmodel error gate L361923), Unclamped Stats
                           = plr_weapon_clamp_stats_values=false (stat ->
                           property mapping extrapolates, count_stats L347338).
-                          The mod also auto-captures every editor build
-                          (ItemBuild.new GET_STATE wrap - the map arg IS
-                          build_result.map_save) into the config; in matches
-                          "Force Captured Build" swaps the server-sent setup
-                          for the captured one at the first-person
-                          ItemBuild.new (3rd-person model keeps the legal
-                          setup - client-side only).
+                          SAVE WARNING: saving uploads the setup (checkout
+                          RPC - no compat pre-check) but the game re-builds
+                          STORED loadouts at spawn and refuses broken ones
+                          ("Failed to Spawn ... is broken: ...") - a saved
+                          illegal build locks you out of spawning until a
+                          legal build is re-saved. The mod auto-captures
+                          every GET_STATE build (ItemBuild.new wrap - the map
+                          arg IS build_result.map_save); "Pin last build"
+                          freezes it (auto-capture keeps overwriting
+                          otherwise) and in matches "Force Captured Build"
+                          swaps the pinned (else captured) setup in at the
+                          first-person ItemBuild.new - 3rd-person keeps the
+                          legal setup, client-side only.
           Edit Loadout In Match - unlocks the whole loadout UI inside a match:
                           gm_disable_loadout_editing=false (no read-only
                           "return to lobby" variant, no ALREADY_IN_MATCH
@@ -86,7 +92,8 @@
                           sv_intermission_only_editor=false (editor node
                           clicks work mid-round, not just during the game's
                           intermission windows). Changes apply on the next
-                          spawn - saves hit the same server checkout.
+                          spawn - saves hit the same server checkout (a saved
+                          broken build still blocks spawning - see above).
       • Misc tab (menu organisation) - movement / lighting / audio / reset:
           Movement = Zero Weight + Infinite Stamina; Lighting = Fullbright
           (toggle + Intensity slider 0-255 ambient grey, shadows off, fog
@@ -159,7 +166,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v33"
+local SCRIPT_VERSION = "dl-v34"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -215,8 +222,10 @@ local DEFAULTS = {
         UnclampedStats = false, -- plr_weapon_clamp_stats_values=false: stats extrapolate
         ForceCaptured = false,  -- matches: build the fps gun from the captured setup
         EditInMatch = false,    -- matches: unlock the whole loadout menu + editor
-        Captures = {},          -- [weapon_code] = setup string (auto-captured in editor)
+        Captures = {},          -- [weapon_code] = setup string (auto-captured builds)
         CaptureOrder = {},      -- eviction order for Captures (most recent last)
+        Pinned = {},            -- [weapon_code] = setup string (Pin button - never
+                                -- auto-overwritten, preferred by ForceCaptured)
     },
 }
 
@@ -980,10 +989,27 @@ local function recordCapture(weaponData, map)
     end
 end
 
+-- Pin = freeze the CURRENT last build for a weapon into Customizer.Pinned.
+-- Auto-capture keeps updating Captures (last editor build wins), so pinning
+-- is what protects an illegal build from being overwritten when the saved
+-- loadout is later fixed/reset in the editor.
+local function pinLastCapture()
+    local code = CUSTOMIZER.last_weapon
+    local str = CUSTOMIZER.last_string
+    if type(code) ~= "string" or type(str) ~= "string" then
+        return nil
+    end
+    local c = Config.Customizer
+    if type(c.Pinned) ~= "table" then c.Pinned = {} end
+    c.Pinned[code] = str
+    saveConfig()
+    return code
+end
+
 -- One permanent wrapper on ItemBuild.new:
---   * lobby editor/preview builds (GET_STATE config) -> capture the map
+--   * every editor build (GET_STATE config, lobby or match) -> capture the map
 --   * match first-person builds (FIRST_PERSON config) + ForceCaptured ->
---     swap in the captured setup for that weapon code
+--     swap in the pinned (else captured) setup for that weapon code
 local function installItemBuildWrap()
     local ok, err = pcall(function()
         local classFolder = ReplicatedStorage:WaitForChild("class", 10)
@@ -1005,13 +1031,13 @@ local function installItemBuildWrap()
         local orig = CUSTOMIZER.ib_orig or IB.new
         CUSTOMIZER.ib_orig = orig
         IB.new = function(weapon_data, model, map, config, flags)
-            if config == BuildConfig.GET_STATE_BUILD_CONFIG and IS_LOBBY then
+            if config == BuildConfig.GET_STATE_BUILD_CONFIG then
                 pcall(recordCapture, weapon_data, map)
             elseif config == BuildConfig.FIRST_PERSON_BUILD_CONFIG and not IS_LOBBY then
                 local c = Config.Customizer
-                if c and c.ForceCaptured and c.Captures then
+                if c and c.ForceCaptured and (c.Captures or c.Pinned) then
                     local code = weapon_data and weapon_data.base_instance and weapon_data.base_instance.Name
-                    local str = code and c.Captures[code]
+                    local str = code and ((c.Pinned and c.Pinned[code]) or (c.Captures and c.Captures[code]))
                     if type(str) == "string" then
                         local okd, decoded = pcall(SS.decode, str)
                         if okd and type(decoded) == "table" then
@@ -1024,8 +1050,8 @@ local function installItemBuildWrap()
             end
             return orig(weapon_data, model, map, config, flags)
         end
-        print(("[deadline] gun customizer armed (capture=%s, force=%s)")
-            :format(tostring(IS_LOBBY), tostring(Config.Customizer.ForceCaptured)))
+        print(("[deadline] gun customizer armed (captures=auto, force=%s)")
+            :format(tostring(Config.Customizer.ForceCaptured)))
     end)
     if not ok then
         warn("[deadline] gun customizer wrap unavailable: " .. tostring(err))
@@ -2308,12 +2334,20 @@ local function buildMenu()
         function() return Config.Customizer.ForceCaptured end,
         function(v)
             Config.Customizer.ForceCaptured = v
-            if v and next(Config.Customizer.Captures) == nil then
+            if v and next(Config.Customizer.Captures) == nil and next(Config.Customizer.Pinned) == nil then
                 notify("No builds captured yet - edit a gun in the editor first")
             else
-                notify(v and "Matches: your guns build from the captured setup" or "Captured-build override off")
+                notify(v and "Matches: pinned builds apply at spawn - keep saved builds legal" or "Captured-build override off")
             end
         end)
+    button(p1, "Pin last build", function()
+        local code = pinLastCapture()
+        if code then
+            notify(("Pinned %s - fixing the saved build won't overwrite it"):format(code))
+        else
+            notify("Nothing captured yet - open a gun in the editor first")
+        end
+    end)
     toggle(p1, "Edit Loadout In Match",
         function() return Config.Customizer.EditInMatch end,
         function(v)
@@ -2331,7 +2365,7 @@ local function buildMenu()
             notify("Nothing captured yet - edit a gun in the editor first")
         end
     end)
-    note(p1, "Editor dev switches: any slot / no broken-build checks / unscaled stats. If saving an illegal build fails, Force Captured Build swaps it in at match spawn. Edit Loadout In Match unlocks the loadout menu mid-match.")
+    note(p1, "Save = checked at SPAWN: a saved broken build locks you out of spawning. Safe flow: build it, Pin last build, exit WITHOUT saving - Force Captured Build plays it client-side in matches. Locked out? Reset the gun in the editor and save a legal build.")
 
     statusLabel = note(p1, "loading...")
 
