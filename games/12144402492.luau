@@ -136,7 +136,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v25"
+local SCRIPT_VERSION = "dl-v26"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -912,14 +912,17 @@ if type(ZW_STATE.saved) ~= "table" then
 end
 
 -- only ever touches the LOCAL controller. controller.character is the rig
--- MODEL itself (assigned from simulation.character.instance, dump L368119);
--- the old `.instance`-wrapper probe never matched a Model, and is_local is
--- only set by the lobby-editor spawn - between the two, matches had NO
--- controller passing this filter and the whole override silently did
--- nothing.
+-- MODEL itself (assigned from simulation.character.instance, dump L368119),
+-- but the diag proved both old probes dead in practice: is_local is nil
+-- outside the lobby-editor spawn AND LocalPlayer.Character is not linked to
+-- these custom rigs (nil). The rigs ARE named by UserId though - the model
+-- name is the reliable identity.
 local function isLocalCharData(controller, cd)
     if rawget(cd, "is_local") == true then return true end
-    return rawget(controller, "character") == LocalPlayer.Character
+    local ch = rawget(controller, "character")
+    if ch == nil then return false end
+    if ch == LocalPlayer.Character then return true end
+    return ch.Name == tostring(LocalPlayer.UserId)
 end
 
 local function zeroWeightStep()
@@ -985,17 +988,22 @@ local function movementDiag(tag)
                 end
                 if i <= 3 then
                     local ov = type(cd) == "table" and rawget(cd, "overrides") or nil
-                    detail[#detail + 1] = ("#%d cd:%s local:%s ov:%s speed:%s w:%s"):format(
+                    local ch = rawget(controller, "character")
+                    detail[#detail + 1] = ("#%d cd:%s local:%s ov:%s speed:%s w:%s char:%s/%s"):format(
                         i,
                         type(cd) == "table" and "ok" or "nil",
                         type(cd) == "table" and tostring(rawget(cd, "is_local")) or "-",
                         type(ov) == "table" and "ok" or "nil",
                         type(ov) == "table" and tostring(rawget(ov, "speed")) or "-",
-                        type(cd) == "table" and tostring(rawget(cd, "collective_weight")) or "-")
+                        type(cd) == "table" and tostring(rawget(cd, "collective_weight")) or "-",
+                        ch == nil and "nil" or tostring(ch.Name),
+                        typeof(ch))
                 end
             end
-            print(("[deadline] move diag (%s) - gcscan:%s controllers:%d local:%d  %s")
-                :format(tag, gcScanAvailable() and "ok" or "NO", #list, localN, table.concat(detail, "   ")))
+            print(("[deadline] move diag (%s) - gcscan:%s controllers:%d local:%d myChar:%s  %s")
+                :format(tag, gcScanAvailable() and "ok" or "NO", #list, localN,
+                    LocalPlayer.Character and LocalPlayer.Character.Name or "nil",
+                    table.concat(detail, "   ")))
             if first then
                 local cd = rawget(first, "char_data")
                 local ov = cd and rawget(cd, "overrides")
