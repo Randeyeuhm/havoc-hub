@@ -136,7 +136,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v23"
+local SCRIPT_VERSION = "dl-v24"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -720,8 +720,8 @@ local function localControllerStubbed()
     local stub = swayStub("camera_nonrelative")
     for controller in pairs(BOB_STATE.saved) do
         if type(controller) == "table" then
-            local ch = rawget(controller, "character")
-            if type(ch) == "table" and rawget(ch, "instance") == char then
+            -- controller.character is the rig MODEL itself (dump L368119)
+            if rawget(controller, "character") == char then
                 local springs = rawget(controller, "springs")
                 if type(springs) == "table" and rawget(springs, "camera_nonrelative") == stub then
                     return true
@@ -911,11 +911,15 @@ if type(ZW_STATE.saved) ~= "table" then
     ZW_STATE.saved = setmetatable({}, { __mode = "k" })
 end
 
--- only ever touches the LOCAL controller: remote rigs rep the network.
+-- only ever touches the LOCAL controller. controller.character is the rig
+-- MODEL itself (assigned from simulation.character.instance, dump L368119);
+-- the old `.instance`-wrapper probe never matched a Model, and is_local is
+-- only set by the lobby-editor spawn - between the two, matches had NO
+-- controller passing this filter and the whole override silently did
+-- nothing.
 local function isLocalCharData(controller, cd)
     if rawget(cd, "is_local") == true then return true end
-    local ch = rawget(controller, "character")
-    return type(ch) == "table" and rawget(ch, "instance") == LocalPlayer.Character
+    return rawget(controller, "character") == LocalPlayer.Character
 end
 
 local function zeroWeightStep()
@@ -927,19 +931,23 @@ local function zeroWeightStep()
             local cd = rawget(controller, "char_data")
             if type(cd) == "table" and isLocalCharData(controller, cd) then
                 local ov = rawget(cd, "overrides")
-                if type(ov) == "table" then
-                    local w = tonumber(rawget(cd, "collective_weight")) or 0
-                    if w < 0 then w = 0 end
-                    if ZW_STATE.saved[controller] == nil then
-                        ZW_STATE.saved[controller] = { cd = cd, orig = ov.speed }
-                    end
-                    -- overrides.speed is the single clean multiplier at the
-                    -- end of the walkspeed chain: weight compensation when
-                    -- Zero Weight is on, times the flat Speed slider value.
-                    local m = 1
-                    if zw then m = (w / 10) + 1 end
-                    ov.speed = m * mult
+                if type(ov) ~= "table" then
+                    -- defensive: always present in practice, but never
+                    -- write into the void if a spawn path skipped it
+                    ov = {}
+                    cd.overrides = ov
                 end
+                local w = tonumber(rawget(cd, "collective_weight")) or 0
+                if w < 0 then w = 0 end
+                if ZW_STATE.saved[controller] == nil then
+                    ZW_STATE.saved[controller] = { cd = cd, orig = ov.speed }
+                end
+                -- overrides.speed is the single clean multiplier at the
+                -- end of the walkspeed chain: weight compensation when
+                -- Zero Weight is on, times the flat Speed slider value.
+                local m = 1
+                if zw then m = (w / 10) + 1 end
+                ov.speed = m * mult
             end
         end
     end
@@ -953,6 +961,56 @@ local function zeroWeightRestore()
         end
         ZW_STATE.saved[controller] = nil
     end
+end
+
+-- Names the dead link when the movement override "does nothing": scan
+-- availability, controller count, which ones pass the local filter,
+-- char_data / overrides shape, the written value - then a 1.5s readback
+-- showing whether the value survived.
+local mdQueued = false
+local function movementDiag(tag)
+    if mdQueued then return end
+    mdQueued = true
+    task.delay(0.6, function()
+        mdQueued = false
+        if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
+        local ok, err = pcall(function()
+            local list = findControllers()
+            local localN, first, detail = 0, nil, {}
+            for i, controller in ipairs(list) do
+                local cd = rawget(controller, "char_data")
+                if type(cd) == "table" and isLocalCharData(controller, cd) then
+                    localN = localN + 1
+                    if not first then first = controller end
+                end
+                if i <= 3 then
+                    local ov = type(cd) == "table" and rawget(cd, "overrides") or nil
+                    detail[#detail + 1] = ("#%d cd:%s local:%s ov:%s speed:%s w:%s"):format(
+                        i,
+                        type(cd) == "table" and "ok" or "nil",
+                        type(cd) == "table" and tostring(rawget(cd, "is_local")) or "-",
+                        type(ov) == "table" and "ok" or "nil",
+                        type(ov) == "table" and tostring(rawget(ov, "speed")) or "-",
+                        type(cd) == "table" and tostring(rawget(cd, "collective_weight")) or "-")
+                end
+            end
+            print(("[deadline] move diag (%s) - gcscan:%s controllers:%d local:%d  %s")
+                :format(tag, gcScanAvailable() and "ok" or "NO", #list, localN, table.concat(detail, "   ")))
+            if first then
+                local cd = rawget(first, "char_data")
+                local ov = cd and rawget(cd, "overrides")
+                local wrote = type(ov) == "table" and ov.speed or nil
+                task.delay(1.5, function()
+                    if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
+                    local now = type(ov) == "table" and ov.speed or nil
+                    print(("[deadline] move diag (%s) persistence - wrote:%s readback:%s (%s)")
+                        :format(tag, tostring(wrote), tostring(now),
+                            (now == wrote and "kept") or "CHANGED"))
+                end)
+            end
+        end)
+        if not ok then warn("[deadline] move diag error: " .. tostring(err)) end
+    end)
 end
 
 local zwErrCount = 0
@@ -2047,6 +2105,7 @@ local function buildMenu()
                     end
                     pcall(refreshControllerCache)
                     pcall(zeroWeightStep)
+                    pcall(movementDiag, "zero-weight")
                 end)
             else
                 pcall(zeroWeightRestore)
@@ -2059,6 +2118,7 @@ local function buildMenu()
         function() return Config.Misc.SpeedMult end,
         function(v)
             Config.Misc.SpeedMult = v
+            if v > 1 then pcall(movementDiag, "speed") end
             refreshStatus()
         end, 0.25, 1, 5, function(v) return ("%g×"):format(v) end)
     toggle(pm, "Infinite Stamina",
@@ -2182,6 +2242,7 @@ task.spawn(function()
         task.spawn(function()
             pcall(refreshControllerCache)
             pcall(zeroWeightStep)
+            pcall(movementDiag, "boot")
         end)
     else
         -- reconcile: an earlier run can leave overrides.speed boosted
