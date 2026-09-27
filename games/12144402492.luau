@@ -135,7 +135,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v22"
+local SCRIPT_VERSION = "dl-v31"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -565,18 +565,6 @@ local function smoothStub(name)
     return s
 end
 
-local function gcScanAvailable()
-    local fn = getgc
-    if type(fn) ~= "function" then return false end
-    local ok, list = pcall(fn, true)
-    if not ok then ok, list = pcall(fn) end
-    if not ok or type(list) ~= "table" then return false end
-    for i = 1, #list do
-        if list[i] == GC_CANARY then return true end
-    end
-    return false
-end
-
 local function isDeadlineController(t)
     if type(t) ~= "table" then return false end
     local springs = rawget(t, "springs")
@@ -592,20 +580,80 @@ local function isDeadlineController(t)
         and type(rawget(lerps, "final_aim")) == "table"
 end
 
-local function findControllers()
-    local out = {}
-    local fn = getgc
-    if type(fn) ~= "function" then return out end
-    local ok, list = pcall(fn, true)
-    if not ok then ok, list = pcall(fn) end
-    if not ok or type(list) ~= "table" then return out end
-    for i = 1, #list do
-        local v = list[i]
-        if isDeadlineController(v) then
-            table.insert(out, v)
-        end
+-- ============================================================
+-- CONTROLLER SCAN  (one shared, throttled getgc walk)
+-- ============================================================
+-- getgc(true) is a full-heap walk - the most expensive thing this script
+-- does, and the reason respawns hitched: two retry chains (sway stubs +
+-- reload/zero-weight/ballistics cache) plus every capability check used to
+-- run their own scan - up to a dozen full walks in the first seconds after
+-- a spawn, each building a huge throwaway array (GC churn on top of the
+-- pause). All callers now share ONE cached scan:
+--   * results are reused for 0.75s - back-to-back callers cost nothing,
+--   * the canary capability check rides along instead of re-scanning,
+--   * big heaps are walked in chunks (yield every 8192 entries) so a scan
+--     never blocks a single frame for long.
+local SCAN = { list = {}, t = -math.huge, gcOK = nil, busy = false }
+local SCAN_REUSE = 0.75
+
+local function scanControllers()
+    local now = os.clock()
+    if (now - SCAN.t) < SCAN_REUSE or SCAN.busy then
+        return SCAN.list
     end
-    return out
+    SCAN.busy = true
+    local ok = pcall(function()
+        local fn = getgc
+        if type(fn) ~= "function" then
+            SCAN.gcOK = false
+            SCAN.list = {}
+            return
+        end
+        local ok2, heap = pcall(fn, true)
+        if not ok2 then ok2, heap = pcall(fn) end
+        if not ok2 or type(heap) ~= "table" then
+            SCAN.gcOK = false
+            SCAN.list = {}
+            return
+        end
+        SCAN.gcOK = true
+        local out = {}
+        local sawCanary = false
+        local n = #heap
+        for i = 1, n do
+            local v = heap[i]
+            if v == GC_CANARY then
+                sawCanary = true
+            elseif isDeadlineController(v) then
+                table.insert(out, v)
+            end
+            -- spread the walk across frames; pcall guards non-yieldable
+            -- contexts (the scan then just runs straight through)
+            if (i % 8192) == 0 and i < n then pcall(task.wait) end
+        end
+        SCAN.gcOK = sawCanary
+        SCAN.list = out
+    end)
+    if not ok then
+        -- unexpected failure mid-walk: drop the (stale) list but keep the
+        -- capability answer - a filter glitch must not disable diagnostics
+        SCAN.list = {}
+    end
+    SCAN.t = os.clock()
+    SCAN.busy = false
+    return SCAN.list
+end
+
+-- Cached capability answer (the old version ran its own getgc per call).
+local function gcScanAvailable()
+    if SCAN.gcOK == nil then
+        scanControllers()
+    end
+    return SCAN.gcOK == true
+end
+
+local function findControllers()
+    return scanControllers()
 end
 
 -- Knob side: 0 while on, originals while off. Cheap - runs on the heartbeat.
@@ -730,10 +778,13 @@ end
 -- The controller is built over the first moments after spawn, so keep
 -- retrying instead of a single delayed scan - that single scan missing the
 -- fresh controller is why the stubs felt like they didn't reapply.
+-- (4 retries, not 8: every retry is a full GC scan, and the reload/zero
+-- weight/ballistics chain shares the same 0.75s scan window - the 30s
+-- heartbeat picks up anything that still slips through.)
 track(LocalPlayer.CharacterAdded:Connect(function()
     if not Config.Weapons.ZeroSway then return end
     task.spawn(function()
-        for _, delay in ipairs({ 0.5, 0.5, 1, 1, 2, 2, 3, 4 }) do
+        for _, delay in ipairs({ 0.6, 1.5, 3, 6 }) do
             task.wait(delay)
             if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
             if not Config.Weapons.ZeroSway then return end
@@ -812,10 +863,10 @@ local RELOAD_FEED_TRACKS = {
 }
 
 -- GC scan (same controller signature the sway stubs use) - event-driven,
--- never per frame.
+-- never per frame; pulls from the shared throttled scan (SCAN) so it can
+-- never stack a second heap walk on top of a recent one.
 local function refreshControllerCache()
-    if not gcScanAvailable() then return end
-    for _, controller in ipairs(findControllers()) do
+    for _, controller in ipairs(scanControllers()) do
         CTRL_STATE.tracked[controller] = true
     end
 end
@@ -847,7 +898,8 @@ track(LocalPlayer.CharacterAdded:Connect(function()
     if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight
         and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1 then return end
     task.spawn(function()
-        for _, d in ipairs({ 1, 2, 3 }) do
+        -- 2 retries: scans are shared with the sway chain's 0.75s window
+        for _, d in ipairs({ 1.2, 3.5 }) do
             task.wait(d)
             if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
             if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight
@@ -2115,14 +2167,24 @@ end
 -- RENDER LOOPS  (ESP frame + camera aim after the game's camera)
 -- ============================================================
 local espRenderErrors = 0
+local espIdle = false
 track(RunService.RenderStepped:Connect(function()
     local cam = workspace.CurrentCamera
     if not cam then return end
+    local enabled = Config.ESP.Enabled
+    if enabled then espIdle = false end
+    if espIdle then
+        -- ESP off and its drawings were already hidden in one final pass -
+        -- skip the per-frame engine calls until it is re-enabled
+        pcall(updateFovCircle, UserInputService:GetMouseLocation())
+        return
+    end
     local ok, err = pcall(renderESP, cam)
     if not ok and espRenderErrors < 6 then
         espRenderErrors = espRenderErrors + 1
         warn(("[deadline] ESP render error (%d): %s"):format(espRenderErrors, tostring(err)))
     end
+    if ok and not enabled then espIdle = true end
     pcall(updateFovCircle, UserInputService:GetMouseLocation())
 end))
 
