@@ -6,7 +6,7 @@
     Both places share the exact same client framework, so the loader maps the
     whole universe here (see UNIVERSES in loader.luau).
 
-      • Weapons tab - everything live via the game's own shared_state knobs:
+      • Weapons + Misc tabs - everything live via the game's own levers:
           Recoil %      - plr_recoil + every recoil trait (debug values)
           Spread %      - plr_barrel_deviation / plr_buck_barrel_deviation
           Aim In Speed  - plr_viewmodel_state_transition_speed   (dump L356495;
@@ -63,6 +63,11 @@
                           Enabled=false (live + RS templates) and the
                           tinnitus ringing group muted (explosion_deaf_effect
                           L201192-205, lobby_deaf_effect L131807)
+      • Misc tab (menu organisation) - movement / lighting / audio / reset:
+          Movement = Zero Weight + Infinite Stamina; Lighting = Fullbright
+          (toggle + Intensity slider 0-255 ambient grey, shadows off, fog
+          gone, re-checked every frame so weather can't dim it again);
+          Audio = No Deafness; Reset = the global Restore vanilla.
       • Aimbot / ESP - built around the match rigs: characters live in
           Workspace.characters as <UserId>-named models (custom rig: head /
           humanoid_root_part / torso_hitbox / *_vis - no Humanoid). The game
@@ -130,7 +135,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v19"
+local SCRIPT_VERSION = "dl-v20"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -173,6 +178,10 @@ local DEFAULTS = {
         Enabled = false, VisibleOnly = false, MaxDistance = 2500,
         Health = false,  -- no client-readable remote health in this game
         NPCs = true,     -- show non-player (NPC / bot) rigs in the ESP
+    },
+    Misc = {
+        Fullbright = false,
+        FullbrightIntensity = 190, -- ambient grey 0-255 while fullbright is on
     },
 }
 
@@ -236,6 +245,9 @@ Config.Weapons.ReloadSpeed = math.clamp(tonumber(Config.Weapons.ReloadSpeed) or 
 -- projectile penetration multiplier.
 Config.Weapons.BulletVelocity = math.clamp(tonumber(Config.Weapons.BulletVelocity) or 15, 1, 50)
 Config.Weapons.Wallbang = math.clamp(tonumber(Config.Weapons.Wallbang) or 1, 1, 100)
+
+-- Fullbright intensity: ambient grey level (matches the sibling scripts).
+Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
 
 -- ============================================================
 -- DEADLINE WEAPON FRAMEWORK  (the live levers)
@@ -1161,6 +1173,67 @@ task.spawn(function()
     end
 end)
 
+-- ============================================================
+-- FULLBRIGHT  (Misc tab: adjustable lighting override)
+-- ============================================================
+-- The game's weather module rewrites ClockTime from its day cycle every
+-- frame (L198694-198695) and storms lerp OutdoorAmbient down (L198760),
+-- so the clock is left alone; instead the light values are re-checked
+-- every frame and only mismatches get written - weather simply can't dim
+-- the scene while this is on. Originals are captured once and kept on
+-- genv, so a re-execution while fullbright is on can never learn the lit
+-- values as vanilla.
+local Lighting = game:GetService("Lighting")
+
+local function lightOriginals()
+    if genv.__HAVOC_DEADLINE_LIGHT == nil then
+        genv.__HAVOC_DEADLINE_LIGHT = {
+            Ambient = Lighting.Ambient,
+            OutdoorAmbient = Lighting.OutdoorAmbient,
+            Brightness = Lighting.Brightness,
+            GlobalShadows = Lighting.GlobalShadows,
+            FogEnd = Lighting.FogEnd,
+            FogStart = Lighting.FogStart,
+        }
+    end
+    return genv.__HAVOC_DEADLINE_LIGHT
+end
+
+local function setFullbright(on)
+    local orig = lightOriginals()
+    if on then
+        local v = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
+        local c = Color3.fromRGB(v, v, v)
+        Lighting.Ambient = c
+        Lighting.OutdoorAmbient = c
+        Lighting.Brightness = 2
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 100000
+        Lighting.FogStart = 100000
+    else
+        pcall(function()
+            Lighting.Ambient = orig.Ambient
+            Lighting.OutdoorAmbient = orig.OutdoorAmbient
+            Lighting.Brightness = orig.Brightness
+            Lighting.GlobalShadows = orig.GlobalShadows
+            Lighting.FogEnd = orig.FogEnd
+            Lighting.FogStart = orig.FogStart
+        end)
+    end
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if not Config.Misc.Fullbright then return end
+    local v = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
+    local c = Color3.fromRGB(v, v, v)
+    if Lighting.Ambient ~= c then Lighting.Ambient = c end
+    if Lighting.OutdoorAmbient ~= c then Lighting.OutdoorAmbient = c end
+    if Lighting.Brightness < 2 then Lighting.Brightness = 2 end
+    if Lighting.GlobalShadows then Lighting.GlobalShadows = false end
+    if Lighting.FogEnd < 100000 then Lighting.FogEnd = 100000 end
+    if Lighting.FogStart < 100000 then Lighting.FogStart = 100000 end
+end))
+
 -- esp.luau loads later in this file (UI library section) - declare the
 -- handle HERE so the ESP features below close over this local instead of a
 -- nil global (that scoping miss is why ESP silently did nothing).
@@ -1640,7 +1713,7 @@ local function buildMenu()
         subtitle = ("PlaceId %d  ·  %s"):format(game.PlaceId, SCRIPT_VERSION),
         size = UDim2.new(0, winW, 0, winH),
         position = UDim2.new(0, 30, 0, 40),
-        tabs = { "Aimbot", "ESP", "Weapons" },
+        tabs = { "Aimbot", "ESP", "Weapons", "Misc" },
         controls = guiControls,
         footerHint = "RightShift - show / hide this menu",
         onClose = function()
@@ -1651,6 +1724,7 @@ local function buildMenu()
     local pa = win.tab(1)  -- Aimbot
     local pe = win.tab(2)  -- ESP
     local p1 = win.tab(3)  -- Weapons
+    local pm = win.tab(4)  -- Misc
 
     local builtCount = 0
     local function guard(what, fn)
@@ -1877,26 +1951,6 @@ local function buildMenu()
             Config.Weapons.ReloadSpeed = v
             if v > 1 then queueControllerCache() end
         end, 0.25, 1, 3, function(v) return ("%g×"):format(v) end)
-    toggle(p1, "Zero Weight",
-        function() return Config.Weapons.ZeroWeight end,
-        function(v)
-            Config.Weapons.ZeroWeight = v
-            if v then
-                notify("Zero weight: you walk at weightless speed")
-                task.spawn(function()
-                    if not gcScanAvailable() then
-                        warn("[deadline] GC scan unavailable in this executor - zero weight can't find the controller")
-                        return
-                    end
-                    pcall(refreshControllerCache)
-                    pcall(zeroWeightStep)
-                end)
-            else
-                pcall(zeroWeightRestore)
-                notify("Weight restored - normal walk speed")
-            end
-            refreshStatus()
-        end)
 
     section(p1, "Ballistics")
     slider(p1, "Bullet Velocity",
@@ -1922,14 +1976,6 @@ local function buildMenu()
             refreshStatus()
             notify(v and "Steady aim: arms never tire, breathing shake off" or "Steady aim off")
         end)
-    toggle(p1, "Infinite Stamina",
-        function() return Config.Weapons.InfStamina end,
-        function(v)
-            Config.Weapons.InfStamina = v
-            applyInfStamina()
-            refreshStatus()
-            notify(v and "Infinite stamina: sprint and lean forever" or "Infinite stamina off")
-        end)
     toggle(p1, "Zero Sight Sway",
         function() return Config.Weapons.ZeroSway end,
         function(v)
@@ -1953,8 +1999,57 @@ local function buildMenu()
             notify(v and "Sight sway zeroed - no walk bob, no look lag" or "Sight sway restored")
         end)
 
-    section(p1, "Audio")
-    toggle(p1, "No Deafness",
+    statusLabel = note(p1, "loading...")
+
+    -- ---------------- Misc ---------------- (movement / lighting / audio /
+    -- reset: the pieces that were crowding the Weapons tab)
+    section(pm, "Movement")
+    toggle(pm, "Zero Weight",
+        function() return Config.Weapons.ZeroWeight end,
+        function(v)
+            Config.Weapons.ZeroWeight = v
+            if v then
+                notify("Zero weight: you walk at weightless speed")
+                task.spawn(function()
+                    if not gcScanAvailable() then
+                        warn("[deadline] GC scan unavailable in this executor - zero weight can't find the controller")
+                        return
+                    end
+                    pcall(refreshControllerCache)
+                    pcall(zeroWeightStep)
+                end)
+            else
+                pcall(zeroWeightRestore)
+                notify("Weight restored - normal walk speed")
+            end
+            refreshStatus()
+        end)
+    toggle(pm, "Infinite Stamina",
+        function() return Config.Weapons.InfStamina end,
+        function(v)
+            Config.Weapons.InfStamina = v
+            applyInfStamina()
+            refreshStatus()
+            notify(v and "Infinite stamina: sprint and lean forever" or "Infinite stamina off")
+        end)
+
+    section(pm, "Lighting")
+    toggle(pm, "Fullbright",
+        function() return Config.Misc.Fullbright end,
+        function(v)
+            Config.Misc.Fullbright = v
+            pcall(setFullbright, v)
+            notify(v and "Fullbright on" or "Lighting restored")
+        end)
+    slider(pm, "Intensity",
+        function() return Config.Misc.FullbrightIntensity end,
+        function(v)
+            Config.Misc.FullbrightIntensity = v
+            if Config.Misc.Fullbright then pcall(setFullbright, true) end
+        end, 5, 0, 255, function(v) return ("%d"):format(v) end)
+
+    section(pm, "Audio")
+    toggle(pm, "No Deafness",
         function() return Config.Weapons.NoDeaf end,
         function(v)
             Config.Weapons.NoDeaf = v
@@ -1962,11 +2057,10 @@ local function buildMenu()
             notify(v and "Deafness and ringing disabled" or "Deafness restored")
         end)
 
-    statusLabel = note(p1, "loading...")
-
-    section(p1, "Reset")
-    button(p1, "Restore vanilla", function()
+    section(pm, "Reset")
+    button(pm, "Restore vanilla", function()
         local w = Config.Weapons
+        local m = Config.Misc
         w.RecoilPct = 100
         w.SpreadPct = 100
         w.AimSpeed = 1
@@ -1980,16 +2074,19 @@ local function buildMenu()
         w.ZeroWeight = false
         w.BulletVelocity = 1
         w.Wallbang = 1
+        m.Fullbright = false
+        m.FullbrightIntensity = 190
         pcall(unstubSwaySprings)
         pcall(applyNoDeaf, false)
         pcall(zeroWeightRestore)
         pcall(ballisticsRestore)
         pcall(applyBallistics)
+        pcall(setFullbright, false)
         applyAll()
         refreshGUI()
         refreshStatus()
         saveConfig()
-        notify("Deadline weapons restored to vanilla")
+        notify("Deadline settings restored to vanilla")
     end)
 
     win:setControls(guiControls)
@@ -2062,6 +2159,7 @@ task.spawn(function()
         pcall(ballisticsRestore)
     end
     pcall(applyBallistics)
+    pcall(setFullbright, Config.Misc.Fullbright)
     if Config.Weapons.NoDeaf then
         pcall(applyNoDeaf, true)
     end
