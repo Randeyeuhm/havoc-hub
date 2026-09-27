@@ -79,6 +79,14 @@
                           for the captured one at the first-person
                           ItemBuild.new (3rd-person model keeps the legal
                           setup - client-side only).
+          Edit Loadout In Match - unlocks the whole loadout UI inside a match:
+                          gm_disable_loadout_editing=false (no read-only
+                          "return to lobby" variant, no ALREADY_IN_MATCH
+                          notice; CUSTOMIZE/SWITCH buttons live) +
+                          sv_intermission_only_editor=false (editor node
+                          clicks work mid-round, not just during the game's
+                          intermission windows). Changes apply on the next
+                          spawn - saves hit the same server checkout.
       • Misc tab (menu organisation) - movement / lighting / audio / reset:
           Movement = Zero Weight + Infinite Stamina; Lighting = Fullbright
           (toggle + Intensity slider 0-255 ambient grey, shadows off, fog
@@ -151,7 +159,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v32"
+local SCRIPT_VERSION = "dl-v33"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -206,6 +214,7 @@ local DEFAULTS = {
         SkipCompat = false,     -- editor_compatibility_checks=false: never "broken"
         UnclampedStats = false, -- plr_weapon_clamp_stats_values=false: stats extrapolate
         ForceCaptured = false,  -- matches: build the fps gun from the captured setup
+        EditInMatch = false,    -- matches: unlock the whole loadout menu + editor
         Captures = {},          -- [weapon_code] = setup string (auto-captured in editor)
         CaptureOrder = {},      -- eviction order for Captures (most recent last)
     },
@@ -863,7 +872,16 @@ end))
 --   plr_weapon_clamp_stats_values - when false, the stat->property mapping
 --                                   (count_stats, dump L347338) extrapolates
 --                                   past min/max instead of clamping
--- All three are client-local SharedValue writes - never replicated.
+-- All client-local SharedValue writes - never replicated.
+-- dl-v33 adds the match-editing pair:
+--   gm_disable_loadout_editing    - gates the whole loadout UI in matches
+--                                   (read-only "return to lobby" variant +
+--                                   the ALREADY_IN_MATCH notice at L168941)
+--   sv_intermission_only_editor   - the editor's own gate: mid-round node
+--                                   clicks are ignored while
+--                                   sv_intermission_finish is nil + this is
+--                                   true (editor L147865; the game's design
+--                                   = editing allowed during intermissions)
 --
 -- The save flow uploads the encoded setup through the checkout RPC
 -- (call_checkout_setups); if the server re-validates it, the save is
@@ -880,19 +898,39 @@ if type(CUSTOMIZER) ~= "table" then
     genv.__HAVOC_DEADLINE_CUSTOM = CUSTOMIZER
 end
 
+-- One shared writer for the editor's dev switches. Each knob is (re)written
+-- while its toggle is ON - the heartbeat re-asserts because the game
+-- rebroadcasts shared state - and restored to the game's own default ONCE
+-- when the toggle goes off, never continuously. That way the game keeps
+-- control of its own values (e.g. its legit intermission editing flow)
+-- whenever our toggles are off.
 local function applyCustomizer()
     if not RESOURCES_OK then return end
     local c = Config.Customizer
     if not c then return end
-    if SHARED_STATE.editor_mount_anything then
-        SHARED_STATE.editor_mount_anything.value = c.MountAnything == true
+    local applied = CUSTOMIZER.applied
+    if type(applied) ~= "table" then
+        applied = {}
+        CUSTOMIZER.applied = applied
     end
-    if SHARED_STATE.editor_compatibility_checks then
-        SHARED_STATE.editor_compatibility_checks.value = not (c.SkipCompat == true)
+    local function knob(key, ssName, onValue, enabled, offValue)
+        local kv = SHARED_STATE[ssName]
+        if not kv then return end
+        if enabled then
+            kv.value = onValue
+            applied[key] = true
+        elseif applied[key] then
+            applied[key] = nil
+            kv.value = offValue
+        end
     end
-    if SHARED_STATE.plr_weapon_clamp_stats_values then
-        SHARED_STATE.plr_weapon_clamp_stats_values.value = not (c.UnclampedStats == true)
-    end
+    knob("mount", "editor_mount_anything", true, c.MountAnything == true, false)
+    knob("compat", "editor_compatibility_checks", false, c.SkipCompat == true, true)
+    knob("clamp", "plr_weapon_clamp_stats_values", false, c.UnclampedStats == true, true)
+    -- dl-v33: match loadout editing. Off values = the game's own defaults
+    -- per place (lobby false / match true for both).
+    knob("editing", "gm_disable_loadout_editing", false, c.EditInMatch == true, not IS_LOBBY)
+    knob("editor_gate", "sv_intermission_only_editor", false, c.EditInMatch == true, not IS_LOBBY)
 end
 
 local function deepCopyPlain(v, seen, depth)
@@ -2276,6 +2314,14 @@ local function buildMenu()
                 notify(v and "Matches: your guns build from the captured setup" or "Captured-build override off")
             end
         end)
+    toggle(p1, "Edit Loadout In Match",
+        function() return Config.Customizer.EditInMatch end,
+        function(v)
+            Config.Customizer.EditInMatch = v
+            applyCustomizer()
+            refreshStatus()
+            notify(v and "Loadout menu unlocked in matches - changes apply on your next spawn" or "Match loadout editing locked again")
+        end)
     button(p1, "Copy last captured setup", function()
         local w, s = CUSTOMIZER.last_weapon, CUSTOMIZER.last_string
         if type(s) == "string" and type(setclipboard) == "function" then
@@ -2285,7 +2331,7 @@ local function buildMenu()
             notify("Nothing captured yet - edit a gun in the editor first")
         end
     end)
-    note(p1, "Editor dev switches: any slot / no broken-build checks / unscaled stats. If saving an illegal build fails, Force Captured Build swaps it in at match spawn.")
+    note(p1, "Editor dev switches: any slot / no broken-build checks / unscaled stats. If saving an illegal build fails, Force Captured Build swaps it in at match spawn. Edit Loadout In Match unlocks the loadout menu mid-match.")
 
     statusLabel = note(p1, "loading...")
 
@@ -2355,6 +2401,7 @@ local function buildMenu()
             cz.SkipCompat = false
             cz.UnclampedStats = false
             cz.ForceCaptured = false
+            cz.EditInMatch = false
         end
         w.RecoilPct = 100
         w.SpreadPct = 100
@@ -2482,7 +2529,7 @@ task.spawn(function()
         if w.RecoilPct < 100 or w.SpreadPct < 100 or w.AimSpeed ~= 1 or w.SwitchSpeed ~= 1
             or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina or w.ZeroSway or w.ZeroWeight
             or (tonumber(w.BulletVelocity) or 1) > 1 or (tonumber(w.Wallbang) or 1) > 1
-            or cz.MountAnything or cz.SkipCompat or cz.UnclampedStats then
+            or cz.MountAnything or cz.SkipCompat or cz.UnclampedStats or cz.EditInMatch then
             local ok, err = pcall(function()
                 applyAll()
                 zeroWeightStep()
