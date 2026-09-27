@@ -14,7 +14,7 @@ Adding support for a new game is just dropping a `<PlaceId>.luau` file into `gam
 ## Quick start (loader)
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/Randeyeuhm/havoc-project-delta/main/loader.luau"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Randeyeuhm/havoc-hub/main/loader.luau"))()
 ```
 
 Everything runs through `loadstring` — the loader fetches the matching script plus the shared modules (`uilib.luau` and `esp.luau`) and loads them straight into memory. Nothing is copied into your executor's workspace; only your config files are written there — all inside a single `havoc_hub/` folder.

@@ -1972,7 +1972,7 @@ end)
 -- we queue the hub LOADER: it maps every Driving Empire place back to this
 -- same script, which re-queues itself for the hop after that - the farm
 -- survives place hops on its own.
-local HUB_LOADER_URL = "https://raw.githubusercontent.com/Randeyeuhm/havoc-project-delta/main/loader.luau"
+local HUB_LOADER_URL = "https://raw.githubusercontent.com/Randeyeuhm/havoc-hub/main/loader.luau"
 local teleportPersist = { fn = nil, queuedAt = 0, warned = false }
 
 local function resolveTeleportQueue()

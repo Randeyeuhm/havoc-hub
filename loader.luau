@@ -7,7 +7,7 @@
     falls back to a universal script everywhere else.
 
     Usage (paste in the executor console):
-        loadstring(game:HttpGet("https://raw.githubusercontent.com/Randeyeuhm/havoc-project-delta/main/loader.luau"))()
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/Randeyeuhm/havoc-hub/main/loader.luau"))()
 
     How the pick works:
       • games/<PlaceId>.luau   - exact script for one place (games/7336302630.luau
@@ -27,7 +27,7 @@
 ]]
 
 local USER   = "Randeyeuhm"
-local REPO   = "havoc-project-delta"
+local REPO   = "havoc-hub"
 local BRANCH = "main"
 
 local GAMES_DIR      = "games/"
