@@ -42,6 +42,16 @@
                           Wallbang scales plr_penetration_multiplier - the
                           game's own projectile penetration multiplier
                           (per-surface check L334985).
+          No Bullet Drop - true zero-drop: the caster's SHARED gravity upvalue
+                          (`local u10` in module/caster/caster L322647,
+                          rewritten at every bullet creation by fire L322901
+                          / fire_server L323041, read live every frame by
+                          update_caster L323397, path call L323497) is
+                          zeroed with debug.setupvalue and re-zeroed every
+                          frame, so the g*t^2 term in the projectile path
+                          (L322684) is always 0 - bullets fly dead straight.
+                          Client-local; same risk class as the velocity
+                          slider.
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
                           (shake = (1 - arm_stamina/max) * shake_mult, L364597)
           Infinite Stam - sprint / lean / jump / vault drains -> 0
@@ -135,7 +145,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v31"
+local SCRIPT_VERSION = "dl-v35"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -163,6 +173,7 @@ local DEFAULTS = {
                            -- weight/10 + 1 cancels the weight divisor
         BulletVelocity = 15,-- muzzle velocity x15 (drop ~gone; see BALLISTICS)
         Wallbang = 1,      -- projectile penetration multiplier (x1 vanilla)
+        NoBulletDrop = false, -- zero the caster's gravity upvalue (dead straight)
         SteadyAim = false, -- arm stamina drains + breathing shake -> 0
         InfStamina = false,-- sprint / lean / jump / vault drains -> 0
         ZeroSway = false,  -- walk bob + look sway -> 0 (knob + live spring stubs)
@@ -1006,13 +1017,14 @@ end))
 -- BALLISTICS  (bullet velocity / no drop + wallbang)
 -- ============================================================
 -- Bullets are real client-simulated projectiles (caster module). The path
--- (L334935) is: pos = origin + dir * (v*t / (t*drag + 1)) + gravity*t^2,
--- with gravity = workspace.Gravity (untouchable - it drives the whole
--- game). The drop is g*t^2 in TIME though, and t = distance / velocity -
--- so a high enough muzzle velocity makes it vanish (x15: 400 studs fly in
--- ~1/60 s -> well under a stud of drop). velocity / velocity_drop live on
--- the weapon's build result (weapon.build_result.ammunition - the exact
--- table every shot reads: fire L374718, path use L335754), and
+-- (L322684) is: pos = origin + dir * (v*t / (t*drag + 1)) + gravity*t^2,
+-- where gravity is the caster's shared upvalue (set from workspace.Gravity -
+-- untouchable, it drives the whole game - but the UPVALUE itself can be
+-- zeroed: see NO BULLET DROP below). The drop is also g*t^2 in TIME, and
+-- t = distance / velocity - so a high muzzle velocity alone makes it
+-- almost vanish (x15: 400 studs fly in ~1/60 s -> under a stud of drop).
+-- velocity / velocity_drop live on the weapon's build result
+-- (weapon.build_result.ammunition - the exact table every shot reads), and
 -- velocity_drop is read per frame, so in-flight bullets flatten too.
 -- Wallbang: penetrate_bullet (L334942) compares
 --   bullet_penetration_ability * plr_penetration_multiplier
@@ -1112,6 +1124,112 @@ local function applyBallistics()
         restoreKnob("plr_penetration_multiplier")
     end
 end
+
+-- ============================================================
+-- NO BULLET DROP  (dl-v35 - zero the caster's gravity upvalue)
+-- ============================================================
+-- The drop term in the projectile path is gravity*t^2, where gravity is the
+-- caster module's SHARED UPVALUE: `local u10` in module/caster/caster
+-- (dump L322647, set from workspace.Gravity; rewritten at every bullet
+-- creation by fire L322901 / fire_server L323041; read LIVE every frame by
+-- the step loop update_caster L323397, path call L323497). All of these
+-- share ONE upvalue cell, so debug.setupvalue on it zeroes the drop for
+-- every bullet our client steps - and since each frame's position is
+-- recomputed from the origin with the CURRENT value, in-flight bullets
+-- flatten too. Fires rewrite the cell, so it is re-zeroed every frame;
+-- worst case is one frame of gravity right after a shot (~0.05 studs).
+-- Client-local; affects every projectile our client steps (explosive
+-- rounds fly straight too) - same risk class as the velocity slider.
+-- Needs debug.getupvalue/setupvalue (guarded - reports when blocked).
+local DROP_STATE = genv.__HAVOC_DEADLINE_DROP
+if type(DROP_STATE) ~= "table" then
+    DROP_STATE = {}
+    genv.__HAVOC_DEADLINE_DROP = DROP_STATE
+end
+
+local function findGravityCells()
+    local cells = {}
+    local function scan(fn)
+        if type(fn) ~= "function" then return end
+        for i = 1, 120 do
+            local name, val = debug.getupvalue(fn, i)
+            if name == nil then break end
+            if typeof(val) == "Vector3" and val.X == 0 and val.Z == 0
+                and val.Y < 0 and math.abs(val.Y + workspace.Gravity) < 0.5 then
+                table.insert(cells, { fn = fn, index = i })
+            end
+        end
+    end
+    local ok, err = pcall(function()
+        local casterMod = require(ReplicatedStorage.module.caster.caster)
+        scan(casterMod.fire)
+        scan(casterMod.fire_server)
+    end)
+    if not ok then return nil, tostring(err) end
+    if #cells == 0 then return nil, "gravity upvalue not found" end
+    return cells
+end
+
+-- Returns ok, err. Never notifies - the callers own the messaging.
+local function applyNoDrop()
+    if not Config.Weapons.NoBulletDrop then
+        if DROP_STATE.cells then
+            local g = Vector3.new(0, -workspace.Gravity, 0)
+            for _, c in ipairs(DROP_STATE.cells) do
+                pcall(debug.setupvalue, c.fn, c.index, g)
+            end
+            DROP_STATE.cells = nil
+        end
+        DROP_STATE.blocked = nil
+        return true
+    end
+    if DROP_STATE.cells then return true end
+    if DROP_STATE.blocked then return false, DROP_STATE.blocked end
+    local cells, err = findGravityCells()
+    if not cells then
+        DROP_STATE.blocked = err or "unavailable"
+        warn("[deadline] no bullet drop inactive: " .. tostring(err))
+        return false, err
+    end
+    DROP_STATE.cells = cells
+    for _, c in ipairs(cells) do
+        pcall(debug.setupvalue, c.fn, c.index, Vector3.new(0, 0, 0))
+    end
+    return true
+end
+
+-- Keep the cell at zero: every fire rewrites it, so one write per frame
+-- wins (a fire's write can only land between our writes, and is undone
+-- within one frame - the bullet gains at most ~0.05 studs of arc before
+-- the next recompute).
+local dropWarnCount = 0
+local dropRetry = 0
+track(RunService.RenderStepped:Connect(function()
+    if not Config.Weapons.NoBulletDrop then
+        dropRetry = 0
+        return
+    end
+    local cells = DROP_STATE.cells
+    if not cells then
+        dropRetry = dropRetry + 1
+        if dropRetry >= 60 then
+            dropRetry = 0
+            pcall(applyNoDrop)
+        end
+        return
+    end
+    local zero = Vector3.new(0, 0, 0)
+    for _, c in ipairs(cells) do
+        if not pcall(debug.setupvalue, c.fn, c.index, zero) then
+            DROP_STATE.cells = nil
+            if dropWarnCount < 3 then
+                dropWarnCount = dropWarnCount + 1
+                warn("[deadline] no bullet drop: stale upvalue cache, re-acquiring")
+            end
+            return
+        end
+    end
+end))
 
 -- ============================================================
 -- AUDIO: NO DEAFNESS  (death + explosion hearing loss, ringing)
@@ -2030,6 +2148,24 @@ local function buildMenu()
             applyBallistics()
             refreshStatus()
         end, 1, 1, 100, function(v) return ("%g×"):format(v) end)
+    toggle(p1, "No Bullet Drop",
+        function() return Config.Weapons.NoBulletDrop end,
+        function(v)
+            Config.Weapons.NoBulletDrop = v
+            if v then
+                DROP_STATE.cells = nil
+                DROP_STATE.blocked = nil
+            end
+            local ok = applyNoDrop()
+            if v and not ok then
+                Config.Weapons.NoBulletDrop = false
+                refreshGUI()
+                notify("No bullet drop unavailable - this executor blocks debug.getupvalue")
+            else
+                notify(v and "No bullet drop: bullets fly dead straight" or "Bullet drop restored")
+            end
+            refreshStatus()
+        end)
 
     section(p1, "Stability")
     toggle(p1, "Steady Aim",
@@ -2138,6 +2274,7 @@ local function buildMenu()
         w.ZeroWeight = false
         w.BulletVelocity = 1
         w.Wallbang = 1
+        w.NoBulletDrop = false
         m.Fullbright = false
         m.FullbrightIntensity = 190
         pcall(unstubSwaySprings)
@@ -2145,6 +2282,7 @@ local function buildMenu()
         pcall(zeroWeightRestore)
         pcall(ballisticsRestore)
         pcall(applyBallistics)
+        pcall(applyNoDrop)
         pcall(setFullbright, false)
         applyAll()
         refreshGUI()
@@ -2233,6 +2371,18 @@ task.spawn(function()
         pcall(ballisticsRestore)
     end
     pcall(applyBallistics)
+    -- no-bullet-drop reconcile: a fresh place means fresh caster closures,
+    -- so the upvalue cache is always re-acquired on boot
+    DROP_STATE.cells = nil
+    DROP_STATE.blocked = nil
+    if Config.Weapons.NoBulletDrop then
+        local dropOK = applyNoDrop()
+        if not dropOK then
+            notify("No bullet drop unavailable - this executor blocks debug.getupvalue")
+        end
+    else
+        pcall(applyNoDrop)
+    end
     pcall(setFullbright, Config.Misc.Fullbright)
     if Config.Weapons.NoDeaf then
         pcall(applyNoDeaf, true)
