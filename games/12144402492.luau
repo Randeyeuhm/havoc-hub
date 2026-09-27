@@ -1239,7 +1239,7 @@ RunService:BindToRenderStep("HavocHubDeadlineFullbright", Enum.RenderPriority.La
     if Lighting.GlobalShadows then Lighting.GlobalShadows = false end
     if Lighting.FogEnd < 100000 then Lighting.FogEnd = 100000 end
     if Lighting.FogStart < 100000 then Lighting.FogStart = 100000 end
-end))
+end)
 
 -- esp.luau loads later in this file (UI library section) - declare the
 -- handle HERE so the ESP features below close over this local instead of a
