@@ -63,6 +63,19 @@ Built against the game's decompiled source — weapon handling runs client-side 
 - Everything applies and restores live — no hooks, no remotes, nothing sent to the server; lowered values re-assert themselves
 - The whole Deadline universe (lobby + match places) loads this one script via the loader's universe map
 
+### Oaklands — `games/9938675423.luau` (PlaceId 9938675423, GameId 3666294218)
+
+Built from the game's decompiled source — everything gameplay-side flows through the game's own buffer networking, so this one sticks to the safe levers:
+
+- **Tree ESP** — every choppable tree (`World.TreeRegions` — the `Choppable` + `AltName` attributes the axe code itself reads) gets a species + distance label, optional highlight, and a species filter built live from the game's own `INFO` registry (keep the rares, hide the junk)
+- **Loose Item ESP** — everything under the game's own `Item` tag, with name + distance
+- **Enemy ESP** and **Player ESP** — name + distance labels (players resolved from the username-named characters in the workspace)
+- **Auto Chop** — swings your equipped axe at the nearest in-range tree through the game's own signals (`Backpack:InformServer` "SwingStartAttempt" → "AttemptChop" with the hit part), honouring the tool's live `MaxSwingTime` / `MaxSwingDistance` and the `INFO` power requirements; the server still validates every swing like a player's, and the timing carries jitter so it stays human-looking
+- **Infinite Stamina** — refills to your baseline the instant it drains, deliberately never above baseline+50 (the exact threshold of the game's own self-reporting stamina watch)
+- **Movement (experimental)** — infinite jump, walk speed, jump power, sprint boost (the game's own `SpeedMultiplier` attribute); movement is client-side but server checks are untested — keep it subtle or use an alt
+- **Fullbright, teleports** to every store and **anti-AFK**
+- All game-side calls go through plain Luau closures only (the game's anticheat self-reports `"[C]"` callers — this never trips it), and the script is re-run safe like the rest of the hub
+
 ### Universal — `games/universal.luau` (any other game)
 
 Generic toolkit for games without a dedicated script:
@@ -86,6 +99,7 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
 | `games/3351674303.luau` | Driving Empire (vehicle performance, teleports, speedometer HUD) |
 | `games/8343259840.luau` | Criminality (recoil & spread toolkit) |
 | `games/12144402492.luau` | Deadline (weapon mods, reload speed, aimbot, ESP) |
+| `games/9938675423.luau` | Oaklands (tree / item / enemy / player ESP, auto chop, stamina, movement) |
 | `games/universal.luau` | Universal aimbot / ESP / utilities fallback |
 | `uilib.luau` | Shared UI toolkit — Project Delta-style window shell (dot header, drawn-X close, searchable left-rail tabs, footer), widgets, toasts, rebind capture, popup management |
 | `esp.luau` | One-file ESP library — Project Delta based engine (corner box, name/health/distance, highlights) + two-window customizer (preview + settings) used by every script |
