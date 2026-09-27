@@ -82,11 +82,15 @@
                           Enabled=false (live + RS templates) and the
                           tinnitus ringing group muted (explosion_deaf_effect
                           L201192-205, lobby_deaf_effect L131807)
-      • Misc tab (menu organisation) - movement / lighting / audio / reset:
+      • Misc tab (menu organisation) - movement / lighting / audio / reset
+        + the anticheat honeypot test:
           Movement = Zero Weight + Infinite Stamina; Lighting = Fullbright
           (toggle + Intensity slider 0-255 ambient grey, shadows off, fog
           gone, re-checked every frame so weather can't dim it again);
-          Audio = No Deafness; Reset = the global Restore vanilla.
+          Audio = No Deafness; Reset = the global Restore vanilla. The trap
+          test button calls caster.fire UNMASKED on purpose - the game's
+          getenv honeypot then prints its taunt and busy-loops a thread
+          until you rejoin (double-click confirm; test only).
       • Aimbot / ESP - built around the match rigs: characters live in
           Workspace.characters as <UserId>-named models (custom rig: head /
           humanoid_root_part / torso_hitbox / *_vis - no Humanoid). The game
@@ -154,7 +158,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v35b"
+local SCRIPT_VERSION = "dl-v35c"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -2356,6 +2360,44 @@ local function buildMenu()
             pcall(applyNoDeaf, v)
             notify(v and "Deafness and ringing disabled" or "Deafness restored")
         end)
+
+    section(pm, "Anticheat Trap (test)")
+    note(pm, "Fires the caster's honeypot for real: prints its taunt + busy-loops a thread until rejoin. Test only.")
+    button(pm, "Trigger caster.fire trap", function()
+        local orig = nil
+        if type(DROP_STATE.originals) == "table" then
+            orig = DROP_STATE.originals.fire
+        end
+        if type(orig) ~= "function" then
+            local mod = findCasterModule()
+            orig = mod and rawget(mod, "fire") or nil
+        end
+        if type(orig) ~= "function" then
+            notify("caster.fire is not loaded yet - try again shortly")
+            return
+        end
+        notify("Triggering the trap - if it fires, rejoin to recover")
+        task.spawn(function()
+            -- UNMASKED on purpose: the honeypot walks getfenv(1..10) hunting
+            -- for an env table with `rconsoleprint` - this thread's executor
+            -- env on the stack is exactly what it looks for. a4 = {} makes a
+            -- miss (no trap) exit cleanly before any bullet gets created.
+            local ok, err = pcall(orig, nil, nil, nil, {})
+            if ok then
+                -- miss: fire rewrote its gravity upvalue - re-zero it for
+                -- No Bullet Drop (scope workspace.Gravity like the wrappers)
+                if Config.Weapons.NoBulletDrop and workspace.Gravity ~= 0 then
+                    local g = workspace.Gravity
+                    workspace.Gravity = 0
+                    pcall(orig, nil, nil, nil, {})
+                    workspace.Gravity = g
+                end
+                notify("Trap did not fire - caster.fire returned (no rconsoleprint on the stack)")
+            else
+                notify("Trap did not fire - caster.fire exited: " .. tostring(err))
+            end
+        end)
+    end, { confirm = true, confirmText = "Click again to fire the trap", danger = true })
 
     section(pm, "Reset")
     button(pm, "Restore vanilla", function()
