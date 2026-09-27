@@ -135,7 +135,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v29"
+local SCRIPT_VERSION = "dl-v30"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -159,7 +159,7 @@ local DEFAULTS = {
         ErgoSpeed = 1,     -- plr_ergonomics_multiplier             (x vanilla)
         ReloadSpeed = 2,   -- reload anim speed (x vanilla; live track time
                            -- injection - see FAST RELOAD section)
-        BulletVelocity = 15,-- muzzle velocity x15 (drop ~gone; see BALLISTICS)
+        BulletVelocity = 1, -- muzzle velocity multiplier (x1 vanilla; see BALLISTICS)
         Wallbang = 1,      -- projectile penetration multiplier (x1 vanilla)
         SteadyAim = false, -- arm stamina drains + breathing shake -> 0
         InfStamina = false,-- sprint / lean / jump / vault drains -> 0
@@ -245,8 +245,10 @@ Config.Weapons.ReloadSpeed = math.clamp(tonumber(Config.Weapons.ReloadSpeed) or 
 
 -- Ballistics: Bullet Velocity multiplies the muzzle velocity written on the
 -- weapon build (see BALLISTICS section); Wallbang scales the game's live
--- projectile penetration multiplier.
-Config.Weapons.BulletVelocity = math.clamp(tonumber(Config.Weapons.BulletVelocity) or 15, 1, 50)
+-- projectile penetration multiplier. Both now DEFAULT TO VANILLA - fast
+-- bullets are unverified against the server's hit validation and got
+-- accounts banned, so they are opt-in only (throwaway-tier).
+Config.Weapons.BulletVelocity = math.clamp(tonumber(Config.Weapons.BulletVelocity) or 1, 1, 50)
 Config.Weapons.Wallbang = math.clamp(tonumber(Config.Weapons.Wallbang) or 1, 1, 100)
 
 -- Fullbright intensity: ambient grey level (matches the sibling scripts).
