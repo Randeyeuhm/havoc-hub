@@ -19,6 +19,14 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Randeyeuhm/havoc-hub/
 
 Everything runs through `loadstring` — the loader fetches the matching script plus the shared modules (`uilib.luau` and `esp.luau`) and loads them straight into memory. Nothing is copied into your executor's workspace; only your config files are written there — all inside a single `havoc_hub/` folder.
 
+### Structure dumper
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Randeyeuhm/havoc-hub/main/dumper-loader.luau"))()
+```
+
+Run it in any game to fetch and execute the latest `StructureDumper.Luau` in one paste — the dump lands in your executor's workspace as `havoc_structure.txt`.
+
 ## Games
 
 ### Project Delta — `games/7336302630.luau` (PlaceId 7336302630)
@@ -82,6 +90,7 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
 | `uilib.luau` | Shared UI toolkit — Project Delta-style window shell (dot header, drawn-X close, searchable left-rail tabs, footer), widgets, toasts, rebind capture, popup management |
 | `esp.luau` | One-file ESP library — Project Delta based engine (corner box, name/health/distance, highlights) + two-window customizer (preview + settings) used by every script |
 | `StructureDumper.Luau` | Dev tool — dumps a game's structure for keeping detection logic up to date |
+| `dumper-loader.luau` | Structure dumper loader — fetches + runs `StructureDumper.Luau` in one loadstring paste |
 | `Libraries_Im_Using.txt` | Reference list of the executor APIs this project relies on |
 
 ## Configuration

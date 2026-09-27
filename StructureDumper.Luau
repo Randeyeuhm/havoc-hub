@@ -19,7 +19,9 @@
     v10: Oaklands — same treatment for the vLuau VM (/ReplicatedStorage/
     Dependencies/vLuau/Ception, the dump died at "[script 767]"); path
     matching is case-insensitive now so folder casing can't dodge the list.
-    Potassium-friendly.
+    Potassium-friendly. Or run this file via the repo's dumper-loader.luau
+    (one paste that fetches + executes it):
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/Randeyeuhm/havoc-hub/main/dumper-loader.luau"))()
 ]]
 
 if setstackhidden then pcall(setstackhidden, true) end
