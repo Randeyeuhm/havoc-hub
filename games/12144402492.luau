@@ -136,7 +136,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v24"
+local SCRIPT_VERSION = "dl-v25"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -2118,7 +2118,13 @@ local function buildMenu()
         function() return Config.Misc.SpeedMult end,
         function(v)
             Config.Misc.SpeedMult = v
-            if v > 1 then pcall(movementDiag, "speed") end
+            if v > 1 then
+                -- the per-frame override only writes to CACHED controllers -
+                -- make the cache hot right away instead of waiting for the
+                -- 30s heartbeat tick
+                queueControllerCache()
+                pcall(movementDiag, "speed")
+            end
             refreshStatus()
         end, 0.25, 1, 5, function(v) return ("%g×"):format(v) end)
     toggle(pm, "Infinite Stamina",
