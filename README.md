@@ -6,7 +6,7 @@ A multi-game script suite for Roblox, built for the [Potassium](https://docs.pot
 
 `loader.luau` checks `game.PlaceId` when you execute it:
 
-1. **`games/<PlaceId>.luau`** — if the repo has a script for the current game, that one loads (e.g. `games/7336302630.luau` is the Havoc Project Delta suite).
+1. **`games/<PlaceId>.luau`** — if the repo has a script for the current game, that one loads (e.g. `games/7336302630.luau` is the Project Delta suite).
 2. **`games/universal.luau`** — otherwise the universal script loads: generic aimbot, ESP and utilities that work across most games.
 
 Adding support for a new game is just dropping a `<PlaceId>.luau` file into `games/` — no loader changes needed.
@@ -21,7 +21,7 @@ Everything runs through `loadstring` — the loader fetches the matching script 
 
 ## Games
 
-### Havoc — `games/7336302630.luau` (PlaceId 7336302630)
+### Project Delta — `games/7336302630.luau` (PlaceId 7336302630)
 
 The original suite:
 
@@ -74,7 +74,7 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
 | File | Purpose |
 | --- | --- |
 | `loader.luau` | Hub loader — picks by PlaceId, fetches modules, runs everything via loadstring |
-| `games/7336302630.luau` | Havoc Project Delta (game-specific suite) |
+| `games/7336302630.luau` | Project Delta (game-specific suite) |
 | `games/3351674303.luau` | Driving Empire (vehicle performance, teleports, speedometer HUD) |
 | `games/8343259840.luau` | Criminality (recoil & spread toolkit) |
 | `games/12144402492.luau` | Deadline (weapon mods, reload speed, aimbot, ESP) |
@@ -87,7 +87,7 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
 ## Configuration
 
 - All persistent files live in one `havoc_hub/` folder (created automatically) instead of loose files cluttering the executor workspace root:
-  - `havoc_hub/havoc_delta_config.json` — Havoc Project Delta
+  - `havoc_hub/project_delta_config.json` — Project Delta
   - `havoc_hub/driving_empire_config.json` — Driving Empire (plus its race/ATM/requeue support files)
   - `havoc_hub/universal_hub_config.json` — the universal script
   - `havoc_hub/criminality_hub_config.json` — Criminality

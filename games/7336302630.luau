@@ -1,6 +1,6 @@
 --[[
     ============================================
-    HAVOC PROJECT DELTA
+    HAVOC HUB - PROJECT DELTA  (games/7336302630.luau)
     ============================================
 ]]
 
@@ -31,19 +31,27 @@ local LocalPlayer       = Players.LocalPlayer
 -- every persistent file lives in one folder instead of loose files in the
 -- executor workspace root (created if missing)
 local CONFIG_DIR          = "havoc_hub"
-local CONFIG_FILE         = CONFIG_DIR .. "/havoc_delta_config.json"
-local LEGACY_CONFIG_FILE  = "havoc_delta_config.json"
+local CONFIG_FILE         = CONFIG_DIR .. "/project_delta_config.json"
+-- older names this config may live under: the original loose file, then the
+-- same file inside the folder under the old "havoc_delta" name
+local LEGACY_CONFIG_FILES = { "havoc_delta_config.json", CONFIG_DIR .. "/havoc_delta_config.json" }
 pcall(function()
     if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(CONFIG_DIR) then
         makefolder(CONFIG_DIR)
     end
 end)
--- one-time move of the old loose config into the folder
+-- one-time move of an older config (loose, or the pre-rename name) to the
+-- current name
 pcall(function()
     if type(isfile) == "function" and type(readfile) == "function" and type(writefile) == "function"
-        and not isfile(CONFIG_FILE) and isfile(LEGACY_CONFIG_FILE) then
-        writefile(CONFIG_FILE, readfile(LEGACY_CONFIG_FILE))
-        if type(delfile) == "function" then pcall(delfile, LEGACY_CONFIG_FILE) end
+        and not isfile(CONFIG_FILE) then
+        for _, legacy in ipairs(LEGACY_CONFIG_FILES) do
+            if isfile(legacy) then
+                writefile(CONFIG_FILE, readfile(legacy))
+                if type(delfile) == "function" then pcall(delfile, legacy) end
+                break
+            end
+        end
     end
 end)
 local DEFAULT_WALKSPEED   = 14
@@ -95,9 +103,9 @@ do
     end)
     if ok and type(res) == "table" then
         UILib = res
-        print("[Havoc] uilib " .. tostring(UILib.VERSION or "?") .. " loaded")
+        print("[Havoc Hub] uilib " .. tostring(UILib.VERSION or "?") .. " loaded")
     else
-        warn("[Havoc] uilib.luau not loaded (" .. tostring(res) .. ") - settings menu will be skipped")
+        warn("[Havoc Hub] uilib.luau not loaded (" .. tostring(res) .. ") - settings menu will be skipped")
     end
 end
 
@@ -114,9 +122,9 @@ do
     end)
     if ok and type(res) == "table" then
         ESPUI = res
-        print("[Havoc] esp " .. tostring(ESPUI.VERSION or "?") .. " loaded")
+        print("[Havoc Hub] esp " .. tostring(ESPUI.VERSION or "?") .. " loaded")
     else
-        warn("[Havoc] esp.luau not loaded (" .. tostring(res) .. ") - ESP disabled")
+        warn("[Havoc Hub] esp.luau not loaded (" .. tostring(res) .. ") - ESP disabled")
     end
 end
 
@@ -663,7 +671,7 @@ do
             end
             toaster(text)
         else
-            print("[Havoc]", tostring(text))
+            print("[Havoc Hub]", tostring(text))
         end
     end
 end
@@ -1151,7 +1159,7 @@ do
             local payload = serializeValue(Config)
             writefile(CONFIG_FILE, HttpService:JSONEncode(payload))
         end)
-        if not ok then warn("[Havoc] Failed to save config") end
+        if not ok then warn("[Havoc Hub] Failed to save config") end
     end
 
     function saveConfigDebounced()
@@ -1314,7 +1322,7 @@ function rebuildKeyMap()
         -- always be brought back.
         if entry.Enabled ~= false or entry.Id == "ToggleGUI" then
             if keyMap[entry.Key] then
-                warn(("[Havoc] Duplicate keybind on %s: %s"):format(entry.Key.Name, entry.Desc))
+                warn(("[Havoc Hub] Duplicate keybind on %s: %s"):format(entry.Key.Name, entry.Desc))
             end
             keyMap[entry.Key] = entry
         end
@@ -2964,18 +2972,18 @@ local model, hum = resolveLiveHitTarget(hitPart)
         if bulletReplace.installed then return true end
         local ok, BulletModule = pcall(require, game.ReplicatedStorage.Modules.FPS.Bullet)
         if not ok or type(BulletModule) ~= "table" then
-            warn("[Havoc] Bullet replacement: module not found")
+            warn("[Havoc Hub] Bullet replacement: module not found")
             return false
         end
         if type(BulletModule.CreateBullet) ~= "function" then
-            warn("[Havoc] Bullet replacement: CreateBullet not a function")
+            warn("[Havoc Hub] Bullet replacement: CreateBullet not a function")
             return false
         end
         bulletReplace.origCreateBullet = BulletModule.CreateBullet
         BulletModule.CreateBullet = ourCreateBullet
         bulletReplace.installed = true
         bulletState.printCount = 0
-        print("[Havoc] Bullet replacement installed (unlimited penetration)")
+        print("[Havoc Hub] Bullet replacement installed (unlimited penetration)")
         return true
     end
 
@@ -2992,7 +3000,7 @@ local model, hum = resolveLiveHitTarget(hitPart)
         end
         bulletReplace.activeBullets = {}
         bulletReplace.installed = false
-        print("[Havoc] Bullet replacement removed")
+        print("[Havoc Hub] Bullet replacement removed")
     end
 
     state.bulletReplace = bulletReplace
@@ -3065,7 +3073,7 @@ do
     function installRayAssist()
         if rayAssist.installed then return true end
         if not hookmetamethod or not getnamecallmethod or not getrawmetatable then
-            warn("[Havoc] Ray assist: missing hook primitives")
+            warn("[Havoc Hub] Ray assist: missing hook primitives")
             return false
         end
 
@@ -3112,13 +3120,13 @@ do
             if setreadonly then pcall(setreadonly, mt, true) end
         end)
         if not ok then
-            warn("[Havoc] Ray assist install failed: " .. tostring(err))
+            warn("[Havoc Hub] Ray assist install failed: " .. tostring(err))
             return false
         end
 
         rayAssist.origNamecall = oldNamecall
         rayAssist.installed = true
-        print("[Havoc] Ray assist installed")
+        print("[Havoc Hub] Ray assist installed")
         return true
     end
 
@@ -3133,7 +3141,7 @@ do
             end
         end)
         rayAssist.installed = false
-        print("[Havoc] Ray assist removed")
+        print("[Havoc Hub] Ray assist removed")
     end
 end
 
@@ -3164,7 +3172,7 @@ do
         if installBulletReplacement() then
             ihState.installed = true
             applyNoSpread(true)
-            print(string.format("[Havoc] Instant Hit installed (replacement) | vel=%.0e | hintV=%s",
+            print(string.format("[Havoc Hub] Instant Hit installed (replacement) | vel=%.0e | hintV=%s",
                 Config.Weapon.InstantHitVelocity or IH_DEFAULT_VELOCITY,
                 (Config.Weapon.ServerVelocityHint or 0) > 0
                     and tostring(Config.Weapon.ServerVelocityHint) or "adaptive"))
@@ -3172,7 +3180,7 @@ do
         end
 
         if not debug or not debug.getupvalue or not debug.setupvalue then
-            warn("[Havoc] Executor missing debug.getupvalue/setupvalue")
+            warn("[Havoc Hub] Executor missing debug.getupvalue/setupvalue")
             return false
         end
 
@@ -3201,7 +3209,7 @@ do
             end
         end
         if not fireSlot or not projSlot then
-            warn("[Havoc] Could not locate remote upvalue slots")
+            warn("[Havoc Hub] Could not locate remote upvalue slots")
             return false
         end
 
@@ -3251,11 +3259,11 @@ do
         local ok1 = setUpvalue(createFn, fireSlot, fireProxy)
         local ok2 = setUpvalue(createFn, projSlot, inflictProxy)
         if not ok1 or not ok2 then
-            warn("[Havoc] setupvalue failed")
+            warn("[Havoc Hub] setupvalue failed")
             return false
         end
         if getUpvalue(createFn, fireSlot) ~= fireProxy or getUpvalue(createFn, projSlot) ~= inflictProxy then
-            warn("[Havoc] setupvalue verification failed")
+            warn("[Havoc Hub] setupvalue verification failed")
             setUpvalue(createFn, fireSlot, realFire)
             setUpvalue(createFn, projSlot, realInflict)
             return false
@@ -3293,7 +3301,7 @@ do
         ihState.installed = true
         bulletState.printCount = 0
         applyNoSpread(true)
-        print(string.format("[Havoc] Instant Hit installed (upvalue proxy) | vel=%.0e | hintV=%s",
+        print(string.format("[Havoc Hub] Instant Hit installed (upvalue proxy) | vel=%.0e | hintV=%s",
             Config.Weapon.InstantHitVelocity or IH_DEFAULT_VELOCITY,
             (Config.Weapon.ServerVelocityHint or 0) > 0
                 and tostring(Config.Weapon.ServerVelocityHint) or "adaptive"))
@@ -3328,7 +3336,7 @@ do
         bulletState.assisted = {}
         bulletState.activeId = nil
         ihState.installed = false
-        print("[Havoc] Instant Hit removed")
+        print("[Havoc Hub] Instant Hit removed")
     end
 
     function applyInstantHit(enabled)
@@ -4903,7 +4911,7 @@ do
                 rebuildKeyMap()
                 saveConfig()
                 if refreshGUI then pcall(refreshGUI) end
-                print(("[Havoc] Rebound '%s' to %s"):format(entry.Desc, entry.Key.Name))
+                print(("[Havoc Hub] Rebound '%s' to %s"):format(entry.Desc, entry.Key.Name))
             end,
         }
         track(UILib.attachInput())
@@ -4958,7 +4966,7 @@ do
         local win = UILib.makeWindow({
             parent = gui,
             name = "HavocMain",
-            title = "HAVOC  ·  v9.9.29",
+            title = "HAVOC HUB  ·  PROJECT DELTA",
             size = UDim2.new(0, winW, 0, winH),
             tabs = tabNames,
             subtabs = subtabMap,
@@ -5657,7 +5665,7 @@ do
     if UILib then
         buildGUI()
     else
-        warn("[Havoc] Settings menu skipped - uilib.luau was not loaded")
+        warn("[Havoc Hub] Settings menu skipped - uilib.luau was not loaded")
     end
 end
 
@@ -5706,7 +5714,7 @@ track(UserInputService.InputBegan:Connect(function(input, processed)
     if not Config.Misc.KeybindsEnabled and entry.Id ~= "ToggleGUI" then return end
     local ok, label, value = pcall(entry.Action)
     if not ok then
-        warn(("[Havoc] Hotkey '%s' errored: %s"):format(entry.Desc, tostring(label)))
+        warn(("[Havoc Hub] Hotkey '%s' errored: %s"):format(entry.Desc, tostring(label)))
     end
 end))
 
@@ -5820,7 +5828,7 @@ pcall(function()
     track(TS.TeleportInitFailed:Connect(cleanupAll))
 end)
 
-print("===== HAVOC SCRIPT LOADED =====")
+print(("[Havoc Hub] Project Delta script loaded (PlaceId %d)"):format(game.PlaceId))
 for _, entry in ipairs(Hotkeys) do
     print(("[%s] %s"):format(entry.Key.Name, entry.Desc))
 end

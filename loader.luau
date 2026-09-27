@@ -11,7 +11,7 @@
 
     How the pick works:
       • games/<PlaceId>.luau   - exact script for one place (games/7336302630.luau
-                                 is Havoc Project Delta)
+                                 is the Project Delta suite)
       • UNIVERSES[game.GameId] - sub places (different PlaceId, same GameId)
                                  use the mapped main script, so the whole game
                                  incl. its sub places runs the same script
@@ -39,7 +39,7 @@ local ESP_FILE       = "esp.luau"
 -- game's GameId (game.GameId) to the main place whose games/<id>.luau
 -- should run in EVERY place of that universe (main + sub places):
 local UNIVERSES = {
-    [2862098693] = 7336302630,  -- Havoc Project Delta (all of its places)
+    [2862098693] = 7336302630,  -- Project Delta (all of its places)
     [1202096104] = 3351674303,  -- Driving Empire (all of its places)
     [1494262959] = 8343259840,  -- Criminality (all of its places)
     [4283416256] = 12144402492, -- Deadline (lobby + its match places)
@@ -51,7 +51,7 @@ local function log(...)
     print("[Havoc Hub]", ...)
 end
 
--- URL-encode spaces so "Havoc Project delta.luau" resolves on raw.github.
+-- URL-encode spaces in file names so raw.github resolves them.
 local function encode(path)
     return (path:gsub(" ", "%%20"))
 end

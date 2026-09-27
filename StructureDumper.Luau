@@ -225,7 +225,7 @@ local function flushDump()
 
     local parts = {
         string.rep("=", 66) .. "\n",
-        "HAVOC STRUCTURE DUMP v9 — single file\n",
+        "HAVOC HUB STRUCTURE DUMP v9 — single file\n",
         ("Generated: %s\n"):format(os.date("%Y-%m-%d %H:%M:%S")),
         ("Payload:   %.1f KB across %d sections\n"):format(total / 1024, #sections),
         string.rep("=", 66) .. "\n\n",
