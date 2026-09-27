@@ -53,6 +53,12 @@
                           Vector3(0,0,0) - the g*t^2 term in the projectile
                           path becomes exactly 0 for every bullet, in-flight
                           ones included. No debug library needed.
+                          The wrappers are environment-masked (setfenv) so
+                          caster.fire's getfenv anti-exploit tripwire can't
+                          see the executor env, and while on they cap the
+                          ammo's raycast_range - straight bullets never hit
+                          the ground, and uncapped misses ride the 30s
+                          timeout (the sim cost tanks FPS).
                           Client-local; same risk class as the velocity
                           slider.
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
@@ -148,7 +154,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v35a"
+local SCRIPT_VERSION = "dl-v35b"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1129,7 +1135,7 @@ local function applyBallistics()
 end
 
 -- ============================================================
--- NO BULLET DROP  (dl-v35a - scope-wrap the caster's fire calls)
+-- NO BULLET DROP  (dl-v35b - scope-wrap the caster's fire calls)
 -- ============================================================
 -- The drop term in the projectile path is gravity*t^2, where gravity is the
 -- caster module's SHARED UPVALUE (`local u10` in module/caster/caster,
@@ -1149,6 +1155,16 @@ end
 -- so the zero-gravity window is one pure call: nothing else can see it.
 -- Client-local; affects every projectile our client steps (explosive
 -- rounds fly straight too) - same risk class as the velocity slider.
+-- TRIPWIRE: caster.fire's first line is getenv() - it walks getfenv(1..10)
+-- hunting for an env table with `rconsoleprint` (executor fingerprint) and
+-- then prints "kill yourself" and busy-loops forever (a pegged parallel
+-- worker per shot = the FPS collapse). The wrappers are setfenv'd to the
+-- GAME function's env; if that is impossible we refuse to arm. The same
+-- trap exists in NetworkEncode (x5) and module/util/lua/util (x3) - never
+-- wrap those either.
+-- PERF: straight bullets never hit the ground, so misses would ride the
+-- full 30s timeout and pile up in the sim. While armed the ammo's
+-- raycast_range is capped at DROP_RANGE_CAP (restored on disarm).
 local DROP_STATE = genv.__HAVOC_DEADLINE_DROP
 if type(DROP_STATE) ~= "table" then
     DROP_STATE = {}
@@ -1161,6 +1177,10 @@ if type(DROP_STATE.originals) ~= "table" then
 end
 
 local DROP_KEYS = { "fire", "fire_server" }
+local DROP_RANGE_CAP = 1800
+if type(DROP_STATE.range_saved) ~= "table" then
+    DROP_STATE.range_saved = setmetatable({}, { __mode = "k" })
+end
 
 local function findCasterModule()
     local ok, mod = pcall(function()
@@ -1184,6 +1204,61 @@ local function clearDropWrappers()
     end
     DROP_STATE.originals = {}
     DROP_STATE.mod = nil
+    -- restore any raycast_range caps from this arming
+    local saved = DROP_STATE.range_saved
+    if type(saved) == "table" then
+        for tbl, entry in pairs(saved) do
+            if type(tbl) == "table" and type(entry) == "table" then
+                pcall(function()
+                    if entry.v == nil then
+                        tbl.raycast_range = nil
+                    else
+                        tbl.raycast_range = entry.v
+                    end
+                end)
+            end
+        end
+        DROP_STATE.range_saved = setmetatable({}, { __mode = "k" })
+    end
+end
+
+-- Wrapper factory: globals are captured as upvalues so the masked (game)
+-- environment cannot affect how the wrapper itself operates.
+local function makeDropWrapper(orig)
+    local fselect, ftype, frawget, ftonumber, fpcall, ferror = select, type, rawget, tonumber, pcall, error
+    local fpack, funpack = table.pack, table.unpack
+    local fws = workspace
+    local function wrapper(...)
+        if not Config.Weapons.NoBulletDrop then
+            return orig(...)
+        end
+        -- perf: cap the flight distance while bullets fly straight (the
+        -- game kills bullets past raycast_range, dump L335477)
+        local opts = fselect(4, ...)
+        local props = ftype(opts) == "table" and frawget(opts, "properties") or nil
+        if ftype(props) == "table" then
+            local rr = ftonumber(frawget(props, "raycast_range"))
+            if rr == nil or rr > DROP_RANGE_CAP then
+                local saved = DROP_STATE.range_saved
+                if saved[props] == nil then
+                    saved[props] = { v = frawget(props, "raycast_range") }
+                end
+                props.raycast_range = DROP_RANGE_CAP
+            end
+        end
+        local g = fws.Gravity
+        if g == 0 then
+            return orig(...)
+        end
+        fws.Gravity = 0
+        local results = fpack(fpcall(orig, ...))
+        fws.Gravity = g
+        if not results[1] then
+            ferror(results[2], 0)
+        end
+        return funpack(results, 2, results.n)
+    end
+    return wrapper
 end
 
 -- Returns ok, err. Never notifies - the callers own the messaging.
@@ -1203,23 +1278,28 @@ local function applyNoDrop()
     for _, key in ipairs(DROP_KEYS) do
         local orig = rawget(mod, key)
         if type(orig) == "function" then
-            originals[key] = orig
-            mod[key] = function(...)
-                if not Config.Weapons.NoBulletDrop then
-                    return orig(...)
-                end
-                local g = workspace.Gravity
-                if g == 0 then
-                    return orig(...)
-                end
-                workspace.Gravity = 0
-                local results = table.pack(pcall(orig, ...))
-                workspace.Gravity = g
-                if not results[1] then
-                    error(results[2], 0)
-                end
-                return table.unpack(results, 2, results.n)
+            local wrapper = makeDropWrapper(orig)
+            -- caster.fire's first line is getenv() - it walks
+            -- getfenv(1..10) hunting for `rconsoleprint` (executor env
+            -- fingerprint) and then prints "kill yourself" and busy-loops
+            -- forever (one pegged parallel worker per shot). Run the
+            -- wrapper in the GAME function's own environment so the walk
+            -- sees nothing; refuse to arm if masking is impossible.
+            local masked = false
+            if type(setfenv) == "function" and type(getfenv) == "function" then
+                masked = pcall(function()
+                    setfenv(wrapper, getfenv(orig))
+                end)
             end
+            if not masked then
+                for k2, o2 in pairs(originals) do
+                    pcall(function() mod[k2] = o2 end)
+                end
+                DROP_STATE.blocked = "cannot mask wrapper environment (setfenv)"
+                return false, DROP_STATE.blocked
+            end
+            originals[key] = orig
+            mod[key] = wrapper
             wrapped = wrapped + 1
         end
     end
