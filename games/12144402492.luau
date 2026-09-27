@@ -63,6 +63,22 @@
                           Enabled=false (live + RS templates) and the
                           tinnitus ringing group muted (explosion_deaf_effect
                           L201192-205, lobby_deaf_effect L131807)
+          Gun Customizer - the editor's own hidden dev switches (dump
+                          shared_state): Mount Anything = editor_mount_anything
+                          (class separation off), Skip Compatibility =
+                          editor_compatibility_checks=false
+                          (check_compatibility die()/set_rail_state no-ops -
+                          builds are never flagged "broken", incl. the match
+                          build_viewmodel error gate L361923), Unclamped Stats
+                          = plr_weapon_clamp_stats_values=false (stat ->
+                          property mapping extrapolates, count_stats L347338).
+                          The mod also auto-captures every editor build
+                          (ItemBuild.new GET_STATE wrap - the map arg IS
+                          build_result.map_save) into the config; in matches
+                          "Force Captured Build" swaps the server-sent setup
+                          for the captured one at the first-person
+                          ItemBuild.new (3rd-person model keeps the legal
+                          setup - client-side only).
       • Misc tab (menu organisation) - movement / lighting / audio / reset:
           Movement = Zero Weight + Infinite Stamina; Lighting = Fullbright
           (toggle + Intensity slider 0-255 ambient grey, shadows off, fog
@@ -135,7 +151,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v31"
+local SCRIPT_VERSION = "dl-v32"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -182,6 +198,16 @@ local DEFAULTS = {
     Misc = {
         Fullbright = false,
         FullbrightIntensity = 190, -- ambient grey 0-255 while fullbright is on
+    },
+    -- dl-v32: the weapon editor's own hidden dev switches (shared_state
+    -- debug knobs the game reads live) + auto-captured editor builds.
+    Customizer = {
+        MountAnything = false,  -- editor_mount_anything: any attachment in any slot
+        SkipCompat = false,     -- editor_compatibility_checks=false: never "broken"
+        UnclampedStats = false, -- plr_weapon_clamp_stats_values=false: stats extrapolate
+        ForceCaptured = false,  -- matches: build the fps gun from the captured setup
+        Captures = {},          -- [weapon_code] = setup string (auto-captured in editor)
+        CaptureOrder = {},      -- eviction order for Captures (most recent last)
     },
 }
 
@@ -820,6 +846,155 @@ track(RunService.RenderStepped:Connect(function()
     end
 end))
 
+-- ============================================================
+-- GUN CUSTOMIZER  (dl-v32 - the weapon editor's own dev switches)
+-- ============================================================
+-- From the lobby dump: the editor build pipeline (ItemBuild +
+-- check_compatibility) is plain client-side ReplicatedStorage code and reads
+-- three shared_state knobs live every build:
+--   editor_mount_anything         - class separation off: any attachment
+--                                   mounts in any slot ("very scuffed guns")
+--   editor_compatibility_checks   - when false, die()/set_rail_state() are
+--                                   no-ops: nothing ever marks a build
+--                                   "broken" (that flag gates the save flow
+--                                   AND the match build - WeaponItem
+--                                   build_viewmodel error()s on broken,
+--                                   dump L361923)
+--   plr_weapon_clamp_stats_values - when false, the stat->property mapping
+--                                   (count_stats, dump L347338) extrapolates
+--                                   past min/max instead of clamping
+-- All three are client-local SharedValue writes - never replicated.
+--
+-- The save flow uploads the encoded setup through the checkout RPC
+-- (call_checkout_setups); if the server re-validates it, the save is
+-- refused client-side with "SAVE FAILED". For that case this block also
+-- auto-captures every editor build - the ItemBuild map ARG is the same
+-- object the save path encodes (build_result.map_save = the map arg) - into
+-- the config, and in a MATCH "Force Captured Build" swaps the server-sent
+-- setup for the captured one at the first-person ItemBuild.new. The
+-- third-person model keeps the legal setup: the swap is client-side only.
+local IS_LOBBY = game.PlaceId == 12144402492
+local CUSTOMIZER = genv.__HAVOC_DEADLINE_CUSTOM
+if type(CUSTOMIZER) ~= "table" then
+    CUSTOMIZER = { last_weapon = nil, last_string = nil }
+    genv.__HAVOC_DEADLINE_CUSTOM = CUSTOMIZER
+end
+
+local function applyCustomizer()
+    if not RESOURCES_OK then return end
+    local c = Config.Customizer
+    if not c then return end
+    if SHARED_STATE.editor_mount_anything then
+        SHARED_STATE.editor_mount_anything.value = c.MountAnything == true
+    end
+    if SHARED_STATE.editor_compatibility_checks then
+        SHARED_STATE.editor_compatibility_checks.value = not (c.SkipCompat == true)
+    end
+    if SHARED_STATE.plr_weapon_clamp_stats_values then
+        SHARED_STATE.plr_weapon_clamp_stats_values.value = not (c.UnclampedStats == true)
+    end
+end
+
+local function deepCopyPlain(v, seen, depth)
+    if type(v) ~= "table" then return v end
+    depth = (depth or 0) + 1
+    if depth > 24 then return nil end
+    seen = seen or {}
+    if seen[v] ~= nil then return seen[v] end
+    local out = {}
+    seen[v] = out
+    for k, val in pairs(v) do
+        local ck = deepCopyPlain(k, seen, depth)
+        local cv = deepCopyPlain(val, seen, depth)
+        if ck ~= nil and cv ~= nil then
+            out[ck] = cv
+        end
+    end
+    return out
+end
+
+-- Capture = encode a COPY of the map container (encode() normalizes its
+-- input, so never hand it the live editor table).
+local function recordCapture(weaponData, map)
+    local ss = CUSTOMIZER.ss
+    if not ss or type(map) ~= "table" then return end
+    local code = weaponData and weaponData.base_instance and weaponData.base_instance.Name
+    if type(code) ~= "string" or code == "" then return end
+    local copy = deepCopyPlain(map, nil, 0)
+    if type(copy) ~= "table" then return end
+    local ok, str = pcall(ss.encode, copy)
+    if not ok or type(str) ~= "string" then return end
+    local c = Config.Customizer
+    CUSTOMIZER.last_weapon = code
+    CUSTOMIZER.last_string = str
+    if c and c.Captures and c.Captures[code] ~= str then
+        c.Captures[code] = str
+        local order = c.CaptureOrder or {}
+        c.CaptureOrder = order
+        local at = table.find(order, code)
+        if at then table.remove(order, at) end
+        table.insert(order, code)
+        while #order > 24 do
+            local old = table.remove(order, 1)
+            if old then c.Captures[old] = nil end
+        end
+        saveConfigDebounced()
+    end
+end
+
+-- One permanent wrapper on ItemBuild.new:
+--   * lobby editor/preview builds (GET_STATE config) -> capture the map
+--   * match first-person builds (FIRST_PERSON config) + ForceCaptured ->
+--     swap in the captured setup for that weapon code
+local function installItemBuildWrap()
+    local ok, err = pcall(function()
+        local classFolder = ReplicatedStorage:WaitForChild("class", 10)
+        local ibFolder = classFolder and classFolder:WaitForChild("ItemBuild", 10)
+        local ibInst = ibFolder and ibFolder:WaitForChild("ItemBuild", 10)
+        local bcInst = ibFolder and ibFolder:WaitForChild("BuildConfig", 10)
+        local nsFolder = ReplicatedStorage:WaitForChild("module", 10)
+        local ns2 = nsFolder and nsFolder:WaitForChild("namespace", 10)
+        local ssFolder = ns2 and ns2:WaitForChild("SetupSerialization", 10)
+        local ssInst = ssFolder and ssFolder:WaitForChild("SetupSerialization", 10)
+        if not (ibInst and bcInst and ssInst) then
+            error("ItemBuild / BuildConfig / SetupSerialization not found")
+        end
+        local IB = require(ibInst).ItemBuild
+        local BuildConfig = require(bcInst)
+        local SS = require(ssInst).SetupSerialization
+        CUSTOMIZER.ss = SS
+        -- keep the true original across script re-executions
+        local orig = CUSTOMIZER.ib_orig or IB.new
+        CUSTOMIZER.ib_orig = orig
+        IB.new = function(weapon_data, model, map, config, flags)
+            if config == BuildConfig.GET_STATE_BUILD_CONFIG and IS_LOBBY then
+                pcall(recordCapture, weapon_data, map)
+            elseif config == BuildConfig.FIRST_PERSON_BUILD_CONFIG and not IS_LOBBY then
+                local c = Config.Customizer
+                if c and c.ForceCaptured and c.Captures then
+                    local code = weapon_data and weapon_data.base_instance and weapon_data.base_instance.Name
+                    local str = code and c.Captures[code]
+                    if type(str) == "string" then
+                        local okd, decoded = pcall(SS.decode, str)
+                        if okd and type(decoded) == "table" then
+                            local okb, result = pcall(orig, weapon_data, model, decoded, config, flags)
+                            if okb then return result end
+                            warn("[deadline] forced setup rejected at build, using server setup: " .. tostring(result))
+                        end
+                    end
+                end
+            end
+            return orig(weapon_data, model, map, config, flags)
+        end
+        print(("[deadline] gun customizer armed (capture=%s, force=%s)")
+            :format(tostring(IS_LOBBY), tostring(Config.Customizer.ForceCaptured)))
+    end)
+    if not ok then
+        warn("[deadline] gun customizer wrap unavailable: " .. tostring(err))
+    end
+end
+task.spawn(installItemBuildWrap)
+
 -- Everything this script applies, in one idempotent pass. Safe to call on
 -- a heartbeat: untouched features just rewrite their originals.
 local function applyAll()
@@ -829,6 +1004,7 @@ local function applyAll()
     applySteadyAim()
     applyInfStamina()
     applySwayKnobs()
+    applyCustomizer()
 end
 
 -- ============================================================
@@ -2063,6 +2239,54 @@ local function buildMenu()
             notify(v and "Sight sway zeroed - no walk bob, no look lag" or "Sight sway restored")
         end)
 
+    -- ---------------- Gun Customizer ---------------- (the editor's own
+    -- hidden dev switches + the captured-build fallback)
+    section(p1, "Gun Customizer")
+    toggle(p1, "Mount Anything",
+        function() return Config.Customizer.MountAnything end,
+        function(v)
+            Config.Customizer.MountAnything = v
+            applyCustomizer()
+            refreshStatus()
+            notify(v and "Editor: any attachment fits any slot" or "Editor slot rules restored")
+        end)
+    toggle(p1, "Skip Compatibility",
+        function() return Config.Customizer.SkipCompat end,
+        function(v)
+            Config.Customizer.SkipCompat = v
+            applyCustomizer()
+            refreshStatus()
+            notify(v and "Editor: compatibility checks off - illegal builds allowed" or "Compatibility checks restored")
+        end)
+    toggle(p1, "Unclamped Stats",
+        function() return Config.Customizer.UnclampedStats end,
+        function(v)
+            Config.Customizer.UnclampedStats = v
+            applyCustomizer()
+            refreshStatus()
+            notify(v and "Weapon stats scale past their normal limits" or "Stat clamping restored")
+        end)
+    toggle(p1, "Force Captured Build",
+        function() return Config.Customizer.ForceCaptured end,
+        function(v)
+            Config.Customizer.ForceCaptured = v
+            if v and next(Config.Customizer.Captures) == nil then
+                notify("No builds captured yet - edit a gun in the editor first")
+            else
+                notify(v and "Matches: your guns build from the captured setup" or "Captured-build override off")
+            end
+        end)
+    button(p1, "Copy last captured setup", function()
+        local w, s = CUSTOMIZER.last_weapon, CUSTOMIZER.last_string
+        if type(s) == "string" and type(setclipboard) == "function" then
+            setclipboard(("%s: %s"):format(tostring(w), s))
+            notify("Copied last captured setup (" .. tostring(w) .. ")")
+        else
+            notify("Nothing captured yet - edit a gun in the editor first")
+        end
+    end)
+    note(p1, "Editor dev switches: any slot / no broken-build checks / unscaled stats. If saving an illegal build fails, Force Captured Build swaps it in at match spawn.")
+
     statusLabel = note(p1, "loading...")
 
     -- ---------------- Misc ---------------- (movement / lighting / audio /
@@ -2125,6 +2349,13 @@ local function buildMenu()
     button(pm, "Restore vanilla", function()
         local w = Config.Weapons
         local m = Config.Misc
+        local cz = Config.Customizer
+        if cz then
+            cz.MountAnything = false
+            cz.SkipCompat = false
+            cz.UnclampedStats = false
+            cz.ForceCaptured = false
+        end
         w.RecoilPct = 100
         w.SpreadPct = 100
         w.AimSpeed = 1
@@ -2247,9 +2478,11 @@ task.spawn(function()
     while genv.__HAVOC_DEADLINE_GEN == MY_GEN do
         task.wait(0.5)
         local w = Config.Weapons
+        local cz = Config.Customizer or {}
         if w.RecoilPct < 100 or w.SpreadPct < 100 or w.AimSpeed ~= 1 or w.SwitchSpeed ~= 1
             or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina or w.ZeroSway or w.ZeroWeight
-            or (tonumber(w.BulletVelocity) or 1) > 1 or (tonumber(w.Wallbang) or 1) > 1 then
+            or (tonumber(w.BulletVelocity) or 1) > 1 or (tonumber(w.Wallbang) or 1) > 1
+            or cz.MountAnything or cz.SkipCompat or cz.UnclampedStats then
             local ok, err = pcall(function()
                 applyAll()
                 zeroWeightStep()
