@@ -1,5 +1,5 @@
 --[[
-    STRUCTURE DUMPER v9 — single file, no runtime hooks
+    STRUCTURE DUMPER v10 — single file, no runtime hooks
     One file with: game info, all decompiled scripts, full tree,
     every attribute, every ValueBase, remotes/bindables, assets,
     tags and game UI.
@@ -16,6 +16,9 @@
     — its embedded VM is far too big for the decompiler/compiler (the dump
     used to die at "[script 557]") and it is useless for feature work; the
     skip lists at the top of the file are editable.
+    v10: Oaklands — same treatment for the vLuau VM (/ReplicatedStorage/
+    Dependencies/vLuau/Ception, the dump died at "[script 767]"); path
+    matching is case-insensitive now so folder casing can't dodge the list.
     Potassium-friendly.
 ]]
 
@@ -48,12 +51,13 @@ local DEFAULT_CLIENT_UI = {
 -- Character scripts every Roblox game ships (Animate/Health)
 local SKIP_DEFAULT_SCRIPTS = { Animate = true, Health = true }
 
--- Scripts we never decompile: embedded runtimes (Luau-in-Luau) are too big
--- for the decompiler/compiler and not useful for feature work. Extend
--- SKIP_SCRIPT_NAMES for exact names, SKIP_SCRIPT_PATH_PARTS for any path
--- substring (plain string match, not a Lua pattern).
-local SKIP_SCRIPT_NAMES = { LuauInLuau = true }
-local SKIP_SCRIPT_PATH_PARTS = { "luau_in_luau" }
+-- Scripts we never decompile: embedded runtimes (Luau-in-Luau, vLuau/
+-- Ception) are too big for the decompiler/compiler and not useful for
+-- feature work. Extend SKIP_SCRIPT_NAMES for exact names,
+-- SKIP_SCRIPT_PATH_PARTS for any path substring (plain string match, not a
+-- Lua pattern; matched case-insensitively).
+local SKIP_SCRIPT_NAMES = { LuauInLuau = true, Ception = true }
+local SKIP_SCRIPT_PATH_PARTS = { "luau_in_luau", "vluau/ception" }
 
 -- Everything we want script source from.
 -- v7 FIX: the game RENAMES services (the Workspace root literally prints as
@@ -225,7 +229,7 @@ local function flushDump()
 
     local parts = {
         string.rep("=", 66) .. "\n",
-        "HAVOC HUB STRUCTURE DUMP v9 — single file\n",
+        "HAVOC HUB STRUCTURE DUMP v10 — single file\n",
         ("Generated: %s\n"):format(os.date("%Y-%m-%d %H:%M:%S")),
         ("Payload:   %.1f KB across %d sections\n"):format(total / 1024, #sections),
         string.rep("=", 66) .. "\n\n",
@@ -350,9 +354,11 @@ local function dumpScript(inst, path)
         return
     end
     -- skip-listed giant scripts BEFORE the decompiler ever touches them
+    -- (case-insensitive so folder casing like vLuau can't dodge the list)
     local skipPath = false
+    local lowerPath = string.lower(path)
     for _, part in ipairs(SKIP_SCRIPT_PATH_PARTS) do
-        if string.find(path, part, 1, true) then
+        if string.find(lowerPath, string.lower(part), 1, true) then
             skipPath = true
             break
         end
@@ -498,7 +504,7 @@ end
 -- ============================================================
 -- MAIN
 -- ============================================================
-print("===== DUMPER v9 START =====")
+print("===== DUMPER v10 START =====")
 local startTime = tick()
 
 local services = game:GetChildren()
@@ -577,7 +583,7 @@ end
 -- ============================================================
 do
     local lines = {}
-    table.insert(lines, "# Structure Summary (v9 — single file)")
+    table.insert(lines, "# Structure Summary (v10 — single file)")
     table.insert(lines, "")
     table.insert(lines, ("Generated:  %s"):format(os.date("%Y-%m-%d %H:%M:%S")))
     table.insert(lines, ("Elapsed:    %.1fs"):format(tick() - startTime))
@@ -609,7 +615,7 @@ end
 -- Everything collected → write the single output file
 flushDump()
 
-print("===== DUMPER v6 COMPLETE =====")
+print("===== DUMPER v10 COMPLETE =====")
 print(("Instances: %d | Scripts: OK=%d FAIL=%d | Remotes: %d | Values: %d")
     :format(#treeLines, scriptOK, scriptFail, #remotes, #valueLines))
 print("Single file: " .. OUT_FILE)
