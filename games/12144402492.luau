@@ -42,14 +42,17 @@
                           Wallbang scales plr_penetration_multiplier - the
                           game's own projectile penetration multiplier
                           (per-surface check L334985).
-          No Bullet Drop - true zero-drop: the caster's SHARED gravity upvalue
-                          (`local u10` in module/caster/caster L322647,
-                          rewritten at every bullet creation by fire L322901
-                          / fire_server L323041, read live every frame by
-                          update_caster L323397, path call L323497) is
-                          zeroed with debug.setupvalue and re-zeroed every
-                          frame, so the g*t^2 term in the projectile path
-                          (L322684) is always 0 - bullets fly dead straight.
+          No Bullet Drop - true zero-drop: the caster module's shared gravity
+                          upvalue (`local u10` in module/caster/caster,
+                          rewritten by fire / fire_server at every bullet
+                          creation, read live every frame by the step loop)
+                          is forced to zero by WRAPPING those two exports:
+                          while the toggle is on, the wrapper zeroes
+                          workspace.Gravity for the duration of the
+                          (synchronous) call, so the game bakes u10 =
+                          Vector3(0,0,0) - the g*t^2 term in the projectile
+                          path becomes exactly 0 for every bullet, in-flight
+                          ones included. No debug library needed.
                           Client-local; same risk class as the velocity
                           slider.
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
@@ -145,7 +148,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v35"
+local SCRIPT_VERSION = "dl-v35a"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1126,107 +1129,128 @@ local function applyBallistics()
 end
 
 -- ============================================================
--- NO BULLET DROP  (dl-v35 - zero the caster's gravity upvalue)
+-- NO BULLET DROP  (dl-v35a - scope-wrap the caster's fire calls)
 -- ============================================================
 -- The drop term in the projectile path is gravity*t^2, where gravity is the
--- caster module's SHARED UPVALUE: `local u10` in module/caster/caster
--- (dump L322647, set from workspace.Gravity; rewritten at every bullet
--- creation by fire L322901 / fire_server L323041; read LIVE every frame by
--- the step loop update_caster L323397, path call L323497). All of these
--- share ONE upvalue cell, so debug.setupvalue on it zeroes the drop for
--- every bullet our client steps - and since each frame's position is
--- recomputed from the origin with the CURRENT value, in-flight bullets
--- flatten too. Fires rewrite the cell, so it is re-zeroed every frame;
--- worst case is one frame of gravity right after a shot (~0.05 studs).
+-- caster module's SHARED UPVALUE (`local u10` in module/caster/caster,
+-- dump L334904; rewritten from workspace.Gravity at every bullet creation:
+-- fire L335158 / fire_server L335298; read LIVE every frame by the step
+-- loop - so keeping the cell at zero also flattens bullets already in
+-- flight). The debug.setupvalue route can be blocked by an executor, so
+-- instead the two CREATION functions are wrapped on the module table - all
+-- call sites (weapon fire, replicated shots, internal ricochet re-fires)
+-- look the function up per call. While the toggle is on, the wrapper makes
+-- the game itself bake a zero into the cell:
+--     g = workspace.Gravity
+--     workspace.Gravity = 0
+--     orig(...)        <- writes u10 = Vector3(0, -0, 0)
+--     workspace.Gravity = g
+-- fire / fire_server are synchronous (no yields - verified in the dump),
+-- so the zero-gravity window is one pure call: nothing else can see it.
 -- Client-local; affects every projectile our client steps (explosive
 -- rounds fly straight too) - same risk class as the velocity slider.
--- Needs debug.getupvalue/setupvalue (guarded - reports when blocked).
 local DROP_STATE = genv.__HAVOC_DEADLINE_DROP
 if type(DROP_STATE) ~= "table" then
     DROP_STATE = {}
     genv.__HAVOC_DEADLINE_DROP = DROP_STATE
 end
+-- true originals persist across re-executions (never wipe: a stale cache
+-- from another place is harmless - the module table is re-found on boot)
+if type(DROP_STATE.originals) ~= "table" then
+    DROP_STATE.originals = {}
+end
 
-local function findGravityCells()
-    local cells = {}
-    local function scan(fn)
-        if type(fn) ~= "function" then return end
-        for i = 1, 120 do
-            local name, val = debug.getupvalue(fn, i)
-            if name == nil then break end
-            if typeof(val) == "Vector3" and val.X == 0 and val.Z == 0
-                and val.Y < 0 and math.abs(val.Y + workspace.Gravity) < 0.5 then
-                table.insert(cells, { fn = fn, index = i })
-            end
+local DROP_KEYS = { "fire", "fire_server" }
+
+local function findCasterModule()
+    local ok, mod = pcall(function()
+        local moduleFolder = ReplicatedStorage:FindFirstChild("module")
+        local casterFolder = moduleFolder and moduleFolder:FindFirstChild("caster")
+        local casterInst = casterFolder and casterFolder:FindFirstChild("caster")
+        if not casterInst then return nil end
+        return require(casterInst)
+    end)
+    if ok and type(mod) == "table" then return mod end
+    return nil
+end
+
+local function clearDropWrappers()
+    local mod = DROP_STATE.mod
+    local originals = DROP_STATE.originals
+    if type(mod) == "table" and type(originals) == "table" then
+        for key, orig in pairs(originals) do
+            pcall(function() mod[key] = orig end)
         end
     end
-    local ok, err = pcall(function()
-        local casterMod = require(ReplicatedStorage.module.caster.caster)
-        scan(casterMod.fire)
-        scan(casterMod.fire_server)
-    end)
-    if not ok then return nil, tostring(err) end
-    if #cells == 0 then return nil, "gravity upvalue not found" end
-    return cells
+    DROP_STATE.originals = {}
+    DROP_STATE.mod = nil
 end
 
 -- Returns ok, err. Never notifies - the callers own the messaging.
 local function applyNoDrop()
+    clearDropWrappers()
+    DROP_STATE.blocked = nil
     if not Config.Weapons.NoBulletDrop then
-        if DROP_STATE.cells then
-            local g = Vector3.new(0, -workspace.Gravity, 0)
-            for _, c in ipairs(DROP_STATE.cells) do
-                pcall(debug.setupvalue, c.fn, c.index, g)
-            end
-            DROP_STATE.cells = nil
-        end
-        DROP_STATE.blocked = nil
         return true
     end
-    if DROP_STATE.cells then return true end
-    if DROP_STATE.blocked then return false, DROP_STATE.blocked end
-    local cells, err = findGravityCells()
-    if not cells then
-        DROP_STATE.blocked = err or "unavailable"
-        warn("[deadline] no bullet drop inactive: " .. tostring(err))
-        return false, err
+    local mod = findCasterModule()
+    if not mod then
+        DROP_STATE.blocked = "caster module not found"
+        return false, DROP_STATE.blocked
     end
-    DROP_STATE.cells = cells
-    for _, c in ipairs(cells) do
-        pcall(debug.setupvalue, c.fn, c.index, Vector3.new(0, 0, 0))
+    local originals = {}
+    local wrapped = 0
+    for _, key in ipairs(DROP_KEYS) do
+        local orig = rawget(mod, key)
+        if type(orig) == "function" then
+            originals[key] = orig
+            mod[key] = function(...)
+                if not Config.Weapons.NoBulletDrop then
+                    return orig(...)
+                end
+                local g = workspace.Gravity
+                if g == 0 then
+                    return orig(...)
+                end
+                workspace.Gravity = 0
+                local results = table.pack(pcall(orig, ...))
+                workspace.Gravity = g
+                if not results[1] then
+                    error(results[2], 0)
+                end
+                return table.unpack(results, 2, results.n)
+            end
+            wrapped = wrapped + 1
+        end
     end
+    if wrapped == 0 then
+        DROP_STATE.blocked = "caster fire exports missing"
+        return false, DROP_STATE.blocked
+    end
+    DROP_STATE.originals = originals
+    DROP_STATE.mod = mod
     return true
 end
 
--- Keep the cell at zero: every fire rewrites it, so one write per frame
--- wins (a fire's write can only land between our writes, and is undone
--- within one frame - the bullet gains at most ~0.05 studs of arc before
--- the next recompute).
-local dropWarnCount = 0
+-- Retry once a second while enabled but not armed (e.g. toggled before the
+-- module replicated); warns once per arming attempt.
 local dropRetry = 0
 track(RunService.RenderStepped:Connect(function()
     if not Config.Weapons.NoBulletDrop then
         dropRetry = 0
         return
     end
-    local cells = DROP_STATE.cells
-    if not cells then
-        dropRetry = dropRetry + 1
-        if dropRetry >= 60 then
-            dropRetry = 0
-            pcall(applyNoDrop)
-        end
+    if DROP_STATE.mod then
+        dropRetry = 0
         return
     end
-    local zero = Vector3.new(0, 0, 0)
-    for _, c in ipairs(cells) do
-        if not pcall(debug.setupvalue, c.fn, c.index, zero) then
-            DROP_STATE.cells = nil
-            if dropWarnCount < 3 then
-                dropWarnCount = dropWarnCount + 1
-                warn("[deadline] no bullet drop: stale upvalue cache, re-acquiring")
-            end
-            return
+    dropRetry = dropRetry + 1
+    if dropRetry >= 60 then
+        dropRetry = 0
+        local ok, err = applyNoDrop()
+        if not ok and not DROP_STATE.warned then
+            DROP_STATE.warned = true
+            warn("[deadline] no bullet drop inactive: " .. tostring(err))
         end
     end
 end))
@@ -2152,15 +2176,11 @@ local function buildMenu()
         function() return Config.Weapons.NoBulletDrop end,
         function(v)
             Config.Weapons.NoBulletDrop = v
-            if v then
-                DROP_STATE.cells = nil
-                DROP_STATE.blocked = nil
-            end
-            local ok = applyNoDrop()
+            DROP_STATE.warned = nil
+            local ok, err = applyNoDrop()
             if v and not ok then
-                Config.Weapons.NoBulletDrop = false
-                refreshGUI()
-                notify("No bullet drop unavailable - this executor blocks debug.getupvalue")
+                warn("[deadline] no bullet drop not armed yet: " .. tostring(err))
+                notify("No bullet drop on - waiting for the game module (auto-retries)")
             else
                 notify(v and "No bullet drop: bullets fly dead straight" or "Bullet drop restored")
             end
@@ -2371,18 +2391,9 @@ task.spawn(function()
         pcall(ballisticsRestore)
     end
     pcall(applyBallistics)
-    -- no-bullet-drop reconcile: a fresh place means fresh caster closures,
-    -- so the upvalue cache is always re-acquired on boot
-    DROP_STATE.cells = nil
-    DROP_STATE.blocked = nil
-    if Config.Weapons.NoBulletDrop then
-        local dropOK = applyNoDrop()
-        if not dropOK then
-            notify("No bullet drop unavailable - this executor blocks debug.getupvalue")
-        end
-    else
-        pcall(applyNoDrop)
-    end
+    -- no-bullet-drop reconcile: applyNoDrop clears any wrappers left by an
+    -- earlier run, then re-arms when enabled (fresh place = fresh module)
+    pcall(applyNoDrop)
     pcall(setFullbright, Config.Misc.Fullbright)
     if Config.Weapons.NoDeaf then
         pcall(applyNoDeaf, true)
