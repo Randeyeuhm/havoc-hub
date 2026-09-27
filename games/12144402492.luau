@@ -135,7 +135,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v20"
+local SCRIPT_VERSION = "dl-v21"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1222,7 +1222,14 @@ local function setFullbright(on)
     end
 end
 
-track(RunService.Heartbeat:Connect(function()
+-- Re-assert at the LAST render priority: the game's own lighting writers
+-- (weather pulses, graphics settings, day cycle) run through the frame in
+-- mixed phases, and a heartbeat write can land BEFORE them on some frames -
+-- that frame then renders their value = flicker. Binding just before the
+-- render makes ours the final write of every frame, so the picture can't
+-- alternate. (Same-name bind replaces an older run's bind on re-execution.)
+RunService:BindToRenderStep("HavocHubDeadlineFullbright", Enum.RenderPriority.Last.Value, function()
+    if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
     if not Config.Misc.Fullbright then return end
     local v = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
     local c = Color3.fromRGB(v, v, v)
