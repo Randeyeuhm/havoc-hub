@@ -136,7 +136,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v26"
+local SCRIPT_VERSION = "dl-v27"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -911,18 +911,24 @@ if type(ZW_STATE.saved) ~= "table" then
     ZW_STATE.saved = setmetatable({}, { __mode = "k" })
 end
 
--- only ever touches the LOCAL controller. controller.character is the rig
--- MODEL itself (assigned from simulation.character.instance, dump L368119),
--- but the diag proved both old probes dead in practice: is_local is nil
--- outside the lobby-editor spawn AND LocalPlayer.Character is not linked to
--- these custom rigs (nil). The rigs ARE named by UserId though - the model
--- name is the reliable identity.
+-- Whether a scanned controller is ours. Round 3 of this filter: the diag
+-- showed the model is "StarterCharacter" (the game's default-avatar
+-- clone), is_local is nil outside the editor spawn, and
+-- LocalPlayer.Character is nil for everyone here - every exact-match probe
+-- is dead. The client only ever holds its OWN FP controller in the GC scan
+-- (controllers:1 every time), and the sway stubs / reload injection already
+-- treat every found controller as local. So: accept anything we cannot
+-- PROVE belongs to someone else (a rig named by a different UserId).
 local function isLocalCharData(controller, cd)
     if rawget(cd, "is_local") == true then return true end
     local ch = rawget(controller, "character")
-    if ch == nil then return false end
+    if ch == nil then return true end
     if ch == LocalPlayer.Character then return true end
-    return ch.Name == tostring(LocalPlayer.UserId)
+    local name = ch.Name
+    if name == tostring(LocalPlayer.UserId) then return true end
+    local uid = tonumber(name)
+    if uid ~= nil and uid ~= LocalPlayer.UserId then return false end
+    return true
 end
 
 local function zeroWeightStep()
