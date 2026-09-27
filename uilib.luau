@@ -1308,6 +1308,7 @@ local function makeDropdown(parent, label, getItems, getSelected, onSelect, over
                 setOpen(false)
                 onSelect(name)
                 update()
+                hooks.save()
             end)
             itemButtons[i] = b
         end

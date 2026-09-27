@@ -135,7 +135,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v21"
+local SCRIPT_VERSION = "dl-v22"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -217,7 +217,12 @@ do
             for section, values in pairs(decoded) do
                 if type(Config[section]) == "table" and type(values) == "table" then
                     for k, v in pairs(values) do
-                        if type(v) == type(Config[section][k]) then
+                        -- Keys with no default in this table yet must still
+                        -- come back: most of the ESP schema is supplied by
+                        -- esp.luau (ESPUI.fill runs LATER, in the ESP load
+                        -- block), so the old type==type(nil) check silently
+                        -- dropped every saved ESP setting on load.
+                        if Config[section][k] == nil or type(v) == type(Config[section][k]) then
                             Config[section][k] = v
                         end
                     end
