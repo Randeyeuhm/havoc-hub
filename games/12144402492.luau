@@ -64,7 +64,8 @@
                           tinnitus ringing group muted (explosion_deaf_effect
                           L201192-205, lobby_deaf_effect L131807)
       • Misc tab (menu organisation) - movement / lighting / audio / reset:
-          Movement = Zero Weight + Infinite Stamina; Lighting = Fullbright
+          Movement = Zero Weight + Speed (x1-x5 movement multiplier) +
+          Infinite Stamina; Lighting = Fullbright
           (toggle + Intensity slider 0-255 ambient grey, shadows off, fog
           gone, re-checked every frame so weather can't dim it again);
           Audio = No Deafness; Reset = the global Restore vanilla.
@@ -135,7 +136,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v22"
+local SCRIPT_VERSION = "dl-v23"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -182,6 +183,7 @@ local DEFAULTS = {
     Misc = {
         Fullbright = false,
         FullbrightIntensity = 190, -- ambient grey 0-255 while fullbright is on
+        SpeedMult = 1,             -- movement speed multiplier (x1 = vanilla)
     },
 }
 
@@ -253,6 +255,10 @@ Config.Weapons.Wallbang = math.clamp(tonumber(Config.Weapons.Wallbang) or 1, 1, 
 
 -- Fullbright intensity: ambient grey level (matches the sibling scripts).
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
+
+-- Movement Speed: x1 = vanilla; composes with Zero Weight on the same
+-- live override (see the ZERO WEIGHT + SPEED section).
+Config.Misc.SpeedMult = math.clamp(tonumber(Config.Misc.SpeedMult) or 1, 1, 5)
 
 -- ============================================================
 -- DEADLINE WEAPON FRAMEWORK  (the live levers)
@@ -845,13 +851,15 @@ end
 -- Also keeps the Zero Weight / Ballistics controller cache warm.
 track(LocalPlayer.CharacterAdded:Connect(function()
     if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight
-        and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1 then return end
+        and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1
+        and (tonumber(Config.Misc.SpeedMult) or 1) <= 1 then return end
     task.spawn(function()
         for _, d in ipairs({ 1, 2, 3 }) do
             task.wait(d)
             if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
             if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight
-                and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1 then return end
+                and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1
+                and (tonumber(Config.Misc.SpeedMult) or 1) <= 1 then return end
             pcall(refreshControllerCache)
         end
     end)
@@ -878,7 +886,7 @@ track(RunService.RenderStepped:Connect(function(dt)
 end))
 
 -- ============================================================
--- ZERO WEIGHT  (walk at weightless speed)
+-- ZERO WEIGHT + SPEED  (live movement override: weightless + multiplier)
 -- ============================================================
 -- The movement chain (7v7 dump L371469) computes the walkspeed as
 --   get_walkspeed(pose, aiming, leaning, char_data.collective_weight)
@@ -911,7 +919,9 @@ local function isLocalCharData(controller, cd)
 end
 
 local function zeroWeightStep()
-    if not Config.Weapons.ZeroWeight then return end
+    local zw = Config.Weapons.ZeroWeight
+    local mult = tonumber(Config.Misc.SpeedMult) or 1
+    if not zw and mult <= 1 then return end
     for controller in pairs(CTRL_STATE.tracked) do
         if type(controller) == "table" then
             local cd = rawget(controller, "char_data")
@@ -923,7 +933,12 @@ local function zeroWeightStep()
                     if ZW_STATE.saved[controller] == nil then
                         ZW_STATE.saved[controller] = { cd = cd, orig = ov.speed }
                     end
-                    ov.speed = (w / 10) + 1
+                    -- overrides.speed is the single clean multiplier at the
+                    -- end of the walkspeed chain: weight compensation when
+                    -- Zero Weight is on, times the flat Speed slider value.
+                    local m = 1
+                    if zw then m = (w / 10) + 1 end
+                    ov.speed = m * mult
                 end
             end
         end
@@ -942,11 +957,14 @@ end
 
 local zwErrCount = 0
 track(RunService.RenderStepped:Connect(function()
-    if not Config.Weapons.ZeroWeight then return end
+    if not Config.Weapons.ZeroWeight and (tonumber(Config.Misc.SpeedMult) or 1) <= 1 then
+        if next(ZW_STATE.saved) ~= nil then pcall(zeroWeightRestore) end
+        return
+    end
     local ok, err = pcall(zeroWeightStep)
     if not ok and zwErrCount < 3 then
         zwErrCount = zwErrCount + 1
-        warn(("[deadline] zero weight step error (%d): %s"):format(zwErrCount, tostring(err)))
+        warn(("[deadline] movement speed step error (%d): %s"):format(zwErrCount, tostring(err)))
     end
 end))
 
@@ -2032,10 +2050,17 @@ local function buildMenu()
                 end)
             else
                 pcall(zeroWeightRestore)
+                pcall(zeroWeightStep)
                 notify("Weight restored - normal walk speed")
             end
             refreshStatus()
         end)
+    slider(pm, "Speed",
+        function() return Config.Misc.SpeedMult end,
+        function(v)
+            Config.Misc.SpeedMult = v
+            refreshStatus()
+        end, 0.25, 1, 5, function(v) return ("%g×"):format(v) end)
     toggle(pm, "Infinite Stamina",
         function() return Config.Weapons.InfStamina end,
         function(v)
@@ -2088,6 +2113,7 @@ local function buildMenu()
         w.Wallbang = 1
         m.Fullbright = false
         m.FullbrightIntensity = 190
+        m.SpeedMult = 1
         pcall(unstubSwaySprings)
         pcall(applyNoDeaf, false)
         pcall(zeroWeightRestore)
@@ -2152,7 +2178,7 @@ task.spawn(function()
     if (tonumber(Config.Weapons.ReloadSpeed) or 1) > 1 or (tonumber(Config.Weapons.BulletVelocity) or 1) > 1 then
         task.spawn(function() pcall(refreshControllerCache) end)
     end
-    if Config.Weapons.ZeroWeight then
+    if Config.Weapons.ZeroWeight or (tonumber(Config.Misc.SpeedMult) or 1) > 1 then
         task.spawn(function()
             pcall(refreshControllerCache)
             pcall(zeroWeightStep)
@@ -2187,7 +2213,8 @@ task.spawn(function()
         local w = Config.Weapons
         if w.RecoilPct < 100 or w.SpreadPct < 100 or w.AimSpeed ~= 1 or w.SwitchSpeed ~= 1
             or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina or w.ZeroSway or w.ZeroWeight
-            or (tonumber(w.BulletVelocity) or 1) > 1 or (tonumber(w.Wallbang) or 1) > 1 then
+            or (tonumber(w.BulletVelocity) or 1) > 1 or (tonumber(w.Wallbang) or 1) > 1
+            or (tonumber(Config.Misc.SpeedMult) or 1) > 1 then
             local ok, err = pcall(function()
                 applyAll()
                 zeroWeightStep()
@@ -2216,7 +2243,8 @@ task.spawn(function()
         -- keep the reload-speed / zero-weight / ballistics controller cache
         -- warm (new characters / controllers that appeared after boot)
         if (tonumber(w.ReloadSpeed) or 1) > 1 or w.ZeroWeight
-            or (tonumber(w.BulletVelocity) or 1) > 1 then
+            or (tonumber(w.BulletVelocity) or 1) > 1
+            or (tonumber(Config.Misc.SpeedMult) or 1) > 1 then
             reloadScanTick = reloadScanTick + 1
             if reloadScanTick >= 60 then
                 reloadScanTick = 0
