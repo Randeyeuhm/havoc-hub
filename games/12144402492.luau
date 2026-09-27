@@ -64,7 +64,7 @@
                           tinnitus ringing group muted (explosion_deaf_effect
                           L201192-205, lobby_deaf_effect L131807)
       • Misc tab (menu organisation) - movement / lighting / audio / reset:
-          Movement = Infinite Stamina; Lighting = Fullbright
+          Movement = Zero Weight + Infinite Stamina; Lighting = Fullbright
           (toggle + Intensity slider 0-255 ambient grey, shadows off, fog
           gone, re-checked every frame so weather can't dim it again);
           Audio = No Deafness; Reset = the global Restore vanilla.
@@ -135,7 +135,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v30"
+local SCRIPT_VERSION = "dl-v22"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -159,7 +159,9 @@ local DEFAULTS = {
         ErgoSpeed = 1,     -- plr_ergonomics_multiplier             (x vanilla)
         ReloadSpeed = 2,   -- reload anim speed (x vanilla; live track time
                            -- injection - see FAST RELOAD section)
-        BulletVelocity = 1, -- muzzle velocity multiplier (x1 vanilla; see BALLISTICS)
+        ZeroWeight = false,-- walk at weightless speed: overrides.speed =
+                           -- weight/10 + 1 cancels the weight divisor
+        BulletVelocity = 15,-- muzzle velocity x15 (drop ~gone; see BALLISTICS)
         Wallbang = 1,      -- projectile penetration multiplier (x1 vanilla)
         SteadyAim = false, -- arm stamina drains + breathing shake -> 0
         InfStamina = false,-- sprint / lean / jump / vault drains -> 0
@@ -245,10 +247,8 @@ Config.Weapons.ReloadSpeed = math.clamp(tonumber(Config.Weapons.ReloadSpeed) or 
 
 -- Ballistics: Bullet Velocity multiplies the muzzle velocity written on the
 -- weapon build (see BALLISTICS section); Wallbang scales the game's live
--- projectile penetration multiplier. Both now DEFAULT TO VANILLA - fast
--- bullets are unverified against the server's hit validation and got
--- accounts banned, so they are opt-in only (throwaway-tier).
-Config.Weapons.BulletVelocity = math.clamp(tonumber(Config.Weapons.BulletVelocity) or 1, 1, 50)
+-- projectile penetration multiplier.
+Config.Weapons.BulletVelocity = math.clamp(tonumber(Config.Weapons.BulletVelocity) or 15, 1, 50)
 Config.Weapons.Wallbang = math.clamp(tonumber(Config.Weapons.Wallbang) or 1, 1, 100)
 
 -- Fullbright intensity: ambient grey level (matches the sibling scripts).
@@ -714,8 +714,8 @@ local function localControllerStubbed()
     local stub = swayStub("camera_nonrelative")
     for controller in pairs(BOB_STATE.saved) do
         if type(controller) == "table" then
-            -- controller.character is the rig MODEL itself (dump L368119)
-            if rawget(controller, "character") == char then
+            local ch = rawget(controller, "character")
+            if type(ch) == "table" and rawget(ch, "instance") == char then
                 local springs = rawget(controller, "springs")
                 if type(springs) == "table" and rawget(springs, "camera_nonrelative") == stub then
                     return true
@@ -842,15 +842,15 @@ end
 
 -- fresh character = fresh controller + fresh tracks: pick them up shortly
 -- after spawn (retries - the controller is built over the first seconds).
--- Also keeps the Ballistics controller cache warm.
+-- Also keeps the Zero Weight / Ballistics controller cache warm.
 track(LocalPlayer.CharacterAdded:Connect(function()
-    if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1
+    if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight
         and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1 then return end
     task.spawn(function()
         for _, d in ipairs({ 1, 2, 3 }) do
             task.wait(d)
             if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
-            if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1
+            if (tonumber(Config.Weapons.ReloadSpeed) or 1) <= 1 and not Config.Weapons.ZeroWeight
                 and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1 then return end
             pcall(refreshControllerCache)
         end
@@ -878,43 +878,77 @@ track(RunService.RenderStepped:Connect(function(dt)
 end))
 
 -- ============================================================
--- MOVEMENT  (speed overrides REMOVED - the game bans for them)
+-- ZERO WEIGHT  (walk at weightless speed)
 -- ============================================================
--- Zero Weight and the Speed multiplier wrote char_data.overrides.speed
--- (dump L371498). Both got accounts instantly banned - the server detects
--- movement speed changes - so the UI and the writers are gone. What remains
--- is a one-shot cleanup so a value written by an older build can never
--- outlive a re-execution into this one.
-local function clearSpeedOverrides()
+-- The movement chain (7v7 dump L371469) computes the walkspeed as
+--   get_walkspeed(pose, aiming, leaning, char_data.collective_weight)
+--   * stamina terms * plr_speed * timescale * char_data.overrides.speed
+-- and get_walkspeed = walkspeed_table[pose] / (collective_weight / 10 + 1)
+-- (L381775-381791; collective_weight = equip weights + plr_base_weight).
+-- The weight penalty is a clean divisor, so writing
+--   overrides.speed = collective_weight / 10 + 1
+-- every frame cancels it EXACTLY: the player moves as if the whole loadout
+-- had zero weight. overrides is the game's own channel (the weapon editor
+-- writes overrides.camera_mode / jump_multiplier / animation_speed), it is
+-- read live every frame, and the multiplier follows the CURRENT weight -
+-- respawns and loadout switches stay covered. Unlike zeroing the weight
+-- itself, stamina drain / vault times / camera stiffness keep their normal
+-- (weight-based) values.
+local ZW_STATE = genv.__HAVOC_DEADLINE_ZW
+if type(ZW_STATE) ~= "table" then
+    ZW_STATE = { saved = setmetatable({}, { __mode = "k" }) }
+    genv.__HAVOC_DEADLINE_ZW = ZW_STATE
+end
+if type(ZW_STATE.saved) ~= "table" then
+    ZW_STATE.saved = setmetatable({}, { __mode = "k" })
+end
+
+-- only ever touches the LOCAL controller: remote rigs rep the network.
+local function isLocalCharData(controller, cd)
+    if rawget(cd, "is_local") == true then return true end
+    local ch = rawget(controller, "character")
+    return type(ch) == "table" and rawget(ch, "instance") == LocalPlayer.Character
+end
+
+local function zeroWeightStep()
+    if not Config.Weapons.ZeroWeight then return end
     for controller in pairs(CTRL_STATE.tracked) do
         if type(controller) == "table" then
             local cd = rawget(controller, "char_data")
-            local ov = type(cd) == "table" and rawget(cd, "overrides") or nil
-            if type(ov) == "table" and ov.speed ~= nil then
-                ov.speed = nil
+            if type(cd) == "table" and isLocalCharData(controller, cd) then
+                local ov = rawget(cd, "overrides")
+                if type(ov) == "table" then
+                    local w = tonumber(rawget(cd, "collective_weight")) or 0
+                    if w < 0 then w = 0 end
+                    if ZW_STATE.saved[controller] == nil then
+                        ZW_STATE.saved[controller] = { cd = cd, orig = ov.speed }
+                    end
+                    ov.speed = (w / 10) + 1
+                end
             end
         end
     end
 end
 
--- Whether a scanned controller is ours. The player model is the game's
--- default-avatar clone ("StarterCharacter"), is_local is nil outside the
--- editor spawn and LocalPlayer.Character is nil for everyone - every
--- exact-match probe is dead. The client only ever holds its OWN FP
--- controller in the GC scan, so: accept anything we cannot PROVE belongs
--- to someone else (a rig named by a different UserId). Used by the
--- ballistics ammo edits and the speed-override cleanup.
-local function isLocalCharData(controller, cd)
-    if rawget(cd, "is_local") == true then return true end
-    local ch = rawget(controller, "character")
-    if ch == nil then return true end
-    if ch == LocalPlayer.Character then return true end
-    local name = ch.Name
-    if name == tostring(LocalPlayer.UserId) then return true end
-    local uid = tonumber(name)
-    if uid ~= nil and uid ~= LocalPlayer.UserId then return false end
-    return true
+local function zeroWeightRestore()
+    for controller, entry in pairs(ZW_STATE.saved) do
+        local ov = entry.cd and entry.cd.overrides
+        if type(ov) == "table" then
+            pcall(function() ov.speed = entry.orig end)
+        end
+        ZW_STATE.saved[controller] = nil
+    end
 end
+
+local zwErrCount = 0
+track(RunService.RenderStepped:Connect(function()
+    if not Config.Weapons.ZeroWeight then return end
+    local ok, err = pcall(zeroWeightStep)
+    if not ok and zwErrCount < 3 then
+        zwErrCount = zwErrCount + 1
+        warn(("[deadline] zero weight step error (%d): %s"):format(zwErrCount, tostring(err)))
+    end
+end))
 
 -- ============================================================
 -- BALLISTICS  (bullet velocity / no drop + wallbang)
@@ -1982,6 +2016,26 @@ local function buildMenu()
     -- ---------------- Misc ---------------- (movement / lighting / audio /
     -- reset: the pieces that were crowding the Weapons tab)
     section(pm, "Movement")
+    toggle(pm, "Zero Weight",
+        function() return Config.Weapons.ZeroWeight end,
+        function(v)
+            Config.Weapons.ZeroWeight = v
+            if v then
+                notify("Zero weight: you walk at weightless speed")
+                task.spawn(function()
+                    if not gcScanAvailable() then
+                        warn("[deadline] GC scan unavailable in this executor - zero weight can't find the controller")
+                        return
+                    end
+                    pcall(refreshControllerCache)
+                    pcall(zeroWeightStep)
+                end)
+            else
+                pcall(zeroWeightRestore)
+                notify("Weight restored - normal walk speed")
+            end
+            refreshStatus()
+        end)
     toggle(pm, "Infinite Stamina",
         function() return Config.Weapons.InfStamina end,
         function(v)
@@ -2029,13 +2083,14 @@ local function buildMenu()
         w.InfStamina = false
         w.ZeroSway = false
         w.NoDeaf = false
+        w.ZeroWeight = false
         w.BulletVelocity = 1
         w.Wallbang = 1
         m.Fullbright = false
         m.FullbrightIntensity = 190
         pcall(unstubSwaySprings)
         pcall(applyNoDeaf, false)
-        pcall(clearSpeedOverrides)
+        pcall(zeroWeightRestore)
         pcall(ballisticsRestore)
         pcall(applyBallistics)
         pcall(setFullbright, false)
@@ -2097,12 +2152,15 @@ task.spawn(function()
     if (tonumber(Config.Weapons.ReloadSpeed) or 1) > 1 or (tonumber(Config.Weapons.BulletVelocity) or 1) > 1 then
         task.spawn(function() pcall(refreshControllerCache) end)
     end
-    -- reconcile: an older build can leave overrides.speed boosted - the
-    -- movement overrides are gone now, so just clear any leftover
-    task.spawn(function()
-        pcall(refreshControllerCache)
-        pcall(clearSpeedOverrides)
-    end)
+    if Config.Weapons.ZeroWeight then
+        task.spawn(function()
+            pcall(refreshControllerCache)
+            pcall(zeroWeightStep)
+        end)
+    else
+        -- reconcile: an earlier run can leave overrides.speed boosted
+        pcall(zeroWeightRestore)
+    end
     if (tonumber(Config.Weapons.BulletVelocity) or 1) > 1 then
         task.spawn(function()
             pcall(refreshControllerCache)
@@ -2128,10 +2186,11 @@ task.spawn(function()
         task.wait(0.5)
         local w = Config.Weapons
         if w.RecoilPct < 100 or w.SpreadPct < 100 or w.AimSpeed ~= 1 or w.SwitchSpeed ~= 1
-            or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina or w.ZeroSway
+            or w.ErgoSpeed ~= 1 or w.SteadyAim or w.InfStamina or w.ZeroSway or w.ZeroWeight
             or (tonumber(w.BulletVelocity) or 1) > 1 or (tonumber(w.Wallbang) or 1) > 1 then
             local ok, err = pcall(function()
                 applyAll()
+                zeroWeightStep()
                 ballisticsStep()
                 applyBallistics()
                 refreshStatus()
@@ -2154,9 +2213,10 @@ task.spawn(function()
         else
             swayScanTick = 0
         end
-        -- keep the reload-speed / ballistics controller cache warm (new
-        -- characters / controllers that appeared after boot)
-        if (tonumber(w.ReloadSpeed) or 1) > 1 or (tonumber(w.BulletVelocity) or 1) > 1 then
+        -- keep the reload-speed / zero-weight / ballistics controller cache
+        -- warm (new characters / controllers that appeared after boot)
+        if (tonumber(w.ReloadSpeed) or 1) > 1 or w.ZeroWeight
+            or (tonumber(w.BulletVelocity) or 1) > 1 then
             reloadScanTick = reloadScanTick + 1
             if reloadScanTick >= 60 then
                 reloadScanTick = 0
