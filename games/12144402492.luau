@@ -161,6 +161,16 @@
           type - the module accepts any X/Y/Z object (CFrame included)
           and type() on Roblox datatypes is not reliable across
           versions, so the old guard could silently drop every call.
+          dl-v41: weapon-by-position matcher - the live gun is found by
+          matching each shot's origin write (its exact barrel world
+          position) against the barrel of every cached weapon table
+          (getgc-collected: barrel_heat + viewmodel.receiver.barrel);
+          the per-shot validation doubles as the cache check, so weapon
+          switches self-heal without the controller cache. (v40 live
+          test confirmed type() returned "vector", not "Vector3" - the
+          entire v39 blackout - and that the controller cache stayed
+          empty in match: every call hit noBarrel. It also showed real
+          shots arriving: big origin (461) + unit direction (1) pairs.)
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -223,7 +233,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v40"
+local SCRIPT_VERSION = "dl-v41"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -677,6 +687,25 @@ local function isDeadlineController(t)
         and type(rawget(lerps, "final_aim")) == "table"
 end
 
+-- The weapon table the fire code carries (a1.weapon, 7v7 dump: barrel_heat
+-- increments per shot at L374678, and viewmodel.receiver.barrel is the
+-- part every shot launches from). Matching that barrel's world position
+-- against a shot's origin identifies the live gun without any controller
+-- cache - weapon switches and respawns self-heal because the check reruns
+-- every shot.
+local function isWeaponTable(t)
+    if type(t) ~= "table" then return false end
+    if typeof(rawget(t, "barrel_heat")) ~= "number" then return false end
+    local vm = rawget(t, "viewmodel")
+    if type(vm) ~= "table" then return false end
+    local recv = rawget(vm, "receiver")
+    if recv == nil then return false end
+    local ok1, barrel = pcall(function() return recv.barrel end)
+    if not ok1 or barrel == nil then return false end
+    local ok2, isPart = pcall(function() return barrel:IsA("BasePart") end)
+    return ok2 and isPart
+end
+
 -- ============================================================
 -- CONTROLLER SCAN  (one shared, throttled getgc walk)
 -- ============================================================
@@ -690,7 +719,7 @@ end
 --   * the canary capability check rides along instead of re-scanning,
 --   * big heaps are walked in chunks (yield every 8192 entries) so a scan
 --     never blocks a single frame for long.
-local SCAN = { list = {}, t = -math.huge, gcOK = nil, busy = false }
+local SCAN = { list = {}, weapons = {}, t = -math.huge, gcOK = nil, busy = false }
 local SCAN_REUSE = 0.75
 
 local function scanControllers()
@@ -715,6 +744,7 @@ local function scanControllers()
         end
         SCAN.gcOK = true
         local out = {}
+        local weapons = {}
         local sawCanary = false
         local n = #heap
         for i = 1, n do
@@ -723,6 +753,8 @@ local function scanControllers()
                 sawCanary = true
             elseif isDeadlineController(v) then
                 table.insert(out, v)
+            elseif isWeaponTable(v) then
+                table.insert(weapons, v)
             end
             -- spread the walk across frames; pcall guards non-yieldable
             -- contexts (the scan then just runs straight through)
@@ -730,6 +762,7 @@ local function scanControllers()
         end
         SCAN.gcOK = sawCanary
         SCAN.list = out
+        SCAN.weapons = weapons
     end)
     if not ok then
         -- unexpected failure mid-walk: drop the (stale) list but keep the
@@ -739,6 +772,13 @@ local function scanControllers()
     SCAN.t = os.clock()
     SCAN.busy = false
     return SCAN.list
+end
+
+-- weapon tables from the same shared walk (collected alongside the
+-- controller signature - one heap walk serves both)
+local function findWeaponTables()
+    scanControllers()
+    return SCAN.weapons or {}
 end
 
 -- Cached capability answer (the old version ran its own getgc per call).
@@ -1128,10 +1168,13 @@ if type(BALL_STATE.saved) ~= "table" then
     BALL_STATE.saved = setmetatable({}, { __mode = "k" })
 end
 
-local function ammoTableFor(controller)
-    local weapon = rawget(controller, "weapon")
+local function ammoFromWeapon(weapon)
     local br = type(weapon) == "table" and rawget(weapon, "build_result") or nil
     return type(br) == "table" and rawget(br, "ammunition") or nil
+end
+
+local function ammoTableFor(controller)
+    return ammoFromWeapon(type(controller) == "table" and rawget(controller, "weapon") or nil)
 end
 
 local function paintAmmo(amm, mult)
@@ -1462,6 +1505,8 @@ local function zResetStats()
     ZSTAT.ferr, ZSTAT.firstFerr = 0, nil
     ZSTAT.noPoint, ZSTAT.noHit = 0, 0
     ZSTAT.bigVec, ZSTAT.smallVec = 0, 0
+    ZSTAT.nearestBarrel = math.huge
+    ZSTAT.weaponScanCount = 0
     ZSTAT.samples = {}
 end
 zResetStats()
@@ -1625,10 +1670,62 @@ local function compensationActive()
     return Config.Weapons.ZeroedAim or (Config.SilentAim and Config.SilentAim.Enabled)
 end
 
+-- barrel of a weapon table (viewmodel.receiver.barrel), resilient to shape
+local function weaponBarrelOf(w)
+    if type(w) ~= "table" then return nil end
+    local vm = rawget(w, "viewmodel")
+    if type(vm) ~= "table" then return nil end
+    local recv = rawget(vm, "receiver")
+    if recv == nil then return nil end
+    local ok, barrel = pcall(function() return recv.barrel end)
+    if not ok or barrel == nil then return nil end
+    local ok2, isPart = pcall(function() return barrel:IsA("BasePart") end)
+    if ok2 and isPart and barrel.Parent then return barrel end
+    return nil
+end
+
+-- The gun being fired right now: among the cached weapon tables, the one
+-- whose barrel sits exactly at the shot origin. The per-shot validation
+-- doubles as the cache check, so weapon switches self-heal.
+local function findLiveWeapon(pos)
+    local list = ZA_STATE.weaponCache
+    local bestD, bestW, bestB = nil, nil, nil
+    if type(list) == "table" then
+        for _, w in ipairs(list) do
+            local barrel = weaponBarrelOf(w)
+            if barrel then
+                local d = (barrel.WorldPosition - pos).Magnitude
+                if bestD == nil or d < bestD then
+                    bestD, bestW, bestB = d, w, barrel
+                end
+            end
+        end
+    end
+    if bestD and bestD <= 2 then
+        return bestW, bestB, bestD
+    end
+    return nil, nil, bestD
+end
+
+local function refreshWeaponCache()
+    local list = findWeaponTables()
+    if type(list) == "table" and #list > 0 then
+        ZA_STATE.weaponCache = list
+    elseif ZA_STATE.weaponCache == nil then
+        ZA_STATE.weaponCache = list or {}
+    end
+end
+
 -- called from the masked wrapper right before each shot's origin write
 local function zeroedOnOriginWrite(vec)
     if typeof(vec) ~= "Vector3" then
         ZSTAT.badArg = ZSTAT.badArg + 1
+        return
+    end
+    -- direction writes are unit vectors - only origin writes (world
+    -- positions) can be matched against a barrel
+    if vec.Magnitude < 5 then
+        ZSTAT.dirSkip = ZSTAT.dirSkip + 1
         return
     end
     if vec.Magnitude > 50 then
@@ -1644,18 +1741,29 @@ local function zeroedOnOriginWrite(vec)
         ZSTAT.inactive = ZSTAT.inactive + 1
         return
     end
-    local controller, weapon, barrel = localWeaponBarrel()
+    local weapon, barrel, nearest = findLiveWeapon(vec)
+    if not barrel then
+        -- fallback: the lobby-style controller cache
+        local controller, cweapon, cbarrel = localWeaponBarrel()
+        if cbarrel then
+            local d = (vec - cbarrel.WorldPosition).Magnitude
+            if d <= 2 then
+                weapon = cweapon or (controller and rawget(controller, "weapon"))
+                barrel = cbarrel
+            elseif nearest == nil or d < nearest then
+                nearest = d
+            end
+        end
+    end
     if not barrel then
         ZSTAT.noBarrel = ZSTAT.noBarrel + 1
+        if nearest ~= nil and nearest < ZSTAT.nearestBarrel then
+            ZSTAT.nearestBarrel = nearest
+        end
+        ZA_STATE.wantScan = true
         return
     end
-    local gd = (vec - barrel.WorldPosition).Magnitude
-    if gd > 2 then
-        ZSTAT.guardMiss = ZSTAT.guardMiss + 1
-        if gd < ZSTAT.nearestMiss then ZSTAT.nearestMiss = gd end
-        return
-    end
-    local amm = ammoTableFor(controller)
+    local amm = ammoFromWeapon(weapon)
     if type(amm) ~= "table" then
         ZSTAT.noAmmo = ZSTAT.noAmmo + 1
         return
@@ -1669,7 +1777,7 @@ local function zeroedOnOriginWrite(vec)
         if not silentAimPointFinder then
             ZSTAT.noFinder = ZSTAT.noFinder + 1
         else
-            local ok, pt = pcall(silentAimPointFinder, vec, barrel, controller)
+            local ok, pt = pcall(silentAimPointFinder, vec, barrel, weapon)
             if not ok then
                 ZSTAT.ferr = ZSTAT.ferr + 1
                 if not ZSTAT.firstFerr then ZSTAT.firstFerr = tostring(pt) end
@@ -1786,6 +1894,10 @@ local function applyZeroed()
         via = via .. (" (%d gc candidates)"):format(ZA_STATE.gcCount)
     end
     print("[deadline] aim module armed via " .. via)
+    task.spawn(function()
+        if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
+        pcall(refreshWeaponCache)
+    end)
     return true
 end
 
@@ -1867,6 +1979,10 @@ track(RunService.RenderStepped:Connect(function()
     zaWarm = zaWarm + 1
     if zaWarm >= 180 then
         zaWarm = 0
+        if ZA_STATE.wantScan or not (ZA_STATE.weaponCache and #ZA_STATE.weaponCache > 0) then
+            ZA_STATE.wantScan = nil
+            pcall(refreshWeaponCache)
+        end
         local _, _, barrel = localWeaponBarrel()
         if not barrel then pcall(refreshControllerCache) end
     end
@@ -1878,10 +1994,12 @@ track(RunService.RenderStepped:Connect(function()
         return
     end
     local armed = ZA_STATE.mod and tostring(ZA_STATE.foundVia or "?") or "no"
-    print(("[deadline] aim 5s (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s]")
+    local cands = (type(ZA_STATE.weaponCache) == "table" and #ZA_STATE.weaponCache) or 0
+    print(("[deadline] aim 5s (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d nearestBarrel=%s cands=%d noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s]")
         :format(armed, ZSTAT.calls, ZSTAT.bigVec, ZSTAT.smallVec, ZSTAT.badArg,
             ZSTAT.tilt, ZSTAT.dirSkip, ZSTAT.guardMiss,
-            zaFmtNum(ZSTAT.nearestMiss), ZSTAT.noBarrel, ZSTAT.noAmmo, ZSTAT.silentNone,
+            zaFmtNum(ZSTAT.nearestMiss), ZSTAT.noBarrel, zaFmtNum(ZSTAT.nearestBarrel), cands,
+            ZSTAT.noAmmo, ZSTAT.silentNone,
             ZSTAT.silentHit, zaFmtNum(ZSTAT.nearestAng, "deg"), ZSTAT.noSolve, ZSTAT.badLocal,
             ZSTAT.noPoint, ZSTAT.noHit, ZSTAT.noFinder, ZSTAT.inactive,
             ZSTAT.errs, ZSTAT.ferr,
@@ -2170,7 +2288,7 @@ end
 -- declaration. Runs at the instant of each shot: the nearest rig whose
 -- head sits within SilentAim.MaxAngle of the barrel direction wins, then
 -- the aim point gets a one-step lead along the target's velocity.
-silentAimPointFinder = function(origin, barrel, controller)
+silentAimPointFinder = function(origin, barrel, weapon)
     local cfg = Config.SilentAim
     if not cfg or not cfg.Enabled then return nil end
     local b = barrel.WorldCFrame.LookVector
@@ -2201,7 +2319,7 @@ silentAimPointFinder = function(origin, barrel, controller)
         return nil
     end
     -- one-step lead for moving targets
-    local amm = ammoTableFor(controller)
+    local amm = ammoFromWeapon(weapon)
     if type(amm) == "table" then
         local v = tonumber(rawget(amm, "velocity"))
         local d = tonumber(rawget(amm, "velocity_drop")) or 0
