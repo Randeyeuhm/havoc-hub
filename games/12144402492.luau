@@ -61,6 +61,24 @@
                           timeout (the sim cost tanks FPS).
                           Client-local; same risk class as the velocity
                           slider.
+          Zeroed Aim    - far-range hitreg done the right way. The server
+                          validates every shot against its OWN vanilla
+                          flight model, so anything that changes the arc
+                          (x15 velocity, zero drop) gets far hits rejected.
+                          This keeps the model 100% vanilla and instead
+                          pitches the launch UP by exactly the drop at the
+                          distance you are aiming at - the round arcs and
+                          lands on the crosshair, and the server's sim
+                          agrees at every range. The weapon builds ONE
+                          direction for both the local sim and the server
+                          buffer (from the barrel), so the shot gets zeroed
+                          by tilting the barrel part for the shot's
+                          synchronous span; the trigger is the shot-origin
+                          write on NetworkEncode.write_exact_position
+                          (module-table call, wrapper env-masked like the
+                          drop wrappers). Solved with the game's own path
+                          formula. Forces x1 velocity; mutually exclusive
+                          with No Bullet Drop.
           Steady Aim    - arm stamina drains -> 0 + breathing shake -> 0
                           (shake = (1 - arm_stamina/max) * shake_mult, L364597)
           Infinite Stam - sprint / lean / jump / vault drains -> 0
@@ -93,10 +111,16 @@
           until you rejoin (double-click confirm; test only).
       • Aimbot / ESP - built around the match rigs: characters live in
           Workspace.characters as <UserId>-named models (custom rig: head /
-          humanoid_root_part / torso_hitbox / *_vis - no Humanoid). The game
-          sets them as the players' .Character, so names resolve through
-          GetPlayerFromCharacter; the shared esp.luau library got rig
-          fallbacks (humanoid_root_part / lowercase head).
+          humanoid_root_part / torso_hitbox / *_vis - no Humanoid). Rig
+          names resolve through the engine link, then hidden-character-
+          tolerant UserId matching, then a direct scan of the server's
+          players (name / display name / UserId in the model name) - and
+          the ESP tab has a "Name check" button that prints exactly what
+          every rig resolves to. The aimbot's visibility check now ignores
+          the game's own workspace.ignore folder (viewmodels and effects
+          live there - they used to block every ray, so no target ever
+          passed) and the aim lock binds in the LAST render slot so the
+          game's late camera updates can't overwrite it.
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -133,6 +157,7 @@ if setstackhidden then pcall(setstackhidden, true) end
 -- SERVICES / STATE
 -- ============================================================
 local Players          = game:GetService("Players")
+local Workspace        = game:GetService("Workspace")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local HttpService      = game:GetService("HttpService")
@@ -158,7 +183,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v35c"
+local SCRIPT_VERSION = "dl-v36"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -184,9 +209,13 @@ local DEFAULTS = {
                            -- injection - see FAST RELOAD section)
         ZeroWeight = false,-- walk at weightless speed: overrides.speed =
                            -- weight/10 + 1 cancels the weight divisor
-        BulletVelocity = 15,-- muzzle velocity x15 (drop ~gone; see BALLISTICS)
+        BulletVelocity = 1, -- muzzle velocity (x1 = vanilla; high values
+                           -- fly flatter but break server hitreg - see
+                           -- BALLISTICS / Zeroed Aim)
         Wallbang = 1,      -- projectile penetration multiplier (x1 vanilla)
         NoBulletDrop = false, -- zero the caster's gravity upvalue (dead straight)
+        ZeroedAim = false, -- server-agreeing far-range hitreg: vanilla arc,
+                           -- pitched up to land on the crosshair (x1 velocity)
         SteadyAim = false, -- arm stamina drains + breathing shake -> 0
         InfStamina = false,-- sprint / lean / jump / vault drains -> 0
         ZeroSway = false,  -- walk bob + look sway -> 0 (knob + live spring stubs)
@@ -272,7 +301,7 @@ Config.Weapons.ReloadSpeed = math.clamp(tonumber(Config.Weapons.ReloadSpeed) or 
 -- Ballistics: Bullet Velocity multiplies the muzzle velocity written on the
 -- weapon build (see BALLISTICS section); Wallbang scales the game's live
 -- projectile penetration multiplier.
-Config.Weapons.BulletVelocity = math.clamp(tonumber(Config.Weapons.BulletVelocity) or 15, 1, 50)
+Config.Weapons.BulletVelocity = math.clamp(tonumber(Config.Weapons.BulletVelocity) or 1, 1, 50)
 Config.Weapons.Wallbang = math.clamp(tonumber(Config.Weapons.Wallbang) or 1, 1, 100)
 
 -- Fullbright intensity: ambient grey level (matches the sibling scripts).
@@ -1340,6 +1369,216 @@ track(RunService.RenderStepped:Connect(function()
 end))
 
 -- ============================================================
+-- ZEROED AIM  (dl-v36 - far-range hitreg, vanilla flight model)
+-- ============================================================
+-- The server validates shots against its own copy of the flight model
+-- (vanilla velocity / drag / gravity), so x15 bullets or zero drop change
+-- the arc on the wrong side of that check. Zeroed Aim keeps everything
+-- vanilla and only pitches the launch up by exactly the drop at the
+-- distance the player is aiming at - the round arcs onto the crosshair and
+-- the server's simulation agrees at every range.
+--
+-- One direction feeds both the local sim and the server buffer (the weapon
+-- builds it from the barrel: barrel.WorldCFrame * deviation), so the shot
+-- is zeroed by tilting the BARREL part for the shot's synchronous span.
+-- Trigger: NetworkEncode.write_exact_position - called on the module table,
+-- once per shot with the shot ORIGIN, right after the buffer is made and
+-- right before the barrel is read. The wrapper is environment-masked like
+-- the drop wrappers (this module carries the same getfenv honeypot).
+-- Math: the game's own path  pos = origin + dir*(v*t/(t*d+1)) + g*t^2 +
+-- wind*t^2*4  ->  solve t with |A - gv*t^2 - wind*4t^2| = travel(t), then
+-- phi = pitch(required launch) - pitch(aim direction).
+local ZA_STATE = genv.__HAVOC_DEADLINE_ZA
+if type(ZA_STATE) ~= "table" then
+    ZA_STATE = { mod = nil, orig = nil, tilted = nil, blocked = nil, warned = nil }
+    genv.__HAVOC_DEADLINE_ZA = ZA_STATE
+end
+-- restore a tilt left behind by an earlier run before anything else
+if ZA_STATE.tilted then
+    local t = ZA_STATE.tilted
+    ZA_STATE.tilted = nil
+    pcall(function()
+        if t.barrel and t.saved then t.barrel.CFrame = t.saved end
+    end)
+end
+
+local function findNetworkEncode()
+    local mod = ReplicatedStorage:FindFirstChild("module")
+    mod = mod and mod:FindFirstChild("namespace")
+    mod = mod and mod:FindFirstChild("NetworkEncode")
+    if not mod then return nil end
+    local ok, res = pcall(function() return require(mod) end)
+    if ok and type(res) == "table" and type(rawget(res, "write_exact_position")) == "function" then
+        return res
+    end
+    return nil
+end
+
+local function localWeaponBarrel()
+    for controller in pairs(CTRL_STATE.tracked) do
+        if type(controller) == "table" then
+            local cd = rawget(controller, "char_data")
+            if type(cd) == "table" and isLocalCharData(controller, cd) then
+                local weapon = rawget(controller, "weapon")
+                local vm = type(weapon) == "table" and rawget(weapon, "viewmodel") or nil
+                local recv = type(vm) == "table" and rawget(vm, "receiver") or nil
+                local barrel = type(recv) == "table" and rawget(recv, "barrel") or nil
+                local isPart = false
+                if barrel then
+                    local ok, res = pcall(function() return barrel:IsA("BasePart") end)
+                    isPart = ok and res
+                end
+                if isPart and barrel.Parent then
+                    return controller, weapon, barrel
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- phi that lands the bullet on the raycast point (or nil when impossible)
+local function zeroedPhi(origin, hitPos, velocity, drop)
+    local A = hitPos - origin
+    local L = A.Magnitude
+    if L < 8 then return nil end
+    local v = tonumber(velocity) or 0
+    if v < 5 then return nil end
+    local d = tonumber(drop) or 0
+    if d < 0 then d = 0 end
+    local g = Workspace.Gravity
+    if not g or g <= 0 then return nil end
+    local gv = Vector3.new(0, -g, 0)
+    local wind = Workspace.GlobalWind
+    local t = L / v
+    for _ = 1, 5 do
+        local tt = t * t
+        local R = A - gv * tt - wind * (tt * 4)
+        local Rm = R.Magnitude
+        if Rm < 1 then return nil end
+        local den = v - Rm * d
+        t = (den > 1) and (Rm / den) or (Rm / v)
+    end
+    local tt = t * t
+    local R = A - gv * tt - wind * (tt * 4)
+    if R.Magnitude < 1 then return nil end
+    local launch = R.Unit
+    local aimU = A.Unit
+    local phi = math.asin(math.clamp(launch.Y, -1, 1)) - math.asin(math.clamp(aimU.Y, -1, 1))
+    return math.clamp(phi, -0.25, 0.25)
+end
+
+-- called from the masked wrapper right before each shot's origin write
+local function zeroedOnOriginWrite(vec)
+    if not Config.Weapons.ZeroedAim then return end
+    if type(vec) ~= "Vector3" then return end
+    if ZA_STATE.tilted then return end
+    local controller, weapon, barrel = localWeaponBarrel()
+    if not barrel then return end
+    if (vec - barrel.WorldPosition).Magnitude > 2 then return end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local ignoreList = {}
+    if LocalPlayer.Character then ignoreList[#ignoreList + 1] = LocalPlayer.Character end
+    local cam = Workspace.CurrentCamera
+    if cam then ignoreList[#ignoreList + 1] = cam end
+    local ig = Workspace:FindFirstChild("ignore")
+    if ig then ignoreList[#ignoreList + 1] = ig end
+    params.FilterDescendantsInstances = ignoreList
+    local hit = Workspace:Raycast(vec, barrel.WorldCFrame.LookVector * 4000, params)
+    if not hit then return end
+    local amm = ammoTableFor(controller)
+    if type(amm) ~= "table" then return end
+    local v = tonumber(rawget(amm, "velocity"))
+    local d = tonumber(rawget(amm, "velocity_drop")) or 0
+    local phi = zeroedPhi(vec, hit.Position, v, d)
+    if not phi then return end
+    local saved = barrel.CFrame
+    barrel.CFrame = saved * CFrame.Angles(phi, 0, 0)
+    ZA_STATE.tilted = { barrel = barrel, saved = saved, at = os.clock() }
+end
+
+local function makeZeroedWrapper(orig)
+    local fpcall = pcall
+    local function wrapper(buf, vec)
+        if Config.Weapons.ZeroedAim and vec ~= nil then
+            fpcall(zeroedOnOriginWrite, vec)
+        end
+        return orig(buf, vec)
+    end
+    return wrapper
+end
+
+-- Returns ok, err. Never notifies.
+local function applyZeroed()
+    if ZA_STATE.mod and ZA_STATE.orig then
+        local mod, orig = ZA_STATE.mod, ZA_STATE.orig
+        pcall(function() mod.write_exact_position = orig end)
+        ZA_STATE.mod, ZA_STATE.orig = nil, nil
+    end
+    if not Config.Weapons.ZeroedAim then return true end
+    local mod = findNetworkEncode()
+    if not mod then
+        return false, "NetworkEncode not replicated yet"
+    end
+    local orig = rawget(mod, "write_exact_position")
+    if type(orig) ~= "function" then return false, "write_exact_position missing" end
+    local wrapper = makeZeroedWrapper(orig)
+    local masked = false
+    if type(setfenv) == "function" and type(getfenv) == "function" then
+        masked = pcall(function() setfenv(wrapper, getfenv(orig)) end)
+    end
+    if not masked then
+        ZA_STATE.blocked = "cannot mask wrapper environment (setfenv)"
+        return false, ZA_STATE.blocked
+    end
+    mod.write_exact_position = wrapper
+    ZA_STATE.mod, ZA_STATE.orig = mod, orig
+    return true
+end
+
+-- The tilt only has to survive the shot's synchronous slice (no frame can
+-- render inside it), so the barrel is restored every frame it is still
+-- tilted - before any render that could see it.
+track(RunService.RenderStepped:Connect(function()
+    local t = ZA_STATE.tilted
+    if not t then return end
+    ZA_STATE.tilted = nil
+    pcall(function()
+        if t.barrel and t.saved and t.barrel.Parent then
+            t.barrel.CFrame = t.saved
+        end
+    end)
+end))
+
+-- Retry arming once a second while enabled but not installed (e.g. toggled
+-- before the module replicated); keeps the controller cache warm so the
+-- barrel can be found.
+local zaRetry = 0
+track(RunService.RenderStepped:Connect(function()
+    if not Config.Weapons.ZeroedAim then
+        zaRetry = 0
+        return
+    end
+    if ZA_STATE.mod then
+        zaRetry = 0
+        return
+    end
+    zaRetry = zaRetry + 1
+    if zaRetry >= 60 then
+        zaRetry = 0
+        if next(CTRL_STATE.tracked) == nil then
+            pcall(refreshControllerCache)
+        end
+        local ok, err = applyZeroed()
+        if not ok and not ZA_STATE.warned then
+            ZA_STATE.warned = true
+            warn("[deadline] zeroed aim inactive: " .. tostring(err))
+        end
+    end
+end))
+
+-- ============================================================
 -- AUDIO: NO DEAFNESS  (death + explosion hearing loss, ringing)
 -- ============================================================
 -- The game deafens the mix with two cloned sound effects:
@@ -1546,25 +1785,51 @@ local function rigHead(model)
     return model:FindFirstChild("head") or model:FindFirstChild("Head") or rigRoot(model)
 end
 
--- Player behind a rig: the engine character link when it exists, else the
--- <UserId> model name (the game itself resolves players this way - remote
--- rigs are not always linked to a Player object client-side).
+-- Player behind a rig. The engine link is tried first; remote rigs are
+-- not always linked client-side, so fall back to the numeric name the game
+-- itself builds them with (tolerating hidden characters), and finally to a
+-- direct scan of the server's players (name / display name / UserId).
 local function rigPlayer(model)
     local p = Players:GetPlayerFromCharacter(model)
     if p then return p end
-    local uid = tonumber(model.Name)
-    if uid then return Players:GetPlayerByUserId(uid) end
+    if ESPUI and ESPUI.resolvePlayer then
+        local ok, res = pcall(ESPUI.resolvePlayer, model)
+        if ok and res then return res end
+    end
+    local compact = model.Name:gsub("[%s\194\160\226\128\139]", "")
+    local uid = tonumber(compact) or tonumber(string.match(compact, "%d+"))
+    if uid then
+        p = Players:GetPlayerByUserId(uid)
+        if p then return p end
+    end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if model.Name == plr.Name or model.Name == plr.DisplayName
+            or compact == tostring(plr.UserId) then
+            return plr
+        end
+    end
     return nil
 end
 
--- Ray from the camera to a point, ignoring our own rig and the target.
+-- Ray from the camera to a point, ignoring our own rig, the target, the
+-- camera's viewmodel and the game's own ignore folder. The viewmodels,
+-- effects and projectiles live under workspace.ignore in this game -
+-- without that exclude every ray hit the local viewmodel and NO target
+-- ever passed (which silently killed the aimbot's visible check).
 local function isVisible(targetModel, camPos, targetPos)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     local ignore = { targetModel }
     if LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
     local cam = workspace.CurrentCamera
-    if cam then table.insert(ignore, cam) end
+    if cam then
+        table.insert(ignore, cam)
+        for _, d in ipairs(cam:GetDescendants()) do
+            ignore[#ignore + 1] = d
+        end
+    end
+    local ignoreFolder = workspace:FindFirstChild("ignore")
+    if ignoreFolder then table.insert(ignore, ignoreFolder) end
     params.FilterDescendantsInstances = ignore
     return workspace:Raycast(camPos, targetPos - camPos, params) == nil
 end
@@ -1992,6 +2257,59 @@ local function refreshStatus()
     end
 end
 
+-- Console readout for rig -> player resolution: run it in a live match and
+-- the output answers exactly why a name shows as "NPC: <id>".
+local function rigNameCheck()
+    print("[deadline] name check - players in this server:")
+    for _, plr in ipairs(Players:GetPlayers()) do
+        print(("    %s  /  %s  (UserId %d)"):format(plr.Name, plr.DisplayName, plr.UserId))
+    end
+    local folder = characterFolder()
+    if folder then
+        print("[deadline] name check - rigs:")
+        for _, model in ipairs(folder:GetChildren()) do
+            if model:IsA("Model") then
+                local p = rigPlayer(model)
+                print(("    '%s' -> %s"):format(model.Name,
+                    p and (("%s / %s"):format(p.Name, p.DisplayName)) or "UNRESOLVED"))
+            end
+        end
+    end
+    notify("Name check printed to the console (F9)")
+end
+
+-- One-shot aimbot health readout: how many rigs exist, how many sit inside
+-- the FOV circle right now and how many pass the visibility check.
+local function aimbotDiagnostics()
+    local cam = workspace.CurrentCamera
+    local mouse = UserInputService:GetMouseLocation()
+    local cfg = Config.Aimbot
+    local rigs, inFov, visible = 0, 0, 0
+    eachEnemyRig(function(model, root)
+        rigs = rigs + 1
+        local head = rigHead(model) or root
+        if cam then
+            local sp = cam:WorldToViewportPoint(head.Position)
+            if sp.Z > 0 and (Vector2.new(sp.X, sp.Y) - mouse).Magnitude <= cfg.FOV then
+                inFov = inFov + 1
+                local ok, vis = pcall(isVisible, model, cam.CFrame.Position, head.Position)
+                if ok and vis then visible = visible + 1 end
+            end
+        end
+    end)
+    print(("[deadline] aimbot check - enabled:%s mode:%s rigs:%d inFOV:%d visible:%d fov:%dpx visibleOnly:%s")
+        :format(tostring(cfg.Enabled), cfg.Mode, rigs, inFov, visible, cfg.FOV, tostring(cfg.VisibleOnly)))
+    if rigs == 0 then
+        notify("Aimbot check: no rigs in Workspace.characters")
+    elseif inFov == 0 then
+        notify(("Aimbot check: %d rig(s), none inside the %dpx FOV circle"):format(rigs, cfg.FOV))
+    elseif visible == 0 and cfg.VisibleOnly then
+        notify(("Aimbot check: %d rig(s) in FOV but all blocked"):format(inFov))
+    else
+        notify(("Aimbot check: %d rig(s), %d in FOV, %d visible"):format(rigs, inFov, visible))
+    end
+end
+
 local function buildMenu()
     local viewport = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(1920, 1080)
     local winW = math.clamp(viewport.X - 60, 380, 500)
@@ -2097,6 +2415,9 @@ local function buildMenu()
     toggle(pa, "Visible Check",
         function() return Config.Aimbot.VisibleOnly end,
         function(v) Config.Aimbot.VisibleOnly = v end)
+    button(pa, "Run aimbot check", function()
+        pcall(aimbotDiagnostics)
+    end)
     bindrow(pa, hotkeyById.ToggleAimbot)
 
     -- ---------------- ESP ----------------
@@ -2116,6 +2437,9 @@ local function buildMenu()
     toggle(pe, "NPCs",
         function() return Config.ESP.NPCs end,
         function(v) Config.ESP.NPCs = v end)
+    button(pe, "Name check (console)", function()
+        pcall(rigNameCheck)
+    end)
     slider(pe, "Max Distance",
         function() return Config.ESP.MaxDistance end,
         function(v) Config.ESP.MaxDistance = v end, 100, 100, 10000)
@@ -2247,6 +2571,12 @@ local function buildMenu()
         function() return Config.Weapons.BulletVelocity end,
         function(v)
             Config.Weapons.BulletVelocity = v
+            if v > 1 and Config.Weapons.ZeroedAim then
+                Config.Weapons.ZeroedAim = false
+                pcall(applyZeroed)
+                notify("Zeroed aim off - it needs x1 bullet velocity")
+                refreshGUI()
+            end
             refreshStatus()
         end, 1, 1, 50, function(v) return ("%g×"):format(v) end)
     slider(p1, "Wallbang",
@@ -2260,6 +2590,12 @@ local function buildMenu()
         function() return Config.Weapons.NoBulletDrop end,
         function(v)
             Config.Weapons.NoBulletDrop = v
+            if v and Config.Weapons.ZeroedAim then
+                Config.Weapons.ZeroedAim = false
+                pcall(applyZeroed)
+                notify("Zeroed aim off - it needs real bullet drop")
+                refreshGUI()
+            end
             DROP_STATE.warned = nil
             local ok, err = applyNoDrop()
             if v and not ok then
@@ -2267,6 +2603,42 @@ local function buildMenu()
                 notify("No bullet drop on - waiting for the game module (auto-retries)")
             else
                 notify(v and "No bullet drop: bullets fly dead straight" or "Bullet drop restored")
+            end
+            refreshStatus()
+        end)
+    toggle(p1, "Zeroed Aim",
+        function() return Config.Weapons.ZeroedAim end,
+        function(v)
+            Config.Weapons.ZeroedAim = v
+            if v then
+                if Config.Weapons.NoBulletDrop then
+                    Config.Weapons.NoBulletDrop = false
+                    pcall(applyNoDrop)
+                end
+                if (tonumber(Config.Weapons.BulletVelocity) or 1) > 1 then
+                    Config.Weapons.BulletVelocity = 1
+                    pcall(ballisticsRestore)
+                    pcall(applyBallistics)
+                end
+                ZA_STATE.warned = nil
+                local ok, err = applyZeroed()
+                if not ok then
+                    warn("[deadline] zeroed aim not armed yet: " .. tostring(err))
+                    notify("Zeroed aim on - waiting for the game module (auto-retries)")
+                else
+                    notify("Zeroed aim: shots arc onto the crosshair - far hits register")
+                end
+                refreshGUI()
+            else
+                pcall(applyZeroed)
+                if ZA_STATE.tilted then
+                    local t = ZA_STATE.tilted
+                    ZA_STATE.tilted = nil
+                    pcall(function()
+                        if t.barrel and t.saved then t.barrel.CFrame = t.saved end
+                    end)
+                end
+                notify("Zeroed aim off")
             end
             refreshStatus()
         end)
@@ -2417,6 +2789,7 @@ local function buildMenu()
         w.BulletVelocity = 1
         w.Wallbang = 1
         w.NoBulletDrop = false
+        w.ZeroedAim = false
         m.Fullbright = false
         m.FullbrightIntensity = 190
         pcall(unstubSwaySprings)
@@ -2425,6 +2798,7 @@ local function buildMenu()
         pcall(ballisticsRestore)
         pcall(applyBallistics)
         pcall(applyNoDrop)
+        pcall(applyZeroed)
         pcall(setFullbright, false)
         applyAll()
         refreshGUI()
@@ -2468,9 +2842,10 @@ track(RunService.RenderStepped:Connect(function()
     pcall(updateFovCircle, UserInputService:GetMouseLocation())
 end))
 
--- The game's camera module rewrites Camera.CFrame every frame, so the
--- aim lock binds at Camera priority + 1 (same slot Havoc's aimbot uses).
-RunService:BindToRenderStep("HavocHubDeadlineAim", Enum.RenderPriority.Camera.Value + 1, function()
+-- The game's camera module rewrites Camera.CFrame every frame and parts of
+-- the controller run late, so the aim lock binds in the LAST render slot -
+-- it is the final word on the camera before the frame renders.
+RunService:BindToRenderStep("HavocHubDeadlineAim", Enum.RenderPriority.Last.Value - 1, function()
     if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
     local cam = workspace.CurrentCamera
     if not cam then return end
@@ -2515,7 +2890,12 @@ task.spawn(function()
     pcall(applyBallistics)
     -- no-bullet-drop reconcile: applyNoDrop clears any wrappers left by an
     -- earlier run, then re-arms when enabled (fresh place = fresh module)
+    if Config.Weapons.ZeroedAim and Config.Weapons.NoBulletDrop then
+        Config.Weapons.NoBulletDrop = false
+    end
     pcall(applyNoDrop)
+    -- zeroed-aim reconcile: re-arm the shot-origin wrapper when enabled
+    pcall(applyZeroed)
     pcall(setFullbright, Config.Misc.Fullbright)
     if Config.Weapons.NoDeaf then
         pcall(applyNoDeaf, true)

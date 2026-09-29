@@ -314,15 +314,41 @@ local function localCharRoot()
 end
 ESP.getLocalRoot = localCharRoot
 
-local function entityName(model, nameSource)
+-- Robust rig -> player resolution, shared by every game script. Custom
+-- rig systems (Deadline: Workspace.characters/<UserId>) don't always link
+-- .Character client-side and model names can carry hidden characters, so:
+-- engine link -> exact UserId name -> digit extraction -> per-player scan
+-- (username / display name / UserId contained in the model name).
+-- Positives are cached per model (weak keys); misses are retried, player
+-- lists change.
+local resolvedRigCache = setmetatable({}, { __mode = "k" })
+local function resolvePlayer(model)
+    local cached = resolvedRigCache[model]
+    if cached then return cached end
     local p = Players:GetPlayerFromCharacter(model)
     if not p then
-        -- Custom rig systems (Deadline: Workspace.characters/<UserId>) don't
-        -- always link .Character for remote players client-side - fall back
-        -- to resolving the model's UserId name the way the game itself does.
-        local uid = tonumber(model.Name)
-        if uid then p = Players:GetPlayerByUserId(uid) end
+        local compact = model.Name:gsub("[%s\194\160\226\128\139]", "")
+        local uid = tonumber(compact) or tonumber(string.match(compact, "%d+"))
+        if uid then
+            p = Players:GetPlayerByUserId(uid)
+        end
+        if not p then
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if model.Name == plr.Name or model.Name == plr.DisplayName
+                    or compact == tostring(plr.UserId) then
+                    p = plr
+                    break
+                end
+            end
+        end
     end
+    if p then resolvedRigCache[model] = p end
+    return p
+end
+ESP.resolvePlayer = resolvePlayer
+
+local function entityName(model, nameSource)
+    local p = resolvePlayer(model)
     if p then
         if nameSource == "DisplayName" then return p.DisplayName end
         return p.Name
