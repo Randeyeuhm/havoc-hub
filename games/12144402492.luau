@@ -198,6 +198,14 @@
           attachment's LOCAL CFrame (parent receiver part CFrame ->
           object-space desired world frame) with a method-aware restore
           (part / cframe / world); the report adds tm= (tilt method).
+          dl-v45: performance pass - the fallback heap walks (controller
+          cache + weapon scan) now only run when the weapon-table route
+          is actually dead (previously a full getgc heap walk fired every
+          ~3s because the match controllers never matched the lobby
+          signature), and telemetry is quiet while shots redirect (it
+          prints only when a shot fails to tilt, and never triggers a
+          walk itself). The viewmodel barrel list self-refreshes on a
+          miss (cheap instance walk) so weapon switches stay seamless.
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -260,7 +268,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v44"
+local SCRIPT_VERSION = "dl-v45"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -812,6 +820,11 @@ end
 -- at all (diagnosis for the case the candidate list stays empty)
 local function findWeaponDiag()
     scanControllers()
+    return SCAN.weaponDiag or {}
+end
+
+-- cached read only - the telemetry report must NEVER trigger a heap walk
+local function weaponDiagCached()
     return SCAN.weaponDiag or {}
 end
 
@@ -1814,6 +1827,7 @@ local function refreshVMB()
         end
     end
     ZA_STATE.vmBarrels = list
+    ZA_STATE.vmbAt = os.clock()
     return list
 end
 
@@ -1822,19 +1836,31 @@ local function findVMB(pos)
     if not (type(list) == "table" and #list > 0) then
         list = refreshVMB()
     end
-    local best, bestD = nil, nil
-    if type(list) == "table" then
-        for _, barrel in ipairs(list) do
+    local function scan(l)
+        local best, bestD = nil, nil
+        for _, barrel in ipairs(l) do
             if zmBarrelLike(barrel) and barrel.Parent then
                 local d = (barrel.WorldPosition - pos).Magnitude
                 if bestD == nil or d < bestD then bestD, best = d, barrel end
             end
         end
+        return best, bestD
     end
+    local best, bestD = scan(list)
     if best and bestD <= 2 then
         return best, bestD
     end
-    return nil, bestD
+    -- stale list (weapon switch): one forced refresh, cheap instance walk
+    local now = os.clock()
+    if not (ZA_STATE.vmbAt and now - ZA_STATE.vmbAt < 2) then
+        list = refreshVMB()
+        local b2, d2 = scan(list)
+        if b2 and d2 <= 2 then return b2, d2 end
+        if d2 ~= nil and (bestD == nil or d2 < bestD) then
+            best, bestD = b2, d2
+        end
+    end
+    return best, bestD
 end
 
 -- The gun being fired right now: among the cached weapon tables, the one
@@ -2188,21 +2214,36 @@ end
 track(RunService.RenderStepped:Connect(function()
     if not compensationActive() then return end
     zaWarm = zaWarm + 1
-    if zaWarm >= 180 then
+    if zaWarm >= 300 then
         zaWarm = 0
-        if ZA_STATE.wantScan or not (ZA_STATE.weaponCache and #ZA_STATE.weaponCache > 0) then
+        local haveWeapons = ZA_STATE.weaponCache and #ZA_STATE.weaponCache > 0
+        if ZA_STATE.wantScan or not haveWeapons then
             ZA_STATE.wantScan = nil
             pcall(refreshWeaponCache)
+            haveWeapons = ZA_STATE.weaponCache and #ZA_STATE.weaponCache > 0
         end
-        pcall(refreshVMB)
-        local _, _, barrel = localWeaponBarrel()
-        if not barrel then pcall(refreshControllerCache) end
+        -- the expensive fallback caches (full heap walks) only matter when
+        -- the weapon-table route is dead - healthy play stays walk-free
+        if not haveWeapons then
+            pcall(refreshVMB)
+            local _, _, barrel = localWeaponBarrel()
+            if not barrel then pcall(refreshControllerCache) end
+        end
     end
     local now = os.clock()
-    if now - zaReportAt < 5 then return end
+    if now - zaReportAt < 10 then return end
     zaReportAt = now
     if ZSTAT.calls <= 0 then
         ZSTAT.nearestMiss, ZSTAT.nearestAng, ZSTAT.firstErr = math.huge, math.huge, nil
+        return
+    end
+    if ZSTAT.tilt > 0 then
+        -- healthy: shots are being redirected - quiet mode, zero spam
+        if not ZA_STATE.quietNoted then
+            ZA_STATE.quietNoted = true
+            print("[deadline] aim telemetry: healthy - quiet mode (report prints only if shots stop redirecting)")
+        end
+        zResetStats()
         return
     end
     local armed = ZA_STATE.mod and tostring(ZA_STATE.foundVia or "?") or "no"
@@ -2214,13 +2255,13 @@ track(RunService.RenderStepped:Connect(function()
             if weaponBarrelOf(w) then barrelsN = barrelsN + 1 end
         end
     end
-    local wd = findWeaponDiag()
+    local wd = weaponDiagCached()
     local vmb = (type(ZA_STATE.vmBarrels) == "table" and #ZA_STATE.vmBarrels) or 0
     local wprobe = "-"
     if type(cache) == "table" and cache[1] ~= nil then
         wprobe = zaWeaponProbeString(cache[1])
     end
-    print(("[deadline] aim 5s (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d tm=%s dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d nearestBarrel=%s cands=%d barrels=%d vmb=%d wd(bh=%d vm=%d) noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s] wprobe=[%s]")
+    print(("[deadline] aim diag (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d tm=%s dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d nearestBarrel=%s cands=%d barrels=%d vmb=%d wd(bh=%d vm=%d) noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s] wprobe=[%s]")
         :format(armed, ZSTAT.calls, ZSTAT.bigVec, ZSTAT.smallVec, ZSTAT.badArg,
             ZSTAT.tilt, tostring(ZSTAT.tiltMethod or "-"), ZSTAT.dirSkip, ZSTAT.guardMiss,
             zaFmtNum(ZSTAT.nearestMiss), ZSTAT.noBarrel, zaFmtNum(ZSTAT.nearestBarrel), cands,
