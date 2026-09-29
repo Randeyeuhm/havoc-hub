@@ -110,13 +110,12 @@
           getenv honeypot then prints its taunt and busy-loops a thread
           until you rejoin (double-click confirm; test only).
       • Aimbot / ESP - built around the match rigs: characters live in
-          Workspace.characters as <UserId>-named models (custom rig: head /
+          Workspace.characters as session-id-named models (custom rig: head /
           humanoid_root_part / torso_hitbox / *_vis - no Humanoid). Rig
           names resolve through the engine link, then hidden-character-
-          tolerant UserId matching, then a direct scan of the server's
-          players (name / display name / UserId in the model name) - and
-          the ESP tab has a "Name check" button that prints exactly what
-          every rig resolves to. The aimbot's visibility check now ignores
+          tolerant UserId matching, the rig index built from the game's own
+          replication records (v36c - see below) and a direct scan of the
+          server's players. The aimbot's visibility check now ignores
           the game's own workspace.ignore folder (viewmodels and effects
           live there - they used to block every ray, so no target ever
           passed) and the aim lock binds in the LAST render slot so the
@@ -129,6 +128,14 @@
           game's own input path, immune to camera overwrites (camera
           lock stays as the fallback). The local sim rig
           (StarterCharacter) is excluded from ESP and aimbot.
+          dl-v37: Silent Aim - each shot is redirected at the nearest
+          enemy within a configurable angle at the instant it fires
+          (the same single-direction interception Zeroed Aim uses: the
+          local sim AND the server's shot record both get the redirected
+          direction; the camera never moves; optional visible-only; the
+          launch solve compensates drop + wind - or the straight-flight
+          mode when No Bullet Drop is on - and applies a one-step lead
+          for moving targets).
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -191,7 +198,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v36c"
+local SCRIPT_VERSION = "dl-v37"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -234,6 +241,9 @@ local DEFAULTS = {
     Aimbot = {
         Enabled = false, Mode = "Hold RMB", FOV = 100, Smoothness = 5,
         VisibleOnly = true, FOVCircle = true,
+    },
+    SilentAim = {
+        Enabled = false, MaxAngle = 20, VisibleOnly = true,
     },
     ESP = {
         Enabled = false, VisibleOnly = false, MaxDistance = 2500,
@@ -311,6 +321,7 @@ Config.Weapons.ReloadSpeed = math.clamp(tonumber(Config.Weapons.ReloadSpeed) or 
 -- projectile penetration multiplier.
 Config.Weapons.BulletVelocity = math.clamp(tonumber(Config.Weapons.BulletVelocity) or 1, 1, 50)
 Config.Weapons.Wallbang = math.clamp(tonumber(Config.Weapons.Wallbang) or 1, 1, 100)
+Config.SilentAim.MaxAngle = math.clamp(tonumber(Config.SilentAim.MaxAngle) or 20, 5, 45)
 
 -- Fullbright intensity: ambient grey level (matches the sibling scripts).
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
@@ -1445,71 +1456,100 @@ local function localWeaponBarrel()
     return nil
 end
 
--- phi that lands the bullet on the raycast point (or nil when impossible)
-local function zeroedPhi(origin, hitPos, velocity, drop)
-    local A = hitPos - origin
+-- Launch direction that lands the bullet on `point` (or nil). Uses the
+-- game's own path model; the gravity term drops out when No Bullet Drop is
+-- zeroing it, so the solve stays correct in both physics modes.
+local function solveLaunch(origin, point, velocity, drop)
+    local A = point - origin
     local L = A.Magnitude
-    if L < 8 then return nil end
+    if L < 2 then return nil end
     local v = tonumber(velocity) or 0
     if v < 5 then return nil end
     local d = tonumber(drop) or 0
     if d < 0 then d = 0 end
-    local g = Workspace.Gravity
-    if not g or g <= 0 then return nil end
-    local gv = Vector3.new(0, -g, 0)
+    local gv = Vector3.zero
+    if not Config.Weapons.NoBulletDrop then
+        local g = Workspace.Gravity
+        if g and g > 0 then
+            gv = Vector3.new(0, -g, 0)
+        end
+    end
     local wind = Workspace.GlobalWind
     local t = L / v
     for _ = 1, 5 do
         local tt = t * t
         local R = A - gv * tt - wind * (tt * 4)
         local Rm = R.Magnitude
-        if Rm < 1 then return nil end
+        if Rm < 0.5 then return nil end
         local den = v - Rm * d
         t = (den > 1) and (Rm / den) or (Rm / v)
     end
     local tt = t * t
     local R = A - gv * tt - wind * (tt * 4)
-    if R.Magnitude < 1 then return nil end
-    local launch = R.Unit
-    local aimU = A.Unit
-    local phi = math.asin(math.clamp(launch.Y, -1, 1)) - math.asin(math.clamp(aimU.Y, -1, 1))
-    return math.clamp(phi, -0.25, 0.25)
+    if R.Magnitude < 0.5 then return nil end
+    return R.Unit, t
+end
+
+-- assigned further down (the rig helpers live in the aimbot section);
+-- this closure keeps the upvalue
+local silentAimPointFinder = nil
+
+local function compensationActive()
+    return Config.Weapons.ZeroedAim or (Config.SilentAim and Config.SilentAim.Enabled)
 end
 
 -- called from the masked wrapper right before each shot's origin write
 local function zeroedOnOriginWrite(vec)
-    if not Config.Weapons.ZeroedAim then return end
     if type(vec) ~= "Vector3" then return end
     if ZA_STATE.tilted then return end
+    if not compensationActive() then return end
     local controller, weapon, barrel = localWeaponBarrel()
     if not barrel then return end
     if (vec - barrel.WorldPosition).Magnitude > 2 then return end
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    local ignoreList = {}
-    if LocalPlayer.Character then ignoreList[#ignoreList + 1] = LocalPlayer.Character end
-    local cam = Workspace.CurrentCamera
-    if cam then ignoreList[#ignoreList + 1] = cam end
-    local ig = Workspace:FindFirstChild("ignore")
-    if ig then ignoreList[#ignoreList + 1] = ig end
-    params.FilterDescendantsInstances = ignoreList
-    local hit = Workspace:Raycast(vec, barrel.WorldCFrame.LookVector * 4000, params)
-    if not hit then return end
     local amm = ammoTableFor(controller)
     if type(amm) ~= "table" then return end
     local v = tonumber(rawget(amm, "velocity"))
     local d = tonumber(rawget(amm, "velocity_drop")) or 0
-    local phi = zeroedPhi(vec, hit.Position, v, d)
-    if not phi then return end
+
+    -- Silent aim first: redirect the shot at the nearest enemy in the angle
+    local point = nil
+    if Config.SilentAim and Config.SilentAim.Enabled and silentAimPointFinder then
+        local ok, pt = pcall(silentAimPointFinder, vec, barrel, controller)
+        if ok and pt then point = pt end
+    end
+    -- otherwise (or when nothing is in the angle): zeroed drop compensation
+    -- at the crosshair
+    if not point then
+        if not Config.Weapons.ZeroedAim then return end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local ignoreList = {}
+        if LocalPlayer.Character then ignoreList[#ignoreList + 1] = LocalPlayer.Character end
+        local cam = Workspace.CurrentCamera
+        if cam then ignoreList[#ignoreList + 1] = cam end
+        local ig = Workspace:FindFirstChild("ignore")
+        if ig then ignoreList[#ignoreList + 1] = ig end
+        params.FilterDescendantsInstances = ignoreList
+        local hit = Workspace:Raycast(vec, barrel.WorldCFrame.LookVector * 4000, params)
+        if not hit then return end
+        point = hit.Position
+    end
+
+    local dir = solveLaunch(vec, point, v, d)
+    if not dir then return end
     local saved = barrel.CFrame
-    barrel.CFrame = saved * CFrame.Angles(phi, 0, 0)
+    local dLocal = saved:VectorToObjectSpace(dir)
+    if dLocal.Magnitude < 0.001 or math.abs(dLocal.Y) > 0.995 then return end
+    local okRot, rot = pcall(function() return CFrame.lookAt(Vector3.zero, dLocal) end)
+    if not okRot or not rot then return end
+    barrel.CFrame = saved * rot
     ZA_STATE.tilted = { barrel = barrel, saved = saved, at = os.clock() }
 end
 
 local function makeZeroedWrapper(orig)
     local fpcall = pcall
     local function wrapper(buf, vec)
-        if Config.Weapons.ZeroedAim and vec ~= nil then
+        if vec ~= nil then
             fpcall(zeroedOnOriginWrite, vec)
         end
         return orig(buf, vec)
@@ -1524,7 +1564,7 @@ local function applyZeroed()
         pcall(function() mod.write_exact_position = orig end)
         ZA_STATE.mod, ZA_STATE.orig = nil, nil
     end
-    if not Config.Weapons.ZeroedAim then return true end
+    if not compensationActive() then return true end
     local mod = findNetworkEncode()
     if not mod then
         return false, "NetworkEncode not replicated yet"
@@ -1564,7 +1604,7 @@ end))
 -- barrel can be found.
 local zaRetry = 0
 track(RunService.RenderStepped:Connect(function()
-    if not Config.Weapons.ZeroedAim then
+    if not compensationActive() then
         zaRetry = 0
         return
     end
@@ -1859,6 +1899,55 @@ local function eachEnemyRig(callback)
             end
         end
     end
+end
+
+-- SILENT AIM TARGET FINDER - assigned to the Zeroed Aim section's forward
+-- declaration. Runs at the instant of each shot: the nearest rig whose
+-- head sits within SilentAim.MaxAngle of the barrel direction wins, then
+-- the aim point gets a one-step lead along the target's velocity.
+silentAimPointFinder = function(origin, barrel, controller)
+    local cfg = Config.SilentAim
+    if not cfg or not cfg.Enabled then return nil end
+    local b = barrel.WorldCFrame.LookVector
+    local maxAng = math.rad(math.clamp(tonumber(cfg.MaxAngle) or 20, 5, 45))
+    local cam = workspace.CurrentCamera
+    local best, bestAng, bestModel = nil, nil, nil
+    eachEnemyRig(function(model, root)
+        local head = rigHead(model) or root
+        if not head then return end
+        local hp = head.Position
+        local toHead = hp - origin
+        local len = toHead.Magnitude
+        if len < 3 or len > 3000 then return end
+        local ang = math.acos(math.clamp(b:Dot(toHead.Unit), -1, 1))
+        if ang > maxAng then return end
+        if cfg.VisibleOnly then
+            local camPos = (cam and cam.CFrame.Position) or origin
+            local ok, vis = pcall(isVisible, model, camPos, hp)
+            if ok and not vis then return end
+        end
+        if not bestAng or ang < bestAng then
+            best, bestAng, bestModel = hp, ang, model
+        end
+    end)
+    if not best or not bestModel then return nil end
+    -- one-step lead for moving targets
+    local amm = ammoTableFor(controller)
+    if type(amm) == "table" then
+        local v = tonumber(rawget(amm, "velocity"))
+        local d = tonumber(rawget(amm, "velocity_drop")) or 0
+        local head = rigHead(bestModel)
+        if head then
+            local okv, vel = pcall(function() return head.AssemblyLinearVelocity end)
+            if okv and typeof(vel) == "Vector3" and vel.Magnitude > 4 then
+                local dir, t = solveLaunch(origin, best, v, d)
+                if dir and t and t > 0 and t < 3 then
+                    best = best + vel * (t * 0.9)
+                end
+            end
+        end
+    end
+    return best
 end
 
 -- ============================================================
@@ -2495,10 +2584,43 @@ local function buildMenu()
     toggle(pa, "Visible Check",
         function() return Config.Aimbot.VisibleOnly end,
         function(v) Config.Aimbot.VisibleOnly = v end)
-    button(pa, "Run aimbot check", function()
-        pcall(aimbotDiagnostics)
-    end)
     bindrow(pa, hotkeyById.ToggleAimbot)
+
+    section(pa, "Silent Aim")
+    toggle(pa, "Silent Aim",
+        function() return Config.SilentAim.Enabled end,
+        function(v)
+            Config.SilentAim.Enabled = v
+            ZA_STATE.warned = nil
+            if v then
+                local ok, err = applyZeroed()
+                if not ok then
+                    warn("[deadline] silent aim not armed yet: " .. tostring(err))
+                    notify("Silent aim on - waiting for the game module (auto-retries)")
+                else
+                    notify("Silent aim: shots redirect to the nearest enemy in the angle")
+                end
+            else
+                pcall(applyZeroed)
+                if not Config.Weapons.ZeroedAim and ZA_STATE.tilted then
+                    local t = ZA_STATE.tilted
+                    ZA_STATE.tilted = nil
+                    pcall(function()
+                        if t.barrel and t.saved then t.barrel.CFrame = t.saved end
+                    end)
+                end
+                notify("Silent aim off")
+            end
+            refreshStatus()
+        end)
+    slider(pa, "Max Angle",
+        function() return Config.SilentAim.MaxAngle end,
+        function(v) Config.SilentAim.MaxAngle = v end, 1, 5, 45,
+        function(v) return ("%d°"):format(v) end)
+    toggle(pa, "Visible Only",
+        function() return Config.SilentAim.VisibleOnly end,
+        function(v) Config.SilentAim.VisibleOnly = v end)
+    note(pa, "Each shot is redirected at the nearest enemy inside the angle - the server gets the redirected direction, your camera never moves. Keep the angle modest for believable replays.")
 
     -- ---------------- ESP ----------------
     section(pe, "Player ESP")
@@ -2519,9 +2641,6 @@ local function buildMenu()
     toggle(pe, "Visible Only",
         function() return Config.ESP.VisibleOnly end,
         function(v) Config.ESP.VisibleOnly = v end)
-    button(pe, "Name check (console)", function()
-        pcall(rigNameCheck)
-    end)
     slider(pe, "Max Distance",
         function() return Config.ESP.MaxDistance end,
         function(v) Config.ESP.MaxDistance = v end, 100, 100, 10000)
