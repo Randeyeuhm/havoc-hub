@@ -153,6 +153,14 @@
           stays warm while the feature is on (keepalive + respawn
           rescans) and the live-character controller is preferred over
           stale copies, so the barrel lookup can't silently miss.
+          dl-v40: deep telemetry - every pipeline exit now has its own
+          counter (badArg / inactive / noFinder / finder-error /
+          noPoint / noHit), plus argument probes showing exactly what
+          callers pass (typeof+type, big vs small magnitude class, first
+          four samples). The Vector3 guard now uses typeof instead of
+          type - the module accepts any X/Y/Z object (CFrame included)
+          and type() on Roblox datatypes is not reliable across
+          versions, so the old guard could silently drop every call.
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -215,7 +223,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v39"
+local SCRIPT_VERSION = "dl-v40"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1450,6 +1458,11 @@ local function zResetStats()
     ZSTAT.noBarrel, ZSTAT.noAmmo, ZSTAT.noSolve, ZSTAT.badLocal = 0, 0, 0, 0
     ZSTAT.silentNone, ZSTAT.silentHit, ZSTAT.nearestAng = 0, 0, math.huge
     ZSTAT.errs, ZSTAT.firstErr = 0, nil
+    ZSTAT.badArg, ZSTAT.inactive, ZSTAT.noFinder = 0, 0, 0
+    ZSTAT.ferr, ZSTAT.firstFerr = 0, nil
+    ZSTAT.noPoint, ZSTAT.noHit = 0, 0
+    ZSTAT.bigVec, ZSTAT.smallVec = 0, 0
+    ZSTAT.samples = {}
 end
 zResetStats()
 
@@ -1614,12 +1627,23 @@ end
 
 -- called from the masked wrapper right before each shot's origin write
 local function zeroedOnOriginWrite(vec)
-    if type(vec) ~= "Vector3" then return end
+    if typeof(vec) ~= "Vector3" then
+        ZSTAT.badArg = ZSTAT.badArg + 1
+        return
+    end
+    if vec.Magnitude > 50 then
+        ZSTAT.bigVec = ZSTAT.bigVec + 1
+    else
+        ZSTAT.smallVec = ZSTAT.smallVec + 1
+    end
     if ZA_STATE.tilted then
         ZSTAT.dirSkip = ZSTAT.dirSkip + 1
         return
     end
-    if not compensationActive() then return end
+    if not compensationActive() then
+        ZSTAT.inactive = ZSTAT.inactive + 1
+        return
+    end
     local controller, weapon, barrel = localWeaponBarrel()
     if not barrel then
         ZSTAT.noBarrel = ZSTAT.noBarrel + 1
@@ -1641,14 +1665,26 @@ local function zeroedOnOriginWrite(vec)
 
     -- Silent aim first: redirect the shot at the nearest enemy in the angle
     local point = nil
-    if Config.SilentAim and Config.SilentAim.Enabled and silentAimPointFinder then
-        local ok, pt = pcall(silentAimPointFinder, vec, barrel, controller)
-        if ok and pt then point = pt end
+    if Config.SilentAim and Config.SilentAim.Enabled then
+        if not silentAimPointFinder then
+            ZSTAT.noFinder = ZSTAT.noFinder + 1
+        else
+            local ok, pt = pcall(silentAimPointFinder, vec, barrel, controller)
+            if not ok then
+                ZSTAT.ferr = ZSTAT.ferr + 1
+                if not ZSTAT.firstFerr then ZSTAT.firstFerr = tostring(pt) end
+            elseif pt then
+                point = pt
+            end
+        end
     end
     -- otherwise (or when nothing is in the angle): zeroed drop compensation
     -- at the crosshair
     if not point then
-        if not Config.Weapons.ZeroedAim then return end
+        if not Config.Weapons.ZeroedAim then
+            ZSTAT.noPoint = ZSTAT.noPoint + 1
+            return
+        end
         local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
         local ignoreList = {}
@@ -1659,7 +1695,10 @@ local function zeroedOnOriginWrite(vec)
         if ig then ignoreList[#ignoreList + 1] = ig end
         params.FilterDescendantsInstances = ignoreList
         local hit = Workspace:Raycast(vec, barrel.WorldCFrame.LookVector * 4000, params)
-        if not hit then return end
+        if not hit then
+            ZSTAT.noHit = ZSTAT.noHit + 1
+            return
+        end
         point = hit.Position
     end
 
@@ -1689,6 +1728,15 @@ local function makeZeroedWrapper(orig)
     local function wrapper(buf, vec)
         if vec ~= nil then
             ZSTAT.calls = ZSTAT.calls + 1
+            -- what do callers actually hand us? (kept for diagnosis)
+            if ZSTAT.argProbe == nil then
+                ZSTAT.argProbe = tostring(typeof(vec)) .. "/" .. tostring(type(vec))
+            end
+            if #ZSTAT.samples < 4 then
+                local mag = -1
+                if typeof(vec) == "Vector3" then mag = vec.Magnitude end
+                table.insert(ZSTAT.samples, ("%s %.0f"):format(typeof(vec), mag))
+            end
             local ok, err = fpcall(zeroedOnOriginWrite, vec)
             if not ok then
                 ZSTAT.errs = ZSTAT.errs + 1
@@ -1830,11 +1878,16 @@ track(RunService.RenderStepped:Connect(function()
         return
     end
     local armed = ZA_STATE.mod and tostring(ZA_STATE.foundVia or "?") or "no"
-    print(("[deadline] aim 5s (armed=%s): calls=%d tilt=%d dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d errs=%d%s")
-        :format(armed, ZSTAT.calls, ZSTAT.tilt, ZSTAT.dirSkip, ZSTAT.guardMiss,
+    print(("[deadline] aim 5s (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s]")
+        :format(armed, ZSTAT.calls, ZSTAT.bigVec, ZSTAT.smallVec, ZSTAT.badArg,
+            ZSTAT.tilt, ZSTAT.dirSkip, ZSTAT.guardMiss,
             zaFmtNum(ZSTAT.nearestMiss), ZSTAT.noBarrel, ZSTAT.noAmmo, ZSTAT.silentNone,
             ZSTAT.silentHit, zaFmtNum(ZSTAT.nearestAng, "deg"), ZSTAT.noSolve, ZSTAT.badLocal,
-            ZSTAT.errs, ZSTAT.firstErr and (" first=" .. ZSTAT.firstErr) or ""))
+            ZSTAT.noPoint, ZSTAT.noHit, ZSTAT.noFinder, ZSTAT.inactive,
+            ZSTAT.errs, ZSTAT.ferr,
+            ZSTAT.firstErr and (" err=" .. ZSTAT.firstErr) or "",
+            ZSTAT.firstFerr and (" ferrMsg=" .. ZSTAT.firstFerr) or "",
+            tostring(ZSTAT.argProbe or "-"), table.concat(ZSTAT.samples or {}, "; ")))
     zResetStats()
 end))
 
