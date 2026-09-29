@@ -327,22 +327,40 @@ local resolvedRigCache = setmetatable({}, { __mode = "k" })
 local rigRecords = setmetatable({}, { __mode = "k" })  -- rig model -> {uid, name}
 local rigRecordsById = {}                               -- ingame_id string -> {uid, name}
 local rigIndexAt = 0
-local function rigIndexScan()
-    if type(getgc) ~= "function" then return end
+local rigIndexStats = { mode = "none", objects = 0, records = 0 }
+local function rigIndexScan(force)
+    if type(getgc) ~= "function" then
+        rigIndexStats.mode = "unavailable"
+        return
+    end
     local now = os.clock()
-    if now - rigIndexAt < 5 then return end
+    if not force and now - rigIndexAt < 5 then return end
     rigIndexAt = now
     local ok = pcall(function()
-        for _, obj in pairs(getgc()) do
+        local heap
+        local mode = "all"
+        -- executors differ: some only accept getgc(true) (tables only)
+        local okT, tables = pcall(getgc, true)
+        if okT and type(tables) == "table" and #tables > 0 then
+            heap, mode = tables, "tables"
+        else
+            heap = getgc()
+        end
+        local objects, records = 0, 0
+        for _, obj in pairs(heap) do
+            objects = objects + 1
             if type(obj) == "table" then
                 local uid = rawget(obj, "user_id")
-                if type(uid) == "number" then
-                    local info = { uid = uid }
-                    local uname = rawget(obj, "player_name")
-                    if type(uname) == "string" then info.name = uname end
-                    local ingame = rawget(obj, "ingame_id")
+                local uname = rawget(obj, "player_name")
+                local ingame = rawget(obj, "ingame_id")
+                if type(uid) == "number" or type(uname) == "string" then
+                    local rec = {
+                        uid = type(uid) == "number" and uid or nil,
+                        name = type(uname) == "string" and uname or nil,
+                    }
+                    records = records + 1
                     if ingame ~= nil then
-                        rigRecordsById[tostring(ingame)] = info
+                        rigRecordsById[tostring(ingame)] = rec
                     end
                     local ch = rawget(obj, "character")
                     if ch ~= nil then
@@ -350,15 +368,34 @@ local function rigIndexScan()
                             return typeof(ch) == "Instance" and ch:IsA("Model")
                         end)
                         if ok2 and isModel then
-                            rigRecords[ch] = info
+                            rigRecords[ch] = rec
+                        end
+                    end
+                    local root = rawget(obj, "humanoid_root_part")
+                    if root ~= nil then
+                        local ok2, rig = pcall(function()
+                            if typeof(root) ~= "Instance" then return nil end
+                            local par = root.Parent
+                            if par and par:IsA("Model") then return par end
+                            return nil
+                        end)
+                        if ok2 and rig then
+                            rigRecords[rig] = rec
                         end
                     end
                 end
             end
         end
+        rigIndexStats.mode = mode
+        rigIndexStats.objects = objects
+        rigIndexStats.records = records
     end)
-    if not ok then return end
+    if not ok then
+        rigIndexStats.mode = "error"
+    end
 end
+ESP.rigIndexScan = rigIndexScan
+ESP.rigIndexStats = rigIndexStats
 
 local function rigRecord(model)
     local rec = rigRecords[model] or rigRecordsById[model.Name]
@@ -387,7 +424,12 @@ local function resolvePlayer(model)
         if not p then
             local rec = rigRecord(model)
             if rec then
-                p = Players:GetPlayerByUserId(rec.uid)
+                if rec.uid then
+                    p = Players:GetPlayerByUserId(rec.uid)
+                end
+                if not p and rec.name then
+                    p = Players:FindFirstChild(rec.name)
+                end
             end
         end
         if not p then

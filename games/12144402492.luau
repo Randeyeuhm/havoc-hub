@@ -191,7 +191,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v36b"
+local SCRIPT_VERSION = "dl-v36c"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1885,9 +1885,6 @@ local function renderESP(cam)
     eachEnemyRig(function(model, root)
         local head = rigHead(model) or root
         local pass = true
-        if Config.ESP.NPCs == false and not rigPlayer(model) then
-            pass = false
-        end
         if pass and Config.ESP.VisibleOnly then
             local ok, visible = pcall(isVisible, model, camPos, head.Position)
             pass = ok and visible
@@ -2307,9 +2304,18 @@ end
 -- Console readout for rig -> player resolution: run it in a live match and
 -- the output answers exactly why a name shows as "NPC: <id>".
 local function rigNameCheck()
-    print("[deadline] name check - players in this server:")
+    print(("[deadline] name check (%s) - players in this server:"):format(SCRIPT_VERSION))
     for _, plr in ipairs(Players:GetPlayers()) do
         print(("    %s  /  %s  (UserId %d)"):format(plr.Name, plr.DisplayName, plr.UserId))
+    end
+    if ESPUI and ESPUI.rigIndexScan then
+        pcall(ESPUI.rigIndexScan, true)
+    end
+    if ESPUI and ESPUI.rigIndexStats then
+        local st = ESPUI.rigIndexStats
+        print(("[deadline] rig index - getgc:%s  mode:%s  objects:%d  records:%d"):format(
+            type(getgc) == "function" and "yes" or "NO", tostring(st.mode),
+            st.objects or 0, st.records or 0))
     end
     local folder = characterFolder()
     if folder then
@@ -2500,7 +2506,12 @@ local function buildMenu()
         function() return Config.ESP.Enabled end,
         function(v)
             Config.ESP.Enabled = v
-            if v then espOnDiagnostics() end
+            if v then
+                if ESPUI and ESPUI.rigIndexScan then
+                    task.spawn(function() pcall(ESPUI.rigIndexScan, true) end)
+                end
+                espOnDiagnostics()
+            end
         end,
         hotkeyById.ToggleESP)
     bindrow(pe, hotkeyById.ToggleESP)
@@ -2508,9 +2519,6 @@ local function buildMenu()
     toggle(pe, "Visible Only",
         function() return Config.ESP.VisibleOnly end,
         function(v) Config.ESP.VisibleOnly = v end)
-    toggle(pe, "NPCs",
-        function() return Config.ESP.NPCs end,
-        function(v) Config.ESP.NPCs = v end)
     button(pe, "Name check (console)", function()
         pcall(rigNameCheck)
     end)
