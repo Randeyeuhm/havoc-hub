@@ -145,6 +145,14 @@
           also gained real FOV controls: the angle slider is now "FOV
           Angle" and "Show FOV Circle" draws the cone on screen at its
           true radius (tan(angle) x the camera's focal length).
+          dl-v39: Silent Aim telemetry + hardening - the FOV ring shows
+          the armed state (grey = module not hooked yet, orange = armed),
+          and every 5s of shooting prints one console line naming the
+          pipeline stage (calls / tilt / guardMiss / noBarrel / noAmmo /
+          silent none-hit / nearest angle / errors). The controller cache
+          stays warm while the feature is on (keepalive + respawn
+          rescans) and the live-character controller is preferred over
+          stale copies, so the barrel lookup can't silently miss.
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -207,7 +215,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v38"
+local SCRIPT_VERSION = "dl-v39"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1430,6 +1438,21 @@ if ZA_STATE.tilted then
     end)
 end
 
+-- per-shot telemetry (kept in the shared state so a wrapper left over from
+-- an old run still reports into the same counters). Reset every report.
+if type(ZA_STATE.stats) ~= "table" then
+    ZA_STATE.stats = {}
+end
+local ZSTAT = ZA_STATE.stats
+local function zResetStats()
+    ZSTAT.calls, ZSTAT.tilt, ZSTAT.dirSkip = 0, 0, 0
+    ZSTAT.guardMiss, ZSTAT.nearestMiss = 0, math.huge
+    ZSTAT.noBarrel, ZSTAT.noAmmo, ZSTAT.noSolve, ZSTAT.badLocal = 0, 0, 0, 0
+    ZSTAT.silentNone, ZSTAT.silentHit, ZSTAT.nearestAng = 0, 0, math.huge
+    ZSTAT.errs, ZSTAT.firstErr = 0, nil
+end
+zResetStats()
+
 -- late-arm toast hook - assigned next to `local notify` further down
 -- (this section runs before the toaster exists)
 local armedToast = nil
@@ -1460,14 +1483,20 @@ local function findNetworkEncode()
     mod = mod and mod:FindFirstChild("namespace")
     mod = mod and mod:FindFirstChild("NetworkEncode")
     local res = tryNetEncode(mod)
-    if res then return res end
+    if res then
+        ZA_STATE.foundVia = "path"
+        return res
+    end
     -- 2) any descendant still called NetworkEncode
     local ok, desc = pcall(function() return ReplicatedStorage:GetDescendants() end)
     if ok and type(desc) == "table" then
         for _, d in ipairs(desc) do
             if d.Name == "NetworkEncode" then
                 res = tryNetEncode(d)
-                if res then return res end
+                if res then
+                    ZA_STATE.foundVia = "search"
+                    return res
+                end
             end
         end
     end
@@ -1488,17 +1517,31 @@ local function findNetworkEncode()
         ZA_STATE.noGetgc = true
         return nil
     end
+    local found, nCand, seen = nil, 0, {}
     for _, gc in ipairs(scans) do
         for _, obj in ipairs(gc) do
             if type(obj) == "table" and type(rawget(obj, "write_exact_position")) == "function" then
-                return obj
+                if not seen[obj] then
+                    seen[obj] = true
+                    nCand = nCand + 1
+                    if not found then found = obj end
+                end
             end
         end
     end
-    return nil
+    if found then
+        ZA_STATE.foundVia = "gc"
+        ZA_STATE.gcCount = nCand
+    end
+    return found
 end
 
+-- Prefer the controller whose character instance IS the live character -
+-- a stale controller from an earlier life can pass the is_local test and
+-- its old (possibly reparented) barrel would then eat the tilt.
 local function localWeaponBarrel()
+    local localChar = LocalPlayer.Character
+    local fbController, fbWeapon, fbBarrel = nil, nil, nil
     for controller in pairs(CTRL_STATE.tracked) do
         if type(controller) == "table" then
             local cd = rawget(controller, "char_data")
@@ -1513,12 +1556,18 @@ local function localWeaponBarrel()
                     isPart = ok and res
                 end
                 if isPart and barrel.Parent then
-                    return controller, weapon, barrel
+                    local ch = rawget(controller, "character")
+                    if localChar and type(ch) == "table" and rawget(ch, "instance") == localChar then
+                        return controller, weapon, barrel
+                    end
+                    if not fbBarrel then
+                        fbController, fbWeapon, fbBarrel = controller, weapon, barrel
+                    end
                 end
             end
         end
     end
-    return nil
+    return fbController, fbWeapon, fbBarrel
 end
 
 -- Launch direction that lands the bullet on `point` (or nil). Uses the
@@ -1566,13 +1615,27 @@ end
 -- called from the masked wrapper right before each shot's origin write
 local function zeroedOnOriginWrite(vec)
     if type(vec) ~= "Vector3" then return end
-    if ZA_STATE.tilted then return end
+    if ZA_STATE.tilted then
+        ZSTAT.dirSkip = ZSTAT.dirSkip + 1
+        return
+    end
     if not compensationActive() then return end
     local controller, weapon, barrel = localWeaponBarrel()
-    if not barrel then return end
-    if (vec - barrel.WorldPosition).Magnitude > 2 then return end
+    if not barrel then
+        ZSTAT.noBarrel = ZSTAT.noBarrel + 1
+        return
+    end
+    local gd = (vec - barrel.WorldPosition).Magnitude
+    if gd > 2 then
+        ZSTAT.guardMiss = ZSTAT.guardMiss + 1
+        if gd < ZSTAT.nearestMiss then ZSTAT.nearestMiss = gd end
+        return
+    end
     local amm = ammoTableFor(controller)
-    if type(amm) ~= "table" then return end
+    if type(amm) ~= "table" then
+        ZSTAT.noAmmo = ZSTAT.noAmmo + 1
+        return
+    end
     local v = tonumber(rawget(amm, "velocity"))
     local d = tonumber(rawget(amm, "velocity_drop")) or 0
 
@@ -1601,21 +1664,36 @@ local function zeroedOnOriginWrite(vec)
     end
 
     local dir = solveLaunch(vec, point, v, d)
-    if not dir then return end
+    if not dir then
+        ZSTAT.noSolve = ZSTAT.noSolve + 1
+        return
+    end
     local saved = barrel.CFrame
     local dLocal = saved:VectorToObjectSpace(dir)
-    if dLocal.Magnitude < 0.001 or math.abs(dLocal.Y) > 0.995 then return end
+    if dLocal.Magnitude < 0.001 or math.abs(dLocal.Y) > 0.995 then
+        ZSTAT.badLocal = ZSTAT.badLocal + 1
+        return
+    end
     local okRot, rot = pcall(function() return CFrame.lookAt(Vector3.zero, dLocal) end)
-    if not okRot or not rot then return end
+    if not okRot or not rot then
+        ZSTAT.badLocal = ZSTAT.badLocal + 1
+        return
+    end
     barrel.CFrame = saved * rot
     ZA_STATE.tilted = { barrel = barrel, saved = saved, at = os.clock() }
+    ZSTAT.tilt = ZSTAT.tilt + 1
 end
 
 local function makeZeroedWrapper(orig)
     local fpcall = pcall
     local function wrapper(buf, vec)
         if vec ~= nil then
-            fpcall(zeroedOnOriginWrite, vec)
+            ZSTAT.calls = ZSTAT.calls + 1
+            local ok, err = fpcall(zeroedOnOriginWrite, vec)
+            if not ok then
+                ZSTAT.errs = ZSTAT.errs + 1
+                if not ZSTAT.firstErr then ZSTAT.firstErr = tostring(err) end
+            end
         end
         return orig(buf, vec)
     end
@@ -1655,6 +1733,11 @@ local function applyZeroed()
         return false, "module rejects the wrapper (" .. tostring(errSet) .. ")"
     end
     ZA_STATE.mod, ZA_STATE.orig = mod, orig
+    local via = tostring(ZA_STATE.foundVia)
+    if ZA_STATE.gcCount and ZA_STATE.gcCount > 1 then
+        via = via .. (" (%d gc candidates)"):format(ZA_STATE.gcCount)
+    end
+    print("[deadline] aim module armed via " .. via)
     return true
 end
 
@@ -1703,6 +1786,56 @@ track(RunService.RenderStepped:Connect(function()
             warn("[deadline] aim compensation inactive: " .. tostring(err))
         end
     end
+end))
+
+-- Respawn = fresh controller: rescan shortly after (only while the feature
+-- is on) so the new weapon's barrel is in the cache by first contact.
+track(LocalPlayer.CharacterAdded:Connect(function()
+    if not compensationActive() then return end
+    task.spawn(function()
+        for _, d in ipairs({ 1.5, 4 }) do
+            task.wait(d)
+            if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
+            if not compensationActive() then return end
+            pcall(refreshControllerCache)
+        end
+    end)
+end))
+
+-- Keep-warm + telemetry while the feature is on: refresh the controller
+-- cache when no live local weapon is visible (the scan is shared and
+-- throttled), and report the per-shot pipeline every 5s of shooting so a
+-- dead stage names itself in the console (F9) instead of silently doing
+-- nothing. No "aim 5s" lines while firing = the game never called the
+-- wrapper (wrong module table candidate).
+local zaWarm = 0
+local zaReportAt = 0
+local function zaFmtNum(v, suf)
+    if v == nil or v == math.huge then return "-" end
+    return ("%.0f%s"):format(v, suf or "")
+end
+track(RunService.RenderStepped:Connect(function()
+    if not compensationActive() then return end
+    zaWarm = zaWarm + 1
+    if zaWarm >= 180 then
+        zaWarm = 0
+        local _, _, barrel = localWeaponBarrel()
+        if not barrel then pcall(refreshControllerCache) end
+    end
+    local now = os.clock()
+    if now - zaReportAt < 5 then return end
+    zaReportAt = now
+    if ZSTAT.calls <= 0 then
+        ZSTAT.nearestMiss, ZSTAT.nearestAng, ZSTAT.firstErr = math.huge, math.huge, nil
+        return
+    end
+    local armed = ZA_STATE.mod and tostring(ZA_STATE.foundVia or "?") or "no"
+    print(("[deadline] aim 5s (armed=%s): calls=%d tilt=%d dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d errs=%d%s")
+        :format(armed, ZSTAT.calls, ZSTAT.tilt, ZSTAT.dirSkip, ZSTAT.guardMiss,
+            zaFmtNum(ZSTAT.nearestMiss), ZSTAT.noBarrel, ZSTAT.noAmmo, ZSTAT.silentNone,
+            ZSTAT.silentHit, zaFmtNum(ZSTAT.nearestAng, "deg"), ZSTAT.noSolve, ZSTAT.badLocal,
+            ZSTAT.errs, ZSTAT.firstErr and (" first=" .. ZSTAT.firstErr) or ""))
+    zResetStats()
 end))
 
 -- ============================================================
@@ -1999,6 +2132,7 @@ silentAimPointFinder = function(origin, barrel, controller)
         local len = toHead.Magnitude
         if len < 3 or len > 3000 then return end
         local ang = math.acos(math.clamp(b:Dot(toHead.Unit), -1, 1))
+        ZSTAT.nearestAng = math.min(ZSTAT.nearestAng, math.deg(ang))
         if ang > maxAng then return end
         if cfg.VisibleOnly then
             local camPos = (cam and cam.CFrame.Position) or origin
@@ -2009,7 +2143,10 @@ silentAimPointFinder = function(origin, barrel, controller)
             best, bestAng, bestModel = hp, ang, model
         end
     end)
-    if not best or not bestModel then return nil end
+    if not best or not bestModel then
+        ZSTAT.silentNone = ZSTAT.silentNone + 1
+        return nil
+    end
     -- one-step lead for moving targets
     local amm = ammoTableFor(controller)
     if type(amm) == "table" then
@@ -2026,6 +2163,7 @@ silentAimPointFinder = function(origin, barrel, controller)
             end
         end
     end
+    ZSTAT.silentHit = ZSTAT.silentHit + 1
     return best
 end
 
@@ -2207,6 +2345,14 @@ local function updateFovCircle(mouse)
     local focal = (vpY * 0.5) / math.tan(math.rad(fovDeg) * 0.5)
     silentFovCircle.Position = crosshairCenter(cam)
     silentFovCircle.Radius = math.tan(math.rad(Config.SilentAim.MaxAngle)) * focal
+    -- live armed indicator: grey while the module isn't hooked, orange when armed
+    if ZA_STATE.mod then
+        silentFovCircle.Color = Color3.fromRGB(255, 170, 60)
+        silentFovCircle.Transparency = 0.5
+    else
+        silentFovCircle.Color = Color3.fromRGB(140, 150, 165)
+        silentFovCircle.Transparency = 0.75
+    end
     silentFovCircle.Visible = true
 end
 
@@ -2740,7 +2886,7 @@ local function buildMenu()
     toggle(pa, "Visible Only",
         function() return Config.SilentAim.VisibleOnly end,
         function(v) Config.SilentAim.VisibleOnly = v end)
-    note(pa, "The FOV angle is a cone around where the barrel points - each shot fires at the nearest enemy inside it; the server gets the redirected direction and your camera never moves. Keep the angle modest for believable replays.")
+    note(pa, "The FOV angle is a cone around where the barrel points - each shot fires at the nearest enemy inside it; the server gets the redirected direction and your camera never moves. The ring is grey until the aim module arms, then orange. Keep the angle modest for believable replays.")
 
     -- ---------------- ESP ----------------
     section(pe, "Player ESP")
