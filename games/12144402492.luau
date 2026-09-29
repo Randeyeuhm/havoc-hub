@@ -136,6 +136,15 @@
           launch solve compensates drop + wind - or the straight-flight
           mode when No Bullet Drop is on - and applies a one-step lead
           for moving targets).
+          dl-v38: Silent Aim actually arms - the live client hides the
+          NetworkEncode module after boot, so it is now found through
+          three paths (dump path, descendant search, and finally a getgc
+          walk for the module's result table itself); install uses
+          rawset with clear errors, and when the module replicates mid-
+          match the arming retry toasts that it armed late. Silent Aim
+          also gained real FOV controls: the angle slider is now "FOV
+          Angle" and "Show FOV Circle" draws the cone on screen at its
+          true radius (tan(angle) x the camera's focal length).
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -198,7 +207,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v37"
+local SCRIPT_VERSION = "dl-v38"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -243,7 +252,7 @@ local DEFAULTS = {
         VisibleOnly = true, FOVCircle = true,
     },
     SilentAim = {
-        Enabled = false, MaxAngle = 20, VisibleOnly = true,
+        Enabled = false, MaxAngle = 20, VisibleOnly = true, FOVCircle = true,
     },
     ESP = {
         Enabled = false, VisibleOnly = false, MaxDistance = 2500,
@@ -1421,14 +1430,70 @@ if ZA_STATE.tilted then
     end)
 end
 
+-- late-arm toast hook - assigned next to `local notify` further down
+-- (this section runs before the toaster exists)
+local armedToast = nil
+
+-- Module discovery, in order: (1) the exact path the dump shows, (2) a full
+-- descendant name search - the live client hides or moves that folder after
+-- boot, and (3) a getgc walk for the module's RESULT TABLE itself (the table
+-- carrying write_exact_position). require caches per ModuleScript, so the
+-- game's own upvalue and that table are the same object. The getgc walk is
+-- rate-limited because full-state scans are heavy.
+local function netEncodeShape(res)
+    if type(res) ~= "table" then return false end
+    if type(rawget(res, "write_exact_position")) == "function" then return true end
+    local ok, f = pcall(function() return res.write_exact_position end)
+    return ok and type(f) == "function"
+end
+
+local function tryNetEncode(inst)
+    if not inst or not inst:IsA("ModuleScript") then return nil end
+    local ok, res = pcall(function() return require(inst) end)
+    if ok and netEncodeShape(res) then return res end
+    return nil
+end
+
 local function findNetworkEncode()
+    -- 1) the path in the dump: ReplicatedStorage/module/namespace/NetworkEncode
     local mod = ReplicatedStorage:FindFirstChild("module")
     mod = mod and mod:FindFirstChild("namespace")
     mod = mod and mod:FindFirstChild("NetworkEncode")
-    if not mod then return nil end
-    local ok, res = pcall(function() return require(mod) end)
-    if ok and type(res) == "table" and type(rawget(res, "write_exact_position")) == "function" then
-        return res
+    local res = tryNetEncode(mod)
+    if res then return res end
+    -- 2) any descendant still called NetworkEncode
+    local ok, desc = pcall(function() return ReplicatedStorage:GetDescendants() end)
+    if ok and type(desc) == "table" then
+        for _, d in ipairs(desc) do
+            if d.Name == "NetworkEncode" then
+                res = tryNetEncode(d)
+                if res then return res end
+            end
+        end
+    end
+    -- 3) getgc walk for the required module table (renamed/hidden case)
+    if ZA_STATE.noGetgc or type(getgc) ~= "function" then
+        ZA_STATE.noGetgc = true
+        return nil
+    end
+    local now = os.clock()
+    if ZA_STATE.lastGcScan and now - ZA_STATE.lastGcScan < 5 then return nil end
+    ZA_STATE.lastGcScan = now
+    local scans = {}
+    local ok1, g1 = pcall(function() return getgc(true) end)
+    if ok1 and type(g1) == "table" then table.insert(scans, g1) end
+    local ok2, g2 = pcall(function() return getgc() end)
+    if ok2 and type(g2) == "table" and g2 ~= g1 then table.insert(scans, g2) end
+    if #scans == 0 then
+        ZA_STATE.noGetgc = true
+        return nil
+    end
+    for _, gc in ipairs(scans) do
+        for _, obj in ipairs(gc) do
+            if type(obj) == "table" and type(rawget(obj, "write_exact_position")) == "function" then
+                return obj
+            end
+        end
     end
     return nil
 end
@@ -1561,16 +1626,20 @@ end
 local function applyZeroed()
     if ZA_STATE.mod and ZA_STATE.orig then
         local mod, orig = ZA_STATE.mod, ZA_STATE.orig
-        pcall(function() mod.write_exact_position = orig end)
+        pcall(function() rawset(mod, "write_exact_position", orig) end)
         ZA_STATE.mod, ZA_STATE.orig = nil, nil
     end
     if not compensationActive() then return true end
     local mod = findNetworkEncode()
     if not mod then
-        return false, "NetworkEncode not replicated yet"
+        return false, "NetworkEncode not found (path + search + getgc all missed)"
     end
     local orig = rawget(mod, "write_exact_position")
-    if type(orig) ~= "function" then return false, "write_exact_position missing" end
+    if type(orig) ~= "function" then
+        local ok2, f = pcall(function() return mod.write_exact_position end)
+        if ok2 and type(f) == "function" then orig = f end
+    end
+    if type(orig) ~= "function" then return false, "write_exact_position missing on the module" end
     local wrapper = makeZeroedWrapper(orig)
     local masked = false
     if type(setfenv) == "function" and type(getfenv) == "function" then
@@ -1580,7 +1649,11 @@ local function applyZeroed()
         ZA_STATE.blocked = "cannot mask wrapper environment (setfenv)"
         return false, ZA_STATE.blocked
     end
-    mod.write_exact_position = wrapper
+    -- rawset on purpose: bypasses any __newindex guard on the module table
+    local okSet, errSet = pcall(function() rawset(mod, "write_exact_position", wrapper) end)
+    if not okSet then
+        return false, "module rejects the wrapper (" .. tostring(errSet) .. ")"
+    end
     ZA_STATE.mod, ZA_STATE.orig = mod, orig
     return true
 end
@@ -1619,9 +1692,15 @@ track(RunService.RenderStepped:Connect(function()
             pcall(refreshControllerCache)
         end
         local ok, err = applyZeroed()
-        if not ok and not ZA_STATE.warned then
+        if ok then
+            ZA_STATE.warned = nil
+            if ZA_STATE.pendingNotify and armedToast then
+                ZA_STATE.pendingNotify = nil
+                pcall(armedToast, "Aim module armed - silent / zeroed aim active now")
+            end
+        elseif not ZA_STATE.warned then
             ZA_STATE.warned = true
-            warn("[deadline] zeroed aim inactive: " .. tostring(err))
+            warn("[deadline] aim compensation inactive: " .. tostring(err))
         end
     end
 end))
@@ -1989,6 +2068,7 @@ end
 -- AIMBOT  (camera lock - head parts of the character folder rigs)
 -- ============================================================
 local fovCircle = nil
+local silentFovCircle = nil
 local fovDrawingBroken = false
 
 local function aimingActive()
@@ -2068,33 +2148,66 @@ local function updateAimbot(cam, mouse)
     aimApplied = aimApplied + 1
 end
 
+local function makeScreenCircle(color, transparency)
+    if not Drawing then return nil, "no Drawing API" end
+    local ok, circle = pcall(function()
+        local c = Drawing.new("Circle")
+        c.Filled = false
+        c.NumSides = 64
+        c.Thickness = 1
+        c.Color = color
+        c.Transparency = transparency
+        return c
+    end)
+    if not ok then return nil, tostring(circle) end
+    return circle
+end
+
 local function updateFovCircle(mouse)
-    local show = Config.Aimbot.Enabled and Config.Aimbot.FOVCircle
-    if not show or fovDrawingBroken then
+    local cam = workspace.CurrentCamera
+    -- aimbot circle: screen-pixel radius the lock can engage in
+    local showAimbot = Config.Aimbot.Enabled and Config.Aimbot.FOVCircle
+    if not showAimbot or fovDrawingBroken then
         if fovCircle then fovCircle.Visible = false end
+    else
+        if not fovCircle then
+            local circle, err = makeScreenCircle(Color3.fromRGB(255, 255, 255), 0.4)
+            if not circle then
+                fovDrawingBroken = true
+                warn("[deadline] FOV circle failed: " .. tostring(err))
+            else
+                fovCircle = circle
+            end
+        end
+        if fovCircle then
+            fovCircle.Position = crosshairCenter(cam)
+            fovCircle.Radius = Config.Aimbot.FOV
+            fovCircle.Visible = true
+        end
+    end
+    -- silent aim circle: the angular cone projected onto the screen - the
+    -- radius uses the camera's focal length (half viewport height /
+    -- tan(vertical FOV / 2)), so the ring is where the cone actually is
+    local showSilent = Config.SilentAim and Config.SilentAim.Enabled and Config.SilentAim.FOVCircle ~= false
+    if not showSilent or fovDrawingBroken then
+        if silentFovCircle then silentFovCircle.Visible = false end
         return
     end
-    if not Drawing then fovDrawingBroken = true; return end
-    if not fovCircle then
-        local ok, circle = pcall(function()
-            local c = Drawing.new("Circle")
-            c.Filled = false
-            c.NumSides = 64
-            c.Thickness = 1
-            c.Color = Color3.fromRGB(255, 255, 255)
-            c.Transparency = 0.4
-            return c
-        end)
-        if not ok then
+    if not silentFovCircle then
+        local circle, err = makeScreenCircle(Color3.fromRGB(255, 170, 60), 0.5)
+        if not circle then
             fovDrawingBroken = true
-            warn("[deadline] FOV circle failed: " .. tostring(circle))
+            warn("[deadline] silent aim FOV circle failed: " .. tostring(err))
             return
         end
-        fovCircle = circle
+        silentFovCircle = circle
     end
-    fovCircle.Position = crosshairCenter(workspace.CurrentCamera)
-    fovCircle.Radius = Config.Aimbot.FOV
-    fovCircle.Visible = true
+    local vpY = (cam and cam.ViewportSize.Y) or 1080
+    local fovDeg = (cam and cam.FieldOfView) or 70
+    local focal = (vpY * 0.5) / math.tan(math.rad(fovDeg) * 0.5)
+    silentFovCircle.Position = crosshairCenter(cam)
+    silentFovCircle.Radius = math.tan(math.rad(Config.SilentAim.MaxAngle)) * focal
+    silentFovCircle.Visible = true
 end
 
 -- ============================================================
@@ -2204,6 +2317,8 @@ if screenGui and UILib and UILib.makeToaster then
 else
     notify = function(text) print("[Havoc Hub]", tostring(text)) end
 end
+-- the arming retry (top of file) waits for this before toasting a late arm
+armedToast = notify
 
 -- ESP diagnostics - fired whenever ESP flips on (menu toggle or hotkey).
 -- Prints one console line + a toast, then after 1.5s counts the engine's
@@ -2595,10 +2710,12 @@ local function buildMenu()
             if v then
                 local ok, err = applyZeroed()
                 if not ok then
+                    ZA_STATE.pendingNotify = true
                     warn("[deadline] silent aim not armed yet: " .. tostring(err))
                     notify("Silent aim on - waiting for the game module (auto-retries)")
                 else
-                    notify("Silent aim: shots redirect to the nearest enemy in the angle")
+                    ZA_STATE.pendingNotify = nil
+                    notify("Silent aim: shots redirect to the nearest enemy in the FOV angle")
                 end
             else
                 pcall(applyZeroed)
@@ -2613,14 +2730,17 @@ local function buildMenu()
             end
             refreshStatus()
         end)
-    slider(pa, "Max Angle",
+    slider(pa, "FOV Angle",
         function() return Config.SilentAim.MaxAngle end,
         function(v) Config.SilentAim.MaxAngle = v end, 1, 5, 45,
         function(v) return ("%d°"):format(v) end)
+    toggle(pa, "Show FOV Circle",
+        function() return Config.SilentAim.FOVCircle ~= false end,
+        function(v) Config.SilentAim.FOVCircle = v end)
     toggle(pa, "Visible Only",
         function() return Config.SilentAim.VisibleOnly end,
         function(v) Config.SilentAim.VisibleOnly = v end)
-    note(pa, "Each shot is redirected at the nearest enemy inside the angle - the server gets the redirected direction, your camera never moves. Keep the angle modest for believable replays.")
+    note(pa, "The FOV angle is a cone around where the barrel points - each shot fires at the nearest enemy inside it; the server gets the redirected direction and your camera never moves. Keep the angle modest for believable replays.")
 
     -- ---------------- ESP ----------------
     section(pe, "Player ESP")
@@ -2824,9 +2944,11 @@ local function buildMenu()
                 ZA_STATE.warned = nil
                 local ok, err = applyZeroed()
                 if not ok then
+                    ZA_STATE.pendingNotify = true
                     warn("[deadline] zeroed aim not armed yet: " .. tostring(err))
                     notify("Zeroed aim on - waiting for the game module (auto-retries)")
                 else
+                    ZA_STATE.pendingNotify = nil
                     notify("Zeroed aim: shots arc onto the crosshair - far hits register")
                 end
                 refreshGUI()
