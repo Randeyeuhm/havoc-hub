@@ -121,6 +121,14 @@
           live there - they used to block every ray, so no target ever
           passed) and the aim lock binds in the LAST render slot so the
           game's late camera updates can't overwrite it.
+          v36b: the rig numbers are NOT UserIds - names resolve through
+          the game's replicator records (rig -> user_id -> player via a
+          cached getgc index; the records also carry the username),
+          targeting now measures from the crosshair centre, and when the
+          executor exposes mousemoverel the aim moves the MOUSE - the
+          game's own input path, immune to camera overwrites (camera
+          lock stays as the fallback). The local sim rig
+          (StarterCharacter) is excluded from ESP and aimbot.
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -183,7 +191,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v36"
+local SCRIPT_VERSION = "dl-v36b"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1835,14 +1843,16 @@ local function isVisible(targetModel, camPos, targetPos)
 end
 
 -- Every other player's rig in the characters folder (self excluded by
--- identity and by UserId name, so the local rig never shows up).
+-- identity and by UserId name, so the local rig never shows up; the
+-- local sim model is literally called "StarterCharacter" - excluded too).
 local function eachEnemyRig(callback)
     local folder = characterFolder()
     if not folder then return end
     local localChar = LocalPlayer.Character
     local myName = tostring(LocalPlayer.UserId)
     for _, model in ipairs(folder:GetChildren()) do
-        if model:IsA("Model") and model ~= localChar and model.Name ~= myName then
+        if model:IsA("Model") and model ~= localChar and model.Name ~= myName
+            and model.Name ~= "StarterCharacter" then
             local root = rigRoot(model)
             if root then
                 callback(model, root)
@@ -1901,15 +1911,25 @@ local function aimingActive()
     return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
 end
 
+-- The crosshair is the screen centre in first person (mouse locked);
+-- GetMouseLocation used to skew this by the topbar inset (~36px).
+local function crosshairCenter(cam)
+    if cam then
+        return Vector2.new(cam.ViewportSize.X * 0.5, cam.ViewportSize.Y * 0.5)
+    end
+    return UserInputService:GetMouseLocation()
+end
+
 local function findAimTargetPos(cam, mouse)
     local cfg = Config.Aimbot
+    local center = crosshairCenter(cam)
     local candidates = {}
     eachEnemyRig(function(model, root)
         local head = rigHead(model) or root
         local targetPos = head.Position
         local sp = cam:WorldToViewportPoint(targetPos)
         if sp.Z > 0 then
-            local d = (Vector2.new(sp.X, sp.Y) - mouse).Magnitude
+            local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
             if d <= cfg.FOV then
                 table.insert(candidates, { pos = targetPos, model = model, dist = d })
             end
@@ -1925,14 +1945,41 @@ local function findAimTargetPos(cam, mouse)
     return nil
 end
 
+-- Counters + input-path detection for the diagnostics ("locks" should
+-- climb while RMB is held on a target).
+local aimApplied = 0
+local mouseMoveSupport = nil
+local function aimMouseMove()
+    if mouseMoveSupport == nil then
+        mouseMoveSupport = (type(mousemoverel) == "function")
+    end
+    return mouseMoveSupport
+end
+
 local function updateAimbot(cam, mouse)
     if not aimingActive() then return end
     local targetPos = findAimTargetPos(cam, mouse)
     if not targetPos then return end
+    local alpha = 1 / math.clamp(Config.Aimbot.Smoothness, 1, 10)
+    -- Preferred: move the mouse - the game's own input path turns the
+    -- camera (and the viewmodel follows); nothing can overwrite it.
+    if aimMouseMove() then
+        local sp = cam:WorldToViewportPoint(targetPos)
+        if sp.Z > 0 then
+            local center = crosshairCenter(cam)
+            local dx, dy = (sp.X - center.X) * alpha, (sp.Y - center.Y) * alpha
+            if math.abs(dx) >= 0.5 or math.abs(dy) >= 0.5 then
+                pcall(mousemoverel, dx, dy)
+            end
+            aimApplied = aimApplied + 1
+        end
+        return
+    end
+    -- Fallback: camera lock in the last render slot.
     local camCF = cam.CFrame
     local goal = CFrame.lookAt(camCF.Position, targetPos)
-    local alpha = 1 / math.clamp(Config.Aimbot.Smoothness, 1, 10)
     cam.CFrame = camCF:Lerp(goal, alpha)
+    aimApplied = aimApplied + 1
 end
 
 local function updateFovCircle(mouse)
@@ -1959,7 +2006,7 @@ local function updateFovCircle(mouse)
         end
         fovCircle = circle
     end
-    fovCircle.Position = mouse
+    fovCircle.Position = crosshairCenter(workspace.CurrentCamera)
     fovCircle.Radius = Config.Aimbot.FOV
     fovCircle.Visible = true
 end
@@ -2270,43 +2317,67 @@ local function rigNameCheck()
         for _, model in ipairs(folder:GetChildren()) do
             if model:IsA("Model") then
                 local p = rigPlayer(model)
-                print(("    '%s' -> %s"):format(model.Name,
-                    p and (("%s / %s"):format(p.Name, p.DisplayName)) or "UNRESOLVED"))
+                local extra = ""
+                if ESPUI and ESPUI.rigRecord then
+                    local ok2, rec = pcall(ESPUI.rigRecord, model)
+                    if ok2 and rec then
+                        extra = ("  [replicator: user_id %d%s]"):format(rec.uid,
+                            rec.name and (", name " .. rec.name) or "")
+                    end
+                end
+                print(("    '%s' -> %s%s"):format(model.Name,
+                    p and (("%s / %s"):format(p.Name, p.DisplayName)) or "UNRESOLVED", extra))
             end
         end
     end
     notify("Name check printed to the console (F9)")
 end
 
--- One-shot aimbot health readout: how many rigs exist, how many sit inside
--- the FOV circle right now and how many pass the visibility check.
+-- One-shot aimbot health readout. Run it WHILE holding RMB with an
+-- enemy near the crosshair: inFOV should be >= 1 and "locks" should climb.
 local function aimbotDiagnostics()
     local cam = workspace.CurrentCamera
-    local mouse = UserInputService:GetMouseLocation()
     local cfg = Config.Aimbot
     local rigs, inFov, visible = 0, 0, 0
+    local nearest = nil
     eachEnemyRig(function(model, root)
         rigs = rigs + 1
         local head = rigHead(model) or root
+        local p = rigPlayer(model)
+        local label = p and p.Name or model.Name
         if cam then
             local sp = cam:WorldToViewportPoint(head.Position)
-            if sp.Z > 0 and (Vector2.new(sp.X, sp.Y) - mouse).Magnitude <= cfg.FOV then
-                inFov = inFov + 1
-                local ok, vis = pcall(isVisible, model, cam.CFrame.Position, head.Position)
-                if ok and vis then visible = visible + 1 end
+            if sp.Z > 0 then
+                local d = (Vector2.new(sp.X, sp.Y) - crosshairCenter(cam)).Magnitude
+                if not nearest or d < nearest.d then
+                    nearest = { name = label, d = d }
+                end
+                if d <= cfg.FOV then
+                    inFov = inFov + 1
+                    local ok, vis = pcall(isVisible, model, cam.CFrame.Position, head.Position)
+                    if ok and vis then visible = visible + 1 end
+                end
             end
         end
     end)
-    print(("[deadline] aimbot check - enabled:%s mode:%s rigs:%d inFOV:%d visible:%d fov:%dpx visibleOnly:%s")
-        :format(tostring(cfg.Enabled), cfg.Mode, rigs, inFov, visible, cfg.FOV, tostring(cfg.VisibleOnly)))
+    print(("[deadline] aimbot check - enabled:%s mode:%s aiming:%s rigs:%d inFOV:%d visible:%d fov:%dpx visibleOnly:%s aimMethod:%s locks:%d")
+        :format(tostring(cfg.Enabled), cfg.Mode, tostring(aimingActive()), rigs, inFov, visible, cfg.FOV,
+            tostring(cfg.VisibleOnly), aimMouseMove() and "mouse" or "camera", aimApplied))
+    if nearest then
+        print(("[deadline]   nearest rig: %s  %.0fpx from crosshair"):format(nearest.name, nearest.d))
+    end
     if rigs == 0 then
         notify("Aimbot check: no rigs in Workspace.characters")
+    elseif not cfg.Enabled then
+        notify("Aimbot check: aimbot is toggled OFF")
     elseif inFov == 0 then
-        notify(("Aimbot check: %d rig(s), none inside the %dpx FOV circle"):format(rigs, cfg.FOV))
+        notify(("Aimbot check: %d rig(s), nearest %.0fpx - hold RMB with an enemy near the crosshair"):format(rigs, nearest and nearest.d or -1))
     elseif visible == 0 and cfg.VisibleOnly then
         notify(("Aimbot check: %d rig(s) in FOV but all blocked"):format(inFov))
+    elseif not aimingActive() then
+        notify(("Aimbot check: %d rig(s) in FOV - hold RMB to engage"):format(inFov))
     else
-        notify(("Aimbot check: %d rig(s), %d in FOV, %d visible"):format(rigs, inFov, visible))
+        notify(("Aimbot check: %d rig(s), %d in FOV, %d locks applied"):format(rigs, inFov, aimApplied))
     end
 end
 
@@ -2393,7 +2464,10 @@ local function buildMenu()
     section(pa, "Aimbot")
     toggle(pa, "Aimbot Enabled",
         function() return Config.Aimbot.Enabled end,
-        function(v) Config.Aimbot.Enabled = v end,
+        function(v)
+            Config.Aimbot.Enabled = v
+            aimApplied = 0
+        end,
         hotkeyById.ToggleAimbot)
     dropdown(pa, "Activation",
         function() return { "Hold RMB", "Always" } end,

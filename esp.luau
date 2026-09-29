@@ -315,13 +315,65 @@ end
 ESP.getLocalRoot = localCharRoot
 
 -- Robust rig -> player resolution, shared by every game script. Custom
--- rig systems (Deadline: Workspace.characters/<UserId>) don't always link
--- .Character client-side and model names can carry hidden characters, so:
--- engine link -> exact UserId name -> digit extraction -> per-player scan
--- (username / display name / UserId contained in the model name).
--- Positives are cached per model (weak keys); misses are retried, player
--- lists change.
+-- rig systems (Deadline: Workspace.characters/<session id>) don't link
+-- .Character client-side and the names are session ids, not UserIds, so:
+-- engine link -> exact UserId name -> digit extraction -> the game's own
+-- replication records (Deadline's dl_replicator keeps one record per
+-- remote player with user_id + player_name + ingame_id + the rig model -
+-- collected with a rate-limited getgc walk, only while a rig is still
+-- unresolved) -> per-player scan. Positives are cached (weak keys).
 local resolvedRigCache = setmetatable({}, { __mode = "k" })
+
+local rigRecords = setmetatable({}, { __mode = "k" })  -- rig model -> {uid, name}
+local rigRecordsById = {}                               -- ingame_id string -> {uid, name}
+local rigIndexAt = 0
+local function rigIndexScan()
+    if type(getgc) ~= "function" then return end
+    local now = os.clock()
+    if now - rigIndexAt < 5 then return end
+    rigIndexAt = now
+    local ok = pcall(function()
+        for _, obj in pairs(getgc()) do
+            if type(obj) == "table" then
+                local uid = rawget(obj, "user_id")
+                if type(uid) == "number" then
+                    local info = { uid = uid }
+                    local uname = rawget(obj, "player_name")
+                    if type(uname) == "string" then info.name = uname end
+                    local ingame = rawget(obj, "ingame_id")
+                    if ingame ~= nil then
+                        rigRecordsById[tostring(ingame)] = info
+                    end
+                    local ch = rawget(obj, "character")
+                    if ch ~= nil then
+                        local ok2, isModel = pcall(function()
+                            return typeof(ch) == "Instance" and ch:IsA("Model")
+                        end)
+                        if ok2 and isModel then
+                            rigRecords[ch] = info
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    if not ok then return end
+end
+
+local function rigRecord(model)
+    local rec = rigRecords[model] or rigRecordsById[model.Name]
+    if rec then
+        if not rigRecords[model] then rigRecords[model] = rec end
+        return rec
+    end
+    if type(getgc) ~= "function" then return nil end
+    rigIndexScan()
+    rec = rigRecords[model] or rigRecordsById[model.Name]
+    if rec then rigRecords[model] = rec end
+    return rec
+end
+ESP.rigRecord = rigRecord
+
 local function resolvePlayer(model)
     local cached = resolvedRigCache[model]
     if cached then return cached end
@@ -331,6 +383,12 @@ local function resolvePlayer(model)
         local uid = tonumber(compact) or tonumber(string.match(compact, "%d+"))
         if uid then
             p = Players:GetPlayerByUserId(uid)
+        end
+        if not p then
+            local rec = rigRecord(model)
+            if rec then
+                p = Players:GetPlayerByUserId(rec.uid)
+            end
         end
         if not p then
             for _, plr in ipairs(Players:GetPlayers()) do
@@ -353,6 +411,8 @@ local function entityName(model, nameSource)
         if nameSource == "DisplayName" then return p.DisplayName end
         return p.Name
     end
+    local rec = rigRecord(model)
+    if rec and rec.name then return rec.name end
     return "NPC: " .. model.Name
 end
 ESP.entityName = entityName
