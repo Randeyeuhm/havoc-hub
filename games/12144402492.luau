@@ -190,6 +190,14 @@
           position) - immune to any Lua-side API surprises. The report
           adds vmb= (instance barrels found) and wprobe= (first failing
           hop of the weapon chain: vm=/recv=/barrel= + child names).
+          dl-v44: THE barrel is an ATTACHMENT, not a BasePart (v43 live
+          run: wprobe resolved the whole chain to a parented instance,
+          yet every finder gated on IsA("BasePart") rejected it - and
+          barrels=0/vmb=0 both follow from exactly that). Founders now
+          accept anything carrying a WorldCFrame, and the tilt writes the
+          attachment's LOCAL CFrame (parent receiver part CFrame ->
+          object-space desired world frame) with a method-aware restore
+          (part / cframe / world); the report adds tm= (tilt method).
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -252,7 +260,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v43"
+local SCRIPT_VERSION = "dl-v44"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1506,13 +1514,22 @@ if type(ZA_STATE) ~= "table" then
     ZA_STATE = { mod = nil, orig = nil, tilted = nil, blocked = nil, warned = nil }
     genv.__HAVOC_DEADLINE_ZA = ZA_STATE
 end
--- restore a tilt left behind by an earlier run before anything else
+-- restore a tilt left behind by an earlier run before anything else.
+-- Parts restore through .CFrame, attachments (non-BasePart) through their
+-- local .CFrame too, and a last-resort WorldCFrame path is remembered.
+local function restoreTilt(t)
+    if type(t) ~= "table" or t.barrel == nil then return end
+    if t.barrel.Parent == nil then return end
+    if t.method == "world" then
+        pcall(function() t.barrel.WorldCFrame = t.saved end)
+    else
+        pcall(function() t.barrel.CFrame = t.saved end)
+    end
+end
 if ZA_STATE.tilted then
     local t = ZA_STATE.tilted
     ZA_STATE.tilted = nil
-    pcall(function()
-        if t.barrel and t.saved then t.barrel.CFrame = t.saved end
-    end)
+    restoreTilt(t)
 end
 
 -- per-shot telemetry (kept in the shared state so a wrapper left over from
@@ -1696,6 +1713,16 @@ local function compensationActive()
     return Config.Weapons.ZeroedAim or (Config.SilentAim and Config.SilentAim.Enabled)
 end
 
+-- the muzzle "barrel" is an ATTACHMENT in this game (dump: its
+-- .Position is the muzzle offset - barrel_size = receiver.barrel.Position
+-- .Magnitude - and every consumer only reads .WorldCFrame/.WorldPosition),
+-- so anything carrying a WorldCFrame qualifies as tiltable
+local function zmBarrelLike(b)
+    if b == nil then return false end
+    local ok, w = pcall(function() return b.WorldCFrame end)
+    return ok and w ~= nil
+end
+
 -- barrel of a weapon table: viewmodel.receiver.barrel. The viewmodel is
 -- an INSTANCE (Model) whose children are receiver / root_part / left /
 -- right / camera, and receiver's children include barrel - but the chain
@@ -1709,8 +1736,7 @@ local function weaponBarrelOf(w)
     if not okr or recv == nil then return nil end
     local okb, barrel = pcall(function() return recv.barrel end)
     if not okb or barrel == nil then return nil end
-    local okp, isPart = pcall(function() return barrel:IsA("BasePart") end)
-    if okp and isPart and barrel.Parent then return barrel end
+    if zmBarrelLike(barrel) and barrel.Parent then return barrel end
     return nil
 end
 
@@ -1765,7 +1791,7 @@ local function refreshVMB()
                 if child.Name:sub(1, 10) == "viewmodel_" then
                     local recv = child:FindFirstChild("receiver")
                     local barrel = recv and recv:FindFirstChild("barrel")
-                    if barrel and barrel:IsA("BasePart") then
+                    if barrel and zmBarrelLike(barrel) then
                         table.insert(list, barrel)
                     end
                 end
@@ -1776,7 +1802,7 @@ local function refreshVMB()
             local ok2, desc = pcall(function() return ignore:GetDescendants() end)
             if ok2 and desc then
                 for _, d in ipairs(desc) do
-                    if d:IsA("BasePart") and d.Name == "barrel" then
+                    if d.Name == "barrel" and zmBarrelLike(d) then
                         local recv = d.Parent
                         local vm = recv and recv.Parent
                         if recv and recv.Name == "receiver" and vm and vm.Name:sub(1, 10) == "viewmodel_" then
@@ -1799,7 +1825,7 @@ local function findVMB(pos)
     local best, bestD = nil, nil
     if type(list) == "table" then
         for _, barrel in ipairs(list) do
-            if typeof(barrel) == "BasePart" and barrel.Parent then
+            if zmBarrelLike(barrel) and barrel.Parent then
                 local d = (barrel.WorldPosition - pos).Magnitude
                 if bestD == nil or d < bestD then bestD, best = d, barrel end
             end
@@ -1962,8 +1988,13 @@ local function zeroedOnOriginWrite(vec)
         ZSTAT.noSolve = ZSTAT.noSolve + 1
         return
     end
-    local saved = barrel.CFrame
-    local dLocal = saved:VectorToObjectSpace(dir)
+    -- tilt through whatever frame the barrel carries (part or attachment)
+    local okW, world = pcall(function() return barrel.WorldCFrame end)
+    if not okW or world == nil then
+        ZSTAT.badLocal = ZSTAT.badLocal + 1
+        return
+    end
+    local dLocal = world:VectorToObjectSpace(dir)
     if dLocal.Magnitude < 0.001 or math.abs(dLocal.Y) > 0.995 then
         ZSTAT.badLocal = ZSTAT.badLocal + 1
         return
@@ -1973,8 +2004,45 @@ local function zeroedOnOriginWrite(vec)
         ZSTAT.badLocal = ZSTAT.badLocal + 1
         return
     end
-    barrel.CFrame = saved * rot
-    ZA_STATE.tilted = { barrel = barrel, saved = saved, at = os.clock() }
+    local desired = world * rot
+    local okP, isPart = pcall(function() return barrel:IsA("BasePart") end)
+    local entry = { barrel = barrel, at = os.clock() }
+    if okP and isPart then
+        entry.method = "part"
+        entry.saved = barrel.CFrame
+        barrel.CFrame = desired
+    else
+        -- attachment-style: write the LOCAL CFrame relative to the parent
+        local applied = false
+        local okL, localCF = pcall(function() return barrel.CFrame end)
+        local okPC, parent, pcf = false, nil, nil
+        pcall(function()
+            parent = barrel.Parent
+            if parent ~= nil then
+                pcf = parent.CFrame
+                okPC = pcf ~= nil
+            end
+        end)
+        if okPC and okL then
+            local okSet = pcall(function() barrel.CFrame = pcf:ToObjectSpace(desired) end)
+            if okSet then
+                entry.method = "cframe"
+                entry.saved = localCF
+                applied = true
+            end
+        end
+        if not applied then
+            local okWset = pcall(function() barrel.WorldCFrame = desired end)
+            if not okWset then
+                ZSTAT.badLocal = ZSTAT.badLocal + 1
+                return
+            end
+            entry.method = "world"
+            entry.saved = world
+        end
+    end
+    ZA_STATE.tilted = entry
+    ZSTAT.tiltMethod = entry.method
     ZSTAT.tilt = ZSTAT.tilt + 1
 end
 
@@ -2055,11 +2123,7 @@ track(RunService.RenderStepped:Connect(function()
     local t = ZA_STATE.tilted
     if not t then return end
     ZA_STATE.tilted = nil
-    pcall(function()
-        if t.barrel and t.saved and t.barrel.Parent then
-            t.barrel.CFrame = t.saved
-        end
-    end)
+    restoreTilt(t)
 end))
 
 -- Retry arming once a second while enabled but not installed (e.g. toggled
@@ -2156,9 +2220,9 @@ track(RunService.RenderStepped:Connect(function()
     if type(cache) == "table" and cache[1] ~= nil then
         wprobe = zaWeaponProbeString(cache[1])
     end
-    print(("[deadline] aim 5s (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d nearestBarrel=%s cands=%d barrels=%d vmb=%d wd(bh=%d vm=%d) noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s] wprobe=[%s]")
+    print(("[deadline] aim 5s (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d tm=%s dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d nearestBarrel=%s cands=%d barrels=%d vmb=%d wd(bh=%d vm=%d) noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s] wprobe=[%s]")
         :format(armed, ZSTAT.calls, ZSTAT.bigVec, ZSTAT.smallVec, ZSTAT.badArg,
-            ZSTAT.tilt, ZSTAT.dirSkip, ZSTAT.guardMiss,
+            ZSTAT.tilt, tostring(ZSTAT.tiltMethod or "-"), ZSTAT.dirSkip, ZSTAT.guardMiss,
             zaFmtNum(ZSTAT.nearestMiss), ZSTAT.noBarrel, zaFmtNum(ZSTAT.nearestBarrel), cands,
             barrelsN, vmb, wd.bhAny or -1, wd.vmAny or -1,
             ZSTAT.noAmmo, ZSTAT.silentNone,
@@ -3202,9 +3266,7 @@ local function buildMenu()
                 if not Config.Weapons.ZeroedAim and ZA_STATE.tilted then
                     local t = ZA_STATE.tilted
                     ZA_STATE.tilted = nil
-                    pcall(function()
-                        if t.barrel and t.saved then t.barrel.CFrame = t.saved end
-                    end)
+                    restoreTilt(t)
                 end
                 notify("Silent aim off")
             end
@@ -3437,9 +3499,7 @@ local function buildMenu()
                 if ZA_STATE.tilted then
                     local t = ZA_STATE.tilted
                     ZA_STATE.tilted = nil
-                    pcall(function()
-                        if t.barrel and t.saved then t.barrel.CFrame = t.saved end
-                    end)
+                    restoreTilt(t)
                 end
                 notify("Zeroed aim off")
             end
