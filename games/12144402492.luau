@@ -171,6 +171,15 @@
           entire v39 blackout - and that the controller cache stayed
           empty in match: every call hit noBarrel. It also showed real
           shots arriving: big origin (461) + unit direction (1) pairs.)
+          dl-v42: weapon scan fix - v41 found zero candidates because the
+          live predicate wrongly required weapon.viewmodel to be a TABLE;
+          the dump proves it is an INSTANCE (Model under the weapon, with
+          receiver/root_part/left/right/camera children). The candidate
+          list is now just own numeric barrel_heat, and the barrel chain
+          (viewmodel.receiver.barrel) is resolved with guarded plain
+          access - exactly what the game's own code does - so instance,
+          table and metatable-served shapes all work. Report adds
+          barrels= (resolvable now) and wd(bh,vm) heap-key counts.
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -233,7 +242,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v41"
+local SCRIPT_VERSION = "dl-v42"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -687,23 +696,17 @@ local function isDeadlineController(t)
         and type(rawget(lerps, "final_aim")) == "table"
 end
 
--- The weapon table the fire code carries (a1.weapon, 7v7 dump: barrel_heat
--- increments per shot at L374678, and viewmodel.receiver.barrel is the
--- part every shot launches from). Matching that barrel's world position
--- against a shot's origin identifies the live gun without any controller
--- cache - weapon switches and respawns self-heal because the check reruns
--- every shot.
+-- Weapon tables (framework weapon item class, 7v7 dump: constructor at
+-- L373841 sets an OWN numeric barrel_heat = 0). That field alone is
+-- distinctive enough to collect candidates; the viewmodel shape is
+-- checked per shot by weaponBarrelOf instead - the dump proves it is an
+-- INSTANCE (Model), not a table (L366305 viewmodel:GetDescendants(),
+-- L366313 viewmodel.Parent = Workspace.ignore.effects, L370442
+-- viewmodel.receiver:FindFirstChild("barrel")), and it may be served
+-- through class metatables, so rawget-only checks can miss it.
 local function isWeaponTable(t)
     if type(t) ~= "table" then return false end
-    if typeof(rawget(t, "barrel_heat")) ~= "number" then return false end
-    local vm = rawget(t, "viewmodel")
-    if type(vm) ~= "table" then return false end
-    local recv = rawget(vm, "receiver")
-    if recv == nil then return false end
-    local ok1, barrel = pcall(function() return recv.barrel end)
-    if not ok1 or barrel == nil then return false end
-    local ok2, isPart = pcall(function() return barrel:IsA("BasePart") end)
-    return ok2 and isPart
+    return typeof(rawget(t, "barrel_heat")) == "number"
 end
 
 -- ============================================================
@@ -745,6 +748,7 @@ local function scanControllers()
         SCAN.gcOK = true
         local out = {}
         local weapons = {}
+        local wdiag = { bhAny = 0, vmAny = 0 }
         local sawCanary = false
         local n = #heap
         for i = 1, n do
@@ -756,6 +760,10 @@ local function scanControllers()
             elseif isWeaponTable(v) then
                 table.insert(weapons, v)
             end
+            if type(v) == "table" then
+                if rawget(v, "barrel_heat") ~= nil then wdiag.bhAny = wdiag.bhAny + 1 end
+                if rawget(v, "viewmodel") ~= nil then wdiag.vmAny = wdiag.vmAny + 1 end
+            end
             -- spread the walk across frames; pcall guards non-yieldable
             -- contexts (the scan then just runs straight through)
             if (i % 8192) == 0 and i < n then pcall(task.wait) end
@@ -763,6 +771,7 @@ local function scanControllers()
         SCAN.gcOK = sawCanary
         SCAN.list = out
         SCAN.weapons = weapons
+        SCAN.weaponDiag = wdiag
     end)
     if not ok then
         -- unexpected failure mid-walk: drop the (stale) list but keep the
@@ -779,6 +788,13 @@ end
 local function findWeaponTables()
     scanControllers()
     return SCAN.weapons or {}
+end
+
+-- how many tables in the last walk carried barrel_heat / viewmodel keys
+-- at all (diagnosis for the case the candidate list stays empty)
+local function findWeaponDiag()
+    scanControllers()
+    return SCAN.weaponDiag or {}
 end
 
 -- Cached capability answer (the old version ran its own getgc per call).
@@ -1670,17 +1686,21 @@ local function compensationActive()
     return Config.Weapons.ZeroedAim or (Config.SilentAim and Config.SilentAim.Enabled)
 end
 
--- barrel of a weapon table (viewmodel.receiver.barrel), resilient to shape
+-- barrel of a weapon table: viewmodel.receiver.barrel. The viewmodel is
+-- an INSTANCE (Model) whose children are receiver / root_part / left /
+-- right / camera, and receiver's children include barrel - but the chain
+-- can also be served through class metatables, so every hop is a guarded
+-- plain access (exactly what the game's own code does).
 local function weaponBarrelOf(w)
     if type(w) ~= "table" then return nil end
-    local vm = rawget(w, "viewmodel")
-    if type(vm) ~= "table" then return nil end
-    local recv = rawget(vm, "receiver")
-    if recv == nil then return nil end
-    local ok, barrel = pcall(function() return recv.barrel end)
-    if not ok or barrel == nil then return nil end
-    local ok2, isPart = pcall(function() return barrel:IsA("BasePart") end)
-    if ok2 and isPart and barrel.Parent then return barrel end
+    local okv, vm = pcall(function() return w.viewmodel end)
+    if not okv or vm == nil then return nil end
+    local okr, recv = pcall(function() return vm.receiver end)
+    if not okr or recv == nil then return nil end
+    local okb, barrel = pcall(function() return recv.barrel end)
+    if not okb or barrel == nil then return nil end
+    local okp, isPart = pcall(function() return barrel:IsA("BasePart") end)
+    if okp and isPart and barrel.Parent then return barrel end
     return nil
 end
 
@@ -1994,11 +2014,20 @@ track(RunService.RenderStepped:Connect(function()
         return
     end
     local armed = ZA_STATE.mod and tostring(ZA_STATE.foundVia or "?") or "no"
-    local cands = (type(ZA_STATE.weaponCache) == "table" and #ZA_STATE.weaponCache) or 0
-    print(("[deadline] aim 5s (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d nearestBarrel=%s cands=%d noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s]")
+    local cache = ZA_STATE.weaponCache
+    local cands = (type(cache) == "table" and #cache) or 0
+    local barrelsN = 0
+    if type(cache) == "table" then
+        for _, w in ipairs(cache) do
+            if weaponBarrelOf(w) then barrelsN = barrelsN + 1 end
+        end
+    end
+    local wd = findWeaponDiag()
+    print(("[deadline] aim 5s (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d nearestBarrel=%s cands=%d barrels=%d wd(bh=%d vm=%d) noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s]")
         :format(armed, ZSTAT.calls, ZSTAT.bigVec, ZSTAT.smallVec, ZSTAT.badArg,
             ZSTAT.tilt, ZSTAT.dirSkip, ZSTAT.guardMiss,
             zaFmtNum(ZSTAT.nearestMiss), ZSTAT.noBarrel, zaFmtNum(ZSTAT.nearestBarrel), cands,
+            barrelsN, wd.bhAny or -1, wd.vmAny or -1,
             ZSTAT.noAmmo, ZSTAT.silentNone,
             ZSTAT.silentHit, zaFmtNum(ZSTAT.nearestAng, "deg"), ZSTAT.noSolve, ZSTAT.badLocal,
             ZSTAT.noPoint, ZSTAT.noHit, ZSTAT.noFinder, ZSTAT.inactive,
