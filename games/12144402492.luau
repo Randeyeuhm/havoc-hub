@@ -180,6 +180,16 @@
           access - exactly what the game's own code does - so instance,
           table and metatable-served shapes all work. Report adds
           barrels= (resolvable now) and wd(bh,vm) heap-key counts.
+          dl-v43: viewmodel-instance fallback + weapon probe - v42 live
+          run found the weapon (cands=1) but barrels=0: the Lua-side
+          viewmodel chain would not resolve. The game parents EVERY
+          weapon viewmodel as an instance directly under Workspace.ignore
+          (viewmodel_<GUID>_<name>, dump L122542), so the live barrel is
+          now ALSO found by scanning those instances and position-
+          matching against the shot origin (the exact barrel world
+          position) - immune to any Lua-side API surprises. The report
+          adds vmb= (instance barrels found) and wprobe= (first failing
+          hop of the weapon chain: vm=/recv=/barrel= + child names).
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -242,7 +252,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v42"
+local SCRIPT_VERSION = "dl-v43"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -1704,6 +1714,103 @@ local function weaponBarrelOf(w)
     return nil
 end
 
+-- One-line description of what the weapon chain actually looks like, for
+-- the console report (first failing hop names itself)
+local function zaWeaponProbeString(w)
+    if type(w) ~= "table" then return "-" end
+    local okv, vm = pcall(function() return w.viewmodel end)
+    if not okv then return "vm=ERR" end
+    if vm == nil then return "vm=nil" end
+    local okr, recv = pcall(function() return vm.receiver end)
+    if not okr then return "vm=" .. typeof(vm) .. " recv=ERR" end
+    if recv == nil then
+        local okk, kids = pcall(function() return vm:GetChildren() end)
+        local names = {}
+        if okk and kids then
+            for i, k in ipairs(kids) do
+                if i > 10 then break end
+                names[#names + 1] = k.Name
+            end
+        end
+        return "vm=" .. typeof(vm) .. " recv=nil kids=" .. table.concat(names, ",")
+    end
+    local okb, barrel = pcall(function() return recv.barrel end)
+    if not okb then return "recv=" .. typeof(recv) .. " barrel=ERR" end
+    if barrel == nil then
+        local okk, kids = pcall(function() return recv:GetChildren() end)
+        local names = {}
+        if okk and kids then
+            for i, k in ipairs(kids) do
+                if i > 10 then break end
+                names[#names + 1] = k.Name
+            end
+        end
+        return "recv=" .. typeof(recv) .. " barrel=nil first=" .. table.concat(names, ",")
+    end
+    return "barrel=" .. typeof(barrel) .. (barrel.Parent and " parented" or " unparented")
+end
+
+-- FALLBACK BARREL SOURCE: the game parents every weapon viewmodel as an
+-- INSTANCE directly under Workspace.ignore (viewmodel_<GUID>_<WeaponName>,
+-- dump L122542), and the shot's origin write hands us the barrel's exact
+-- world position - so matching viewmodel instances by position finds the
+-- live barrel without touching any Lua-side weapon API.
+local function refreshVMB()
+    local list = {}
+    local ignore = Workspace:FindFirstChild("ignore")
+    if ignore then
+        local ok, kids = pcall(function() return ignore:GetChildren() end)
+        if ok and kids then
+            for _, child in ipairs(kids) do
+                if child.Name:sub(1, 10) == "viewmodel_" then
+                    local recv = child:FindFirstChild("receiver")
+                    local barrel = recv and recv:FindFirstChild("barrel")
+                    if barrel and barrel:IsA("BasePart") then
+                        table.insert(list, barrel)
+                    end
+                end
+            end
+        end
+        if #list == 0 then
+            -- viewmodels nested deeper (e.g. under ignore/effects)
+            local ok2, desc = pcall(function() return ignore:GetDescendants() end)
+            if ok2 and desc then
+                for _, d in ipairs(desc) do
+                    if d:IsA("BasePart") and d.Name == "barrel" then
+                        local recv = d.Parent
+                        local vm = recv and recv.Parent
+                        if recv and recv.Name == "receiver" and vm and vm.Name:sub(1, 10) == "viewmodel_" then
+                            table.insert(list, d)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    ZA_STATE.vmBarrels = list
+    return list
+end
+
+local function findVMB(pos)
+    local list = ZA_STATE.vmBarrels
+    if not (type(list) == "table" and #list > 0) then
+        list = refreshVMB()
+    end
+    local best, bestD = nil, nil
+    if type(list) == "table" then
+        for _, barrel in ipairs(list) do
+            if typeof(barrel) == "BasePart" and barrel.Parent then
+                local d = (barrel.WorldPosition - pos).Magnitude
+                if bestD == nil or d < bestD then bestD, best = d, barrel end
+            end
+        end
+    end
+    if best and bestD <= 2 then
+        return best, bestD
+    end
+    return nil, bestD
+end
+
 -- The gun being fired right now: among the cached weapon tables, the one
 -- whose barrel sits exactly at the shot origin. The per-shot validation
 -- doubles as the cache check, so weapon switches self-heal.
@@ -1763,7 +1870,27 @@ local function zeroedOnOriginWrite(vec)
     end
     local weapon, barrel, nearest = findLiveWeapon(vec)
     if not barrel then
-        -- fallback: the lobby-style controller cache
+        -- fallback 1: viewmodel barrels matched as INSTANCES under
+        -- Workspace.ignore (immune to any Lua-side weapon API surprises)
+        local vbarrel, vd = findVMB(vec)
+        if vbarrel then
+            barrel = vbarrel
+            weapon = nil
+            local cache = ZA_STATE.weaponCache
+            if type(cache) == "table" then
+                for _, w in ipairs(cache) do
+                    if ammoFromWeapon(w) then
+                        weapon = w
+                        break
+                    end
+                end
+            end
+        elseif vd ~= nil and (nearest == nil or vd < nearest) then
+            nearest = vd
+        end
+    end
+    if not barrel then
+        -- fallback 2: the lobby-style controller cache
         local controller, cweapon, cbarrel = localWeaponBarrel()
         if cbarrel then
             local d = (vec - cbarrel.WorldPosition).Magnitude
@@ -2003,6 +2130,7 @@ track(RunService.RenderStepped:Connect(function()
             ZA_STATE.wantScan = nil
             pcall(refreshWeaponCache)
         end
+        pcall(refreshVMB)
         local _, _, barrel = localWeaponBarrel()
         if not barrel then pcall(refreshControllerCache) end
     end
@@ -2023,18 +2151,24 @@ track(RunService.RenderStepped:Connect(function()
         end
     end
     local wd = findWeaponDiag()
-    print(("[deadline] aim 5s (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d nearestBarrel=%s cands=%d barrels=%d wd(bh=%d vm=%d) noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s]")
+    local vmb = (type(ZA_STATE.vmBarrels) == "table" and #ZA_STATE.vmBarrels) or 0
+    local wprobe = "-"
+    if type(cache) == "table" and cache[1] ~= nil then
+        wprobe = zaWeaponProbeString(cache[1])
+    end
+    print(("[deadline] aim 5s (armed=%s): calls=%d big=%d small=%d badArg=%d tilt=%d dirSkip=%d guardMiss=%d guardNear=%s noBarrel=%d nearestBarrel=%s cands=%d barrels=%d vmb=%d wd(bh=%d vm=%d) noAmmo=%d none=%d hit=%d nearestAng=%s solveFail=%d localFail=%d noPoint=%d noHit=%d noFinder=%d inactive=%d errs=%d ferr=%d%s%s probe=%s samples=[%s] wprobe=[%s]")
         :format(armed, ZSTAT.calls, ZSTAT.bigVec, ZSTAT.smallVec, ZSTAT.badArg,
             ZSTAT.tilt, ZSTAT.dirSkip, ZSTAT.guardMiss,
             zaFmtNum(ZSTAT.nearestMiss), ZSTAT.noBarrel, zaFmtNum(ZSTAT.nearestBarrel), cands,
-            barrelsN, wd.bhAny or -1, wd.vmAny or -1,
+            barrelsN, vmb, wd.bhAny or -1, wd.vmAny or -1,
             ZSTAT.noAmmo, ZSTAT.silentNone,
             ZSTAT.silentHit, zaFmtNum(ZSTAT.nearestAng, "deg"), ZSTAT.noSolve, ZSTAT.badLocal,
             ZSTAT.noPoint, ZSTAT.noHit, ZSTAT.noFinder, ZSTAT.inactive,
             ZSTAT.errs, ZSTAT.ferr,
             ZSTAT.firstErr and (" err=" .. ZSTAT.firstErr) or "",
             ZSTAT.firstFerr and (" ferrMsg=" .. ZSTAT.firstFerr) or "",
-            tostring(ZSTAT.argProbe or "-"), table.concat(ZSTAT.samples or {}, "; ")))
+            tostring(ZSTAT.argProbe or "-"), table.concat(ZSTAT.samples or {}, "; "),
+            wprobe))
     zResetStats()
 end))
 
