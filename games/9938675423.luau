@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v2
+    HAVOC HUB - OAKLANDS                           oak-v3
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -37,6 +37,18 @@
         Speed / Jump Power / Sprint Boost were live-tested: they work,
         but the server bans for them eventually.)
 
+    Carry
+      • Enhanced Drag   - optional, OFF by default. The carry/pickup
+                          mechanic is the dragger, and both of its strength
+                          knobs are client-side live reads: reach
+                          (DefaultMaxDragDistance, vanilla 12 studs, the
+                          game range-checks grabs against it) and pull
+                          force (AlignPosition MaxForce / AlignOrientation
+                          MaxTorque under the dragged object's DragForce
+                          attachment). Pure client physics of a drag the
+                          server already granted - no packets. Server
+                          checks on dragging are unknown: keep modest.
+
     Misc
       • Fullbright       - grey ambient + no fog, re-applied every second
                            (the game's weather system likes to fight back).
@@ -56,7 +68,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v2"
+local SCRIPT_VERSION = "oak-v3"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -122,6 +134,11 @@ local DEFAULTS = {
         JumpPower   = 50,
         SprintBoost = 1,
     },
+    Drag = {
+        Enhanced = false,
+        Reach    = 12,   -- studs (vanilla 12 = DefaultMaxDragDistance)
+        Strength = 1,    -- multiplier on the live drag forces
+    },
     Misc = {
         Fullbright          = false,
         FullbrightIntensity = 190,
@@ -173,6 +190,8 @@ Config.Movement.InfJump = false
 Config.Movement.WalkSpeed = 16
 Config.Movement.JumpPower = 50
 Config.Movement.SprintBoost = 1
+Config.Drag.Reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
+Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 3)
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
 
 local function saveConfig()
@@ -595,6 +614,147 @@ track(task.spawn(function()
 end))
 
 -- ============================================================
+-- DRAGGING  (optional client-side dragger reach + pull strength)
+-- ============================================================
+-- Oaklands' carry/pickup mechanic IS the dragger: the client range-checks
+-- the grab against DefaultMaxDragDistance (= 12 on the live dragger
+-- instance), asks the server once (RequestDrag), then pulls the object
+-- with an AlignPosition + AlignOrientation pair whose attachment
+-- "DragForce" is parented to the dragged part (MaxForce = the part's
+-- "DragForce" attribute or 15000, MaxTorque = "DragTorque" or 48500).
+-- Both knobs are read/written by the CLIENT live:
+--   * reach - field write on the dragger instance (found via getgc)
+--   * pull  - multiplier on the live constraints during a drag
+-- No packets are sent by this feature. Server-side drag checks are
+-- unknown (the server scripts were undumpable) - the menu says keep it
+-- modest.
+local DRAG_STATE = genv.__HAVOC_OAKLANDS_DRAG
+if type(DRAG_STATE) ~= "table" then
+    DRAG_STATE = { draggers = nil, lastScan = 0 }
+    genv.__HAVOC_OAKLANDS_DRAG = DRAG_STATE
+end
+if type(DRAG_STATE.savedDist) ~= "table" then
+    DRAG_STATE.savedDist = setmetatable({}, { __mode = "k" })
+end
+if type(DRAG_STATE.savedForces) ~= "table" then
+    DRAG_STATE.savedForces = setmetatable({}, { __mode = "k" })
+end
+
+local function findDraggers()
+    local out = {}
+    pcall(function()
+        local fn = getgc
+        if type(fn) ~= "function" then return end
+        local heaps = {}
+        local ok1, g1 = pcall(fn, true)
+        if ok1 and type(g1) == "table" then table.insert(heaps, g1) end
+        local ok2, g2 = pcall(fn)
+        if ok2 and type(g2) == "table" and g2 ~= g1 then table.insert(heaps, g2) end
+        for _, heap in ipairs(heaps) do
+            for _, v in ipairs(heap) do
+                if type(v) == "table"
+                    and typeof(rawget(v, "DefaultMaxDragDistance")) == "number"
+                    and type(rawget(v, "DragInfo")) == "table" then
+                    table.insert(out, v)
+                end
+            end
+        end
+    end)
+    return out
+end
+
+local function restoreDragForces()
+    for con, kept in pairs(DRAG_STATE.savedForces) do
+        if con.Parent then
+            pcall(function()
+                if kept.kind == "pos" then
+                    con.MaxForce = kept.base
+                else
+                    con.MaxTorque = kept.base
+                end
+            end)
+        end
+        DRAG_STATE.savedForces[con] = nil
+    end
+end
+
+local function applyDragRestore()
+    for dragger, orig in pairs(DRAG_STATE.savedDist) do
+        pcall(function() dragger.DefaultMaxDragDistance = orig end)
+        DRAG_STATE.savedDist[dragger] = nil
+    end
+    restoreDragForces()
+end
+
+local function dragStep()
+    if not Config.Drag.Enhanced then
+        if next(DRAG_STATE.savedDist) ~= nil or next(DRAG_STATE.savedForces) ~= nil then
+            applyDragRestore()
+        end
+        return
+    end
+    local now = os.clock()
+    if type(DRAG_STATE.draggers) ~= "table" or #DRAG_STATE.draggers == 0 or now - DRAG_STATE.lastScan > 30 then
+        DRAG_STATE.lastScan = now
+        DRAG_STATE.draggers = findDraggers()
+    end
+    -- reach: the dragger itself range-checks every grab against this field
+    local reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
+    for _, dragger in ipairs(DRAG_STATE.draggers) do
+        if DRAG_STATE.savedDist[dragger] == nil then
+            DRAG_STATE.savedDist[dragger] = tonumber(rawget(dragger, "DefaultMaxDragDistance")) or 12
+        end
+        pcall(function() dragger.DefaultMaxDragDistance = reach end)
+    end
+    -- pull strength: boost the live constraints while a drag is active
+    local mult = tonumber(Config.Drag.Strength) or 1
+    if mult <= 1.001 then
+        if next(DRAG_STATE.savedForces) ~= nil then restoreDragForces() end
+        return
+    end
+    local char = LocalPlayer.Character
+    local root = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
+    if not root then return end
+    local okq, parts = pcall(function()
+        return Workspace:GetPartBoundsInRadius(root.Position, reach + 8)
+    end)
+    if not okq or not parts then return end
+    for _, part in ipairs(parts) do
+        local att = part:FindFirstChild("DragForce")
+        if att then
+            for _, con in ipairs(att:GetChildren()) do
+                if con:IsA("AlignPosition") then
+                    local saved = DRAG_STATE.savedForces[con]
+                    if saved == nil then
+                        saved = { kind = "pos", base = tonumber(con.MaxForce) }
+                        DRAG_STATE.savedForces[con] = saved
+                    end
+                    if saved.base and saved.base > 0 and saved.base < 1e12 then
+                        pcall(function() con.MaxForce = saved.base * mult end)
+                    end
+                elseif con:IsA("AlignOrientation") then
+                    local saved = DRAG_STATE.savedForces[con]
+                    if saved == nil then
+                        saved = { kind = "ori", base = tonumber(con.MaxTorque) }
+                        DRAG_STATE.savedForces[con] = saved
+                    end
+                    if saved.base and saved.base > 0 and saved.base < 1e12 then
+                        pcall(function() con.MaxTorque = saved.base * mult end)
+                    end
+                end
+            end
+        end
+    end
+end
+
+track(task.spawn(function()
+    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
+        task.wait(0.25)
+        pcall(dragStep)
+    end
+end))
+
+-- ============================================================
 -- MOVEMENT  (experimental block REMOVED in oak-v2)
 -- ============================================================
 -- Infinite Jump / Walk Speed / Jump Power / Sprint Boost were live-tested:
@@ -869,6 +1029,23 @@ local function buildMenu()
             notify(v and "Infinite stamina on - sprint forever" or "Stamina normal")
         end)
     note(pmv, "Refills to your baseline instantly - stays under the game's stamina watch (it only alerts ABOVE baseline+50).")
+
+    section(pmv, "Dragging")
+    toggle(pmv, "Enhanced Drag",
+        function() return Config.Drag.Enhanced end,
+        function(v)
+            Config.Drag.Enhanced = v
+            notify(v and "Enhanced drag on - reaches farther, pulls harder" or "Dragger back to vanilla")
+        end)
+    slider(pmv, "Drag Reach",
+        function() return Config.Drag.Reach end,
+        function(v) Config.Drag.Reach = v end, 1, 12, 24,
+        function(v) return v <= 12 and "12 (vanilla)" or ("%d studs"):format(v) end)
+    slider(pmv, "Drag Strength",
+        function() return Config.Drag.Strength end,
+        function(v) Config.Drag.Strength = v end, 0.25, 1, 3,
+        function(v) return v <= 1.001 and "1.00x (vanilla)" or ("%.2fx"):format(v) end)
+    note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force on the object. Server checks on dragging are unknown - keep it modest.")
 
     note(pmv, "Speed / jump features were removed in oak-v2 - live testing showed the server bans for them eventually. Infinite Stamina stays: it never crosses the game's own self-report threshold.")
 
