@@ -54,9 +54,11 @@
         scan); during the jump the wheels go nocollide + weightless so
         nothing catches on them, then their physics comes back. The
         landing nudges up over obstacles; the camera must be >20 studs
-        away so the chase cam can never trigger it. The car is pinned
-        at the landing spot for a moment (beats physics / server
-        drag), then the freecam drops so you SEE where it landed.
+        away so the chase cam can never trigger it. The car is frozen
+        (anchored) for the jump + a beat after landing - nothing tips
+        over, cargo can't slip out, and there's no physics lag - then
+        it is released and the freecam drops so you SEE where it
+        landed.
         Console prints parts / assemblies / wheels + a settle line.
         Same class of teleport as the store warps.
 
@@ -121,7 +123,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v30"
+local SCRIPT_VERSION = "oak-v31"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1775,9 +1777,22 @@ end
 
 local TP_JOB = nil
 
--- restore wheel physics when a settle watch ends (any reason)
+-- restore physics when a settle watch ends (any reason): unanchor the
+-- freeze, zero the velocities so nothing carries momentum into the
+-- release, and give the wheels their collision back
 local function finishTpJob(job, note)
     if not job then return end
+    if job.anchored then
+        for p, was in pairs(job.anchored) do
+            pcall(function()
+                if p.Parent then
+                    p.Anchored = was
+                    p.AssemblyLinearVelocity = Vector3.zero
+                    p.AssemblyAngularVelocity = Vector3.zero
+                end
+            end)
+        end
+    end
     if job.wheels then
         for p, st in pairs(job.wheels) do
             pcall(function()
@@ -1916,7 +1931,12 @@ local function cameraTeleport()
     end
     if #parts == 0 then parts[1] = root end
     -- one CFrame write per unique assembly (setting one part moves its
-    -- whole rigid assembly - a second write would double-move it)
+    -- whole rigid assembly - a second write would double-move it). Each
+    -- written assembly is FROZEN (anchored, client-side only) until the
+    -- settle window ends: that is what stops loaded cargo from tipping
+    -- the truck or slipping out mid-jump, and it kills the physics-storm
+    -- lag that came with teleporting a bed full of logs.
+    local anchorState = {}
     local function tpApply()
         local shift = landPos - root.Position
         if shift.Magnitude < 0.5 then return 0, 0 end
@@ -1926,6 +1946,10 @@ local function cameraTeleport()
             if a and not moved[a] then
                 moved[a] = true
                 local okp = pcall(function()
+                    if anchorState[p] == nil then
+                        anchorState[p] = p.Anchored
+                    end
+                    p.Anchored = true
                     p.AssemblyLinearVelocity = Vector3.zero
                     p.AssemblyAngularVelocity = Vector3.zero
                     p.CFrame = CFrame.new(shift) * p.CFrame
@@ -1945,7 +1969,7 @@ local function cameraTeleport()
     -- pin the car where it landed for a moment in case anything (server
     -- replication, physics wake-up, streaming) tries to drag it back;
     -- the settle line is the evidence when something persistent fights
-    TP_JOB = { root = root, landPos = landPos, apply = tpApply, wheels = wheelState, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.6, applies = 1 }
+    TP_JOB = { root = root, landPos = landPos, apply = tpApply, wheels = wheelState, anchored = anchorState, nextAt = 0, doneAt = os.clock() + 0.35, hardDoneAt = os.clock() + 0.9, applies = 1 }
     if FREE.on then
         pcall(freecamOff)  -- camera back on you, so you SEE where it landed
         pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
@@ -1969,7 +1993,7 @@ track(RunService.Heartbeat:Connect(function()
         local d = job.landPos - root.Position
         local drift = Vector3.new(d.X, 0, d.Z).Magnitude  -- horizontal only: gravity may drop it on landing, that's fine
         if os.clock() > job.doneAt then
-            if drift > 8 and os.clock() < job.hardDoneAt and job.applies < 90 then
+            if drift > 8 and os.clock() < job.hardDoneAt and job.applies < 30 then
                 job.doneAt = os.clock() + 0.25
             else
                 local note = drift > 8 and " - something keeps dragging it back" or ""
@@ -1978,9 +2002,13 @@ track(RunService.Heartbeat:Connect(function()
                 return
             end
         end
-        if drift > 6 and job.applies < 90 then
+        -- re-asserts are throttled to 10/s: while the freeze holds the
+        -- car cannot drift on its own, so there is no point burning
+        -- physics every single frame (that WAS the cargo teleport lag)
+        if drift > 6 and job.applies < 30 and os.clock() >= (job.nextAt or 0) then
             job.apply()
             job.applies = job.applies + 1
+            job.nextAt = os.clock() + 0.1
         end
     end)
 end))
