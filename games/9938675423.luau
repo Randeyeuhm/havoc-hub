@@ -45,14 +45,15 @@
         hovers instead of fighting the camera.
       • Cam Teleport   - optional: sit in a vehicle, fly the freecam
         to a spot, press T - the WHOLE vehicle (wheels included) and
-        you teleport straight there. Every jointed part of the rig is
-        collected (joint-graph walk), the landing nudges up over
-        obstacles, and the camera must be >20 studs away so the chase
-        cam can never trigger it. The car is pinned at the landing
-        spot for a moment (beats physics / server drag), then the
-        freecam drops so you SEE where it landed. Console prints the
-        parts / assemblies moved plus a settle line.
-        Same class of teleport as the store warps.
+        you teleport straight there. Collection walks the joint graph
+        AND sweeps the rig model + attachment reverse-lookups (catches
+        wheels whose constraints sit in rig folders - the "wheels
+        bug"), the landing nudges up over obstacles, and the camera
+        must be >20 studs away so the chase cam can never trigger it.
+        The car is pinned at the landing spot for a moment (beats
+        physics / server drag), then the freecam drops so you SEE
+        where it landed. Console prints parts / assemblies + a settle
+        line. Same class of teleport as the store warps.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -115,7 +116,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v24"
+local SCRIPT_VERSION = "oak-v25"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1574,7 +1575,7 @@ local function jointNeighbors(part)
         for _, j in ipairs(list) do joints[#joints + 1] = j end
     end
     for _, ch in ipairs(part:GetChildren()) do
-        if ch:IsA("JointInstance") or ch:IsA("Constraint") then
+        if ch:IsA("JointInstance") or ch:IsA("Constraint") or ch:IsA("WeldConstraint") then
             joints[#joints + 1] = ch
         end
     end
@@ -1586,6 +1587,11 @@ local function jointNeighbors(part)
             if a0 and a0.Parent then push(a0.Parent) end
             if a1 and a1.Parent then push(a1.Parent) end
         end)
+    end
+    -- also let the engine answer: everything joint-connected to this part
+    local okc, conn = pcall(function() return part:GetConnectedParts(true) end)
+    if okc and conn then
+        for _, n in ipairs(conn) do push(n) end
     end
     return out
 end
@@ -1604,7 +1610,111 @@ local function collectVehicleParts(seat)
             end
         end
     end
-    return list
+    return list, seen
+end
+
+-- The wheels can hang off the body through constraints parented OUTSIDE
+-- the parts they connect (rig folders), which a walk from the seat can
+-- miss - a missed wheel assembly rubber-bands behind the car ("the
+-- wheels bug"). Extra passes close that gap: attachment reverse-lookup,
+-- a joint sweep over the shared model the collected parts live in
+-- (deepest seat ancestor holding every non-character part - no names
+-- involved), then one more reverse-lookup. Returns how many parts the
+-- extra passes added, so the console line proves they fired.
+local function augmentVehicleParts(list, seen, seat, ch)
+    local added = 0
+    local function add(p)
+        if p and p:IsA("BasePart") and not seen[p] and #list < 800 then
+            seen[p] = true
+            list[#list + 1] = p
+            added = added + 1
+            return true
+        end
+        return false
+    end
+    local function sidesOf(j)
+        local sides = { j.Part0, j.Part1 }
+        local a0, a1 = j.Attachment0, j.Attachment1
+        if a0 then sides[#sides + 1] = a0.Parent end
+        if a1 then sides[#sides + 1] = a1.Parent end
+        return sides
+    end
+    local function reversePass()
+        local grew = false
+        for i = 1, #list do
+            local p = list[i]
+            for _, att in ipairs(p:GetDescendants()) do
+                if att:IsA("Attachment") then
+                    pcall(function()
+                        local c = att.ParentConstraint
+                        if c then
+                            for _, s in ipairs(sidesOf(c)) do
+                                if add(s) then grew = true end
+                            end
+                        end
+                    end)
+                end
+            end
+        end
+        return grew
+    end
+    local function sweepPass(candidates)
+        local grew = false
+        for _, j in ipairs(candidates) do
+            if j:IsA("JointInstance") or j:IsA("Constraint") or j:IsA("WeldConstraint") then
+                pcall(function()
+                    local sides = sidesOf(j)
+                    local touching = false
+                    for _, s in ipairs(sides) do
+                        if s and s:IsA("BasePart") and seen[s] then
+                            touching = true
+                            break
+                        end
+                    end
+                    if touching then
+                        for _, s in ipairs(sides) do
+                            if add(s) then grew = true end
+                        end
+                    end
+                end)
+            end
+        end
+        return grew
+    end
+    for _ = 1, 2 do
+        if not reversePass() then break end
+    end
+    local common = nil
+    do
+        local node = seat
+        while node and node ~= game do
+            local all = true
+            for _, p in ipairs(list) do
+                if not (ch and p:IsDescendantOf(ch)) and not p:IsDescendantOf(node) then
+                    all = false
+                    break
+                end
+            end
+            if all then
+                common = node
+                break
+            end
+            node = node.Parent
+        end
+        if common == Workspace or common == game then common = nil end
+    end
+    if common then
+        local ok, descs = pcall(function() return common:GetDescendants() end)
+        if ok and descs then
+            for _ = 1, 4 do
+                if not sweepPass(descs) then break end
+            end
+        end
+    end
+    for _ = 1, 2 do
+        if not reversePass() then break end
+    end
+    return added
 end
 
 local TP_JOB = nil
@@ -1654,34 +1764,42 @@ local function cameraTeleport()
         print("[oaklands] cam tp: landing spot is blocked - aim the freecam at open space")
         return
     end
-    local parts = collectVehicleParts(seat)
+    local parts, seenParts = collectVehicleParts(seat)
+    local rigged = augmentVehicleParts(parts, seenParts, seat, ch)
     if ch then
         local hrp = ch:FindFirstChild("HumanoidRootPart")
-        if hrp then parts[#parts + 1] = hrp end
+        if hrp and not seenParts[hrp] then
+            seenParts[hrp] = true
+            parts[#parts + 1] = hrp
+        end
     end
     if #parts == 0 then parts[1] = root end
     -- one CFrame write per unique assembly (setting one part moves its
     -- whole rigid assembly - a second write would double-move it)
     local function tpApply()
         local shift = landPos - root.Position
-        if shift.Magnitude < 0.5 then return 0 end
-        local moved, cnt = {}, 0
+        if shift.Magnitude < 0.5 then return 0, 0 end
+        local moved, cnt, fls = {}, 0, 0
         for _, p in ipairs(parts) do
             local a = p.AssemblyRootPart
             if a and not moved[a] then
                 moved[a] = true
-                pcall(function()
+                local okp = pcall(function()
                     p.AssemblyLinearVelocity = Vector3.zero
                     p.AssemblyAngularVelocity = Vector3.zero
                     p.CFrame = CFrame.new(shift) * p.CFrame
                 end)
-                cnt = cnt + 1
+                if okp then cnt = cnt + 1 else fls = fls + 1 end
             end
         end
-        return cnt
+        return cnt, fls
     end
-    local count = tpApply()
-    print(("[oaklands] cam tp: moved %d studs to the camera (vehicle: %d parts, %d assemblies)"):format(math.floor(dist), #parts, count))
+    local count, fails = tpApply()
+    local extra = {}
+    if fails > 0 then extra[#extra + 1] = ("%d failed"):format(fails) end
+    if rigged > 0 then extra[#extra + 1] = ("+%d rigged"):format(rigged) end
+    local suffix = #extra > 0 and (" [" .. table.concat(extra, ", ") .. "]") or ""
+    print(("[oaklands] cam tp: moved %d studs (vehicle: %d parts, %d assemblies)%s"):format(math.floor(dist), #parts, count, suffix))
     -- pin the car where it landed for a moment in case anything (server
     -- replication, physics wake-up, streaming) tries to drag it back;
     -- the settle line is the evidence when something persistent fights
@@ -1691,7 +1809,7 @@ end
 
 -- settle watch: re-assert the car at the landing spot while the world
 -- catches up (physics wake-up, server ack, streaming). Gives up after
--- hardUntil and prints a settle line either way.
+-- hardDoneAt and prints a settle line either way.
 track(RunService.Heartbeat:Connect(function()
     if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
     local job = TP_JOB
