@@ -42,7 +42,8 @@
         live key chip), WASD flies, mouse looks, Space/LeftCtrl
         up-down, Shift is a 3x boost. Movement keys are swallowed
         while it's on so the character stays put; vehicle fly just
-        hovers instead of fighting the camera.
+        hovers instead of fighting the camera; and dying/respawning
+        drops the freecam so the mouse never stays locked.
       • Cam Teleport   - optional: sit in a vehicle, fly the freecam
         to a spot, press T - the WHOLE vehicle (wheels included) and
         you teleport straight there. Collection walks the joint graph,
@@ -119,7 +120,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v27"
+local SCRIPT_VERSION = "oak-v28"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1549,6 +1550,39 @@ pcall(function()
         Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
         Enum.KeyCode.Space, Enum.KeyCode.LeftShift)
 end)
+
+-- death guard (oak-v28): dying while the freecam is up used to leave the
+-- camera scriptable and the mouse stuck in LockCenter forever. Died fires
+-- at the death moment; CharacterAdded / CharacterRemoving catch anything
+-- else that swaps the character.
+local function freecamDeathGuard(ch)
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    track(hum.Died:Connect(function()
+        if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+        if FREE.on then
+            pcall(freecamOff)
+        end
+        pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+    end))
+end
+if LocalPlayer.Character then
+    freecamDeathGuard(LocalPlayer.Character)
+end
+track(LocalPlayer.CharacterAdded:Connect(function(ch)
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    if FREE.on then
+        pcall(freecamOff)
+    end
+    pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+    freecamDeathGuard(ch)
+end))
+track(LocalPlayer.CharacterRemoving:Connect(function()
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    if FREE.on then
+        pcall(freecamOff)
+    end
+end))
 
 -- (Ghost Vehicle removed in oak-v21 - char noclip got detected; Cam Teleport replaces it)
 
