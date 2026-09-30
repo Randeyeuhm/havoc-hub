@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v13
+    HAVOC HUB - OAKLANDS                           oak-v14
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -37,6 +37,9 @@
         compensated). Roll/pitch is locked so the car cannot capsize -
         pull a flip and it rights itself. Direct velocity + angular
         writes on your own vehicle - cars work best. Off by default.
+      • Ghost Vehicle  - optional, test-tier: while seated, your
+        vehicle's parts go non-colliding locally (client-owned assembly)
+        - drive through fences, trees, hills. Off by default.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -62,6 +65,12 @@
                               frame after release (the throw is an
                               inlined closure - it can't be scaled from
                               inside). Needs Enhanced Drag on.
+                            * no-collide - flips the game's own drag
+                              passthrough (_G.DragPassthrough + the
+                              DragNoCollide player setting patched
+                              locally): tagged world parts stop colliding
+                              with the held object and the drag rays
+                              ignore them.
                           Console prints a scan line on toggle. Pure client
                           physics of a drag the server already granted - no
                           packets. Server checks on dragging are unknown:
@@ -90,7 +99,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v13"
+local SCRIPT_VERSION = "oak-v14"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -161,12 +170,14 @@ local DEFAULTS = {
         Reach    = 12,   -- studs (vanilla 12 = DefaultMaxDragDistance)
         Strength = 1,    -- multiplier on the live drag forces
         Throw    = 1,    -- multiplier on the classic dragger's G-throw impulse
+        NoCollide = false, -- drag through DragNoCollide-tagged parts (game's own passthrough)
     },
     Vehicle = {
         Enabled = false,
         Mult    = 3,     -- multiplier on VehicleSeat MaxSpeed + Torque
         Fly      = false,
         FlySpeed = 150,  -- studs/s for the Vehicle Fly controller
+        Ghost    = false, -- your vehicle stops colliding locally (test)
     },
     Misc = {
         Fullbright          = false,
@@ -1035,6 +1046,100 @@ track(task.spawn(function()
 end))
 
 -- ============================================================
+-- DRAG NO-COLLIDE  (the classic dragger's own passthrough system)
+-- ============================================================
+-- The dragger ships a full passthrough mode: DragNoCollide-tagged world
+-- parts stop colliding with the held object, and the drag rays ignore
+-- them. It is gated twice - _G.DragPassthrough and the player setting
+-- DragNoCollide (= 1). We flip both locally: the flag on _G, and the
+-- setting inside the client settings table the dragger re-reads at every
+-- drag start (found via getgc; settings flow from the server, so the
+-- patch is local-only and re-asserted while on). No packets sent.
+local NC_STATE = genv.__HAVOC_OAKLANDS_DRAGNC
+if type(NC_STATE) ~= "table" then
+    NC_STATE = { settings = nil, lastScan = 0 }
+    genv.__HAVOC_OAKLANDS_DRAGNC = NC_STATE
+end
+
+local function findSettingsModule()
+    local found = nil
+    pcall(function()
+        local fn = getgc
+        if type(fn) ~= "function" then return end
+        local ok, heap = pcall(fn, true)
+        if not ok or type(heap) ~= "table" then return end
+        for _, v in ipairs(heap) do
+            if type(v) == "table" then
+                local cs = rawget(v, "CurrentSettings")
+                if type(cs) == "table" and type(rawget(cs, "DragNoCollide")) == "table" then
+                    found = v
+                    break
+                end
+            end
+        end
+    end)
+    return found
+end
+
+local function noCollideRestore()
+    local s = NC_STATE.settings
+    if s and NC_STATE.orig ~= nil then
+        local cs = rawget(s, "CurrentSettings")
+        local item = type(cs) == "table" and rawget(cs, "DragNoCollide") or nil
+        if type(item) == "table" then
+            pcall(function() item.Value = NC_STATE.orig end)
+        end
+    end
+    NC_STATE.patched = nil
+    pcall(function() _G.DragPassthrough = NC_STATE.origGP end)
+end
+
+local function noCollideStep()
+    if not Config.Drag.NoCollide then
+        if NC_STATE.patched or NC_STATE.origGP ~= nil then
+            noCollideRestore()
+            NC_STATE.origGP = nil
+        end
+        return
+    end
+    if NC_STATE.origGP == nil then
+        local ok, v = pcall(function() return _G.DragPassthrough end)
+        NC_STATE.origGP = (ok and v) or false
+    end
+    pcall(function() _G.DragPassthrough = true end)
+    local now = os.clock()
+    if not NC_STATE.settings and now - (NC_STATE.lastScan or 0) > 5 then
+        NC_STATE.lastScan = now
+        NC_STATE.settings = findSettingsModule()
+        if NC_STATE.settings then
+            print("[oaklands] drag no-collide: settings found")
+        end
+    end
+    local s = NC_STATE.settings
+    if s then
+        local cs = rawget(s, "CurrentSettings")
+        local item = type(cs) == "table" and rawget(cs, "DragNoCollide") or nil
+        if type(item) == "table" then
+            if NC_STATE.orig == nil then
+                NC_STATE.orig = tonumber(item.Value)
+            end
+            if item.Value ~= 1 then
+                pcall(function() item.Value = 1 end)
+            end
+            NC_STATE.patched = true
+        end
+    end
+end
+
+track(task.spawn(function()
+    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
+        task.wait(1)
+        pcall(noCollideStep)
+    end
+end))
+pcall(noCollideStep)
+
+-- ============================================================
 -- VEHICLE SPEED  (client-side; the DRIVER simulates the vehicle)
 -- ============================================================
 -- The game's own driver module (/ReplicatedFirst/Client/GUI/Vehicle)
@@ -1051,6 +1156,9 @@ if type(VEH_STATE) ~= "table" then
 end
 if type(VEH_STATE.saved) ~= "table" then
     VEH_STATE.saved = setmetatable({}, { __mode = "k" })
+end
+if type(VEH_STATE.ghost) ~= "table" then
+    VEH_STATE.ghost = setmetatable({}, { __mode = "k" })
 end
 
 local function restoreVehicleSpeed()
@@ -1146,15 +1254,63 @@ track(RunService.RenderStepped:Connect(function(dt)
     pcall(vehicleFlyStep, dt)
 end))
 
+local function ghostSet(seat, on)
+    if on then
+        local model = seat:FindFirstAncestorWhichIsA("Model")
+        if not model then return end
+        local saved = {}
+        for _, p in ipairs(model:GetDescendants()) do
+            if p:IsA("BasePart") and p.CanCollide then
+                saved[p] = true
+                pcall(function() p.CanCollide = false end)
+            end
+        end
+        VEH_STATE.ghost[seat] = saved
+    else
+        local saved = VEH_STATE.ghost[seat]
+        if saved then
+            for p in pairs(saved) do
+                if p.Parent then
+                    pcall(function() p.CanCollide = true end)
+                end
+            end
+            VEH_STATE.ghost[seat] = nil
+        end
+    end
+end
+
+local function ghostStep()
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local seat = hum and hum.SeatPart
+    if not (seat and seat:IsA("VehicleSeat")) then
+        seat = nil
+    end
+    local gs = VEH_STATE.ghostSeat
+    if Config.Vehicle.Ghost and seat then
+        if gs ~= seat then
+            if gs then pcall(ghostSet, gs, false) end
+            VEH_STATE.ghostSeat = seat
+            pcall(ghostSet, seat, true)
+            print("[oaklands] ghost vehicle on")
+        end
+    elseif gs then
+        pcall(ghostSet, gs, false)
+        VEH_STATE.ghostSeat = nil
+    end
+end
+
 track(task.spawn(function()
     while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
         task.wait(0.5)
         pcall(vehicleStep)
+        pcall(ghostStep)
     end
 end))
 pcall(function()
     if not Config.Vehicle.Enabled then restoreVehicleSpeed() end
 end)
+pcall(ghostStep)
 
 -- ============================================================
 -- MOVEMENT  (experimental block REMOVED in oak-v2)
@@ -1439,6 +1595,13 @@ local function buildMenu()
             if v >= 100 then return ("%dx"):format(math.floor(v + 0.5)) end
             return ("%.2fx"):format(v)
         end)
+    toggle(pmv, "No-Collide Drag",
+        function() return Config.Drag.NoCollide end,
+        function(v)
+            Config.Drag.NoCollide = v
+            if not v then pcall(noCollideStep) end
+            notify(v and "Drag no-collide on" or "Drag no-collide off")
+        end)
     section(pmv, "Vehicles")
     toggle(pmv, "Vehicle Speed",
         function() return Config.Vehicle.Enabled end,
@@ -1461,6 +1624,13 @@ local function buildMenu()
         function() return Config.Vehicle.FlySpeed end,
         function(v) Config.Vehicle.FlySpeed = v end, 5, 25, 500,
         function(v) return ("%d studs/s"):format(v) end)
+    toggle(pmv, "Ghost Vehicle",
+        function() return Config.Vehicle.Ghost end,
+        function(v)
+            Config.Vehicle.Ghost = v
+            pcall(ghostStep)
+            notify(v and "Ghost vehicle on - nothing collides" or "Vehicle collisions restored")
+        end)
     -- ---------------- Misc ----------------
     section(pmi, "Lighting")
     toggle(pmi, "Fullbright",
