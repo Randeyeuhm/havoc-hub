@@ -45,8 +45,9 @@
         hovers instead of fighting the camera; every exit path (toggle
         off, death, cam teleport) hands the mouse back unlocked.
       • Cam Teleport   - optional: sit in a vehicle, fly the freecam
-        to a spot, press T - the WHOLE vehicle (wheels included) and
-        you teleport straight there. Collection walks the joint graph,
+        to a spot, press T - the WHOLE vehicle (wheels and cargo
+        included) and you teleport straight there. Collection walks
+        the joint graph,
         sweeps the rig model + attachment reverse-lookups, and picks
         wheels up by NAME (FL/FR/BL/BR corner names + anything called
         wheel, tire or tyre - the live car hides them from every joint
@@ -120,7 +121,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29"
+local SCRIPT_VERSION = "oak-v30"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1753,6 +1754,16 @@ local function augmentVehicleParts(list, seen, seat, ch)
         if ok and descs then
             for _ = 1, 4 do
                 if not sweepPass(descs) then break end
+            end
+            -- cargo catch-all: every part inside the rig model comes
+            -- along - wood loaded in a truck bed is parented to the
+            -- vehicle but NOT jointed to it, so only the model boundary
+            -- can catch it (reported live: trunk wood stayed behind)
+            for _, p in ipairs(descs) do
+                if p:IsA("BasePart") and not seen[p]
+                    and not (ch and p:IsDescendantOf(ch)) then
+                    add(p)
+                end
             end
         end
     end
