@@ -47,7 +47,8 @@
         to a spot, press T - the WHOLE vehicle (wheels included) and
         you teleport straight there. Collection walks the joint graph,
         sweeps the rig model + attachment reverse-lookups, and picks
-        wheels up by NAME (the live car hides them from every joint
+        wheels up by NAME (FL/FR/BL/BR corner names + anything called
+        wheel, tire or tyre - the live car hides them from every joint
         scan); during the jump the wheels go nocollide + weightless so
         nothing catches on them, then their physics comes back. The
         landing nudges up over obstacles; the camera must be >20 studs
@@ -118,7 +119,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v26"
+local SCRIPT_VERSION = "oak-v27"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1741,6 +1742,12 @@ local function finishTpJob(job, note)
     if note then print(note) end
 end
 
+-- Roblox vehicle convention: wheel parts are named by corner. A live
+-- dump of a RustyJoopBarrow showed its wheels as FL/FR/BL/BR (collide
+-- true, cylinder meshes as children) - nothing says "wheel" anywhere,
+-- which is why the name sweep found nothing.
+local WHEEL_SLOTS = { fl = true, fr = true, bl = true, br = true, ml = true, mr = true, rl = true, rr = true }
+
 local function cameraTeleport()
     if not Config.Vehicle.CamTP then
         print("[oaklands] cam tp: toggle is off (Movement > Vehicles > Cam Teleport)")
@@ -1822,7 +1829,11 @@ local function cameraTeleport()
             if okW and descsW then
                 for _, p in ipairs(descsW) do
                     if p:IsA("BasePart") then
-                        local wheelish = string.find(string.lower(p.Name), "wheel", 1, true) ~= nil
+                        local nm = string.lower(p.Name)
+                        local wheelish = WHEEL_SLOTS[nm] == true
+                            or string.find(nm, "wheel", 1, true) ~= nil
+                            or string.find(nm, "tyre", 1, true) ~= nil
+                            or string.find(nm, "tire", 1, true) ~= nil
                         if not wheelish then
                             local anc = p.Parent
                             while anc and anc ~= scope do
