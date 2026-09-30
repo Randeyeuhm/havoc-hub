@@ -55,7 +55,10 @@
         pose every frame, so they cannot move at all - and the glue
         releases when it settles (deliberate glue, not a weld: welds
         merge the assemblies and can trip the car into server mode).
-        Then their physics comes back. The
+        Then their physics comes back. The settle re-assert fights
+        back ONLY the car + its wheels (max 10x/s), so a rig full of
+        loose pieces (colliders, cargo) can't turn the jump into a
+        stutter fest. The
         landing nudges up over obstacles; the camera must be >20 studs
         away so the chase cam can never trigger it. The car is pinned
         at the landing spot for a moment (beats physics / server
@@ -124,7 +127,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.5"
+local SCRIPT_VERSION = "oak-v29.6"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1872,14 +1875,22 @@ local function cameraTeleport()
                 for _, p in ipairs(descsW) do
                     if p:IsA("BasePart") then
                         local nm = string.lower(p.Name)
+                        -- a STEERING wheel is not a wheel (it only inflated
+                        -- the match count); a spare wheel is legit, keep it.
                         local wheelish = WHEEL_SLOTS[nm] == true
                             or string.find(nm, "wheel", 1, true) ~= nil
                             or string.find(nm, "tyre", 1, true) ~= nil
                             or string.find(nm, "tire", 1, true) ~= nil
+                        if wheelish and string.find(nm, "steering", 1, true) then wheelish = false end
                         if not wheelish then
                             local anc = p.Parent
                             while anc and anc ~= scope do
-                                if string.find(string.lower(anc.Name), "wheel", 1, true) then
+                                local an = string.lower(anc.Name)
+                                if string.find(an, "steering", 1, true) then
+                                    wheelish = false
+                                    break
+                                end
+                                if string.find(an, "wheel", 1, true) then
                                     wheelish = true
                                     break
                                 end
@@ -1931,6 +1942,10 @@ local function cameraTeleport()
             end
         end
     end
+    if #wheelLock > 16 then
+        print(("[oaklands] cam tp: %d separate wheel matches - too many to glue safely, lock skipped (send this line)"):format(#wheelLock))
+        wheelLock = {}
+    end
     local function tpWheelGlue()
         if #wheelLock == 0 then return end
         if not root or not root.Parent then return end
@@ -1974,6 +1989,37 @@ local function cameraTeleport()
     end
     local count, fails = tpApply()
     tpWheelGlue()  -- wheels freeze onto the car from the very first frame
+    -- settle re-assert set: ONLY the car assembly + wheel assemblies.
+    -- Re-pinning every collected assembly (a loaded rig can be 60+ loose
+    -- pieces) on every physics beat was the "huge lagspike when
+    -- teleporting with cargo" bug - the car and its wheels are the only
+    -- things that actually need fighting back into place after a jump.
+    local reassertAnchors, seenAnchor = {}, {}
+    do
+        local function addAnchor(p)
+            local a = p.AssemblyRootPart
+            if a and not seenAnchor[a] then
+                seenAnchor[a] = true
+                reassertAnchors[#reassertAnchors + 1] = a
+            end
+        end
+        addAnchor(root)
+        for _, p in ipairs(wheelParts) do addAnchor(p) end
+    end
+    local function tpReassert()
+        local shift = landPos - root.Position
+        if shift.Magnitude < 0.5 then return end
+        local step = CFrame.new(shift)
+        for _, a in ipairs(reassertAnchors) do
+            if a.Parent then
+                pcall(function()
+                    a.AssemblyLinearVelocity = Vector3.zero
+                    a.AssemblyAngularVelocity = Vector3.zero
+                    a.CFrame = step * a.CFrame
+                end)
+            end
+        end
+    end
     local extra = {}
     if fails > 0 then extra[#extra + 1] = ("%d failed"):format(fails) end
     if rigged > 0 then extra[#extra + 1] = ("+%d rigged"):format(rigged) end
@@ -1986,10 +2032,18 @@ local function cameraTeleport()
     end
     local suffix = #extra > 0 and (" [" .. table.concat(extra, ", ") .. "]") or ""
     print(("[oaklands] cam tp: moved %d studs (vehicle: %d parts, %d assemblies)%s"):format(math.floor(dist), #parts, count, suffix))
+    if #wheelParts >= 24 then
+        local tally = {}
+        for _, p in ipairs(wheelParts) do tally[p.Name] = (tally[p.Name] or 0) + 1 end
+        local bits = {}
+        for n, c in pairs(tally) do bits[#bits + 1] = ("%s=%d"):format(n, c) end
+        table.sort(bits)
+        print("[oaklands] cam tp: lot of wheel matches (" .. #wheelParts .. "): " .. table.concat(bits, ", ", 1, math.min(#bits, 8)) .. (#bits > 8 and " ..." or ""))
+    end
     -- pin the car where it landed for a moment in case anything (server
     -- replication, physics wake-up, streaming) tries to drag it back;
     -- the settle line is the evidence when something persistent fights
-    TP_JOB = { root = root, landPos = landPos, apply = tpApply, glue = tpWheelGlue, wheels = wheelState, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.6, applies = 1 }
+    TP_JOB = { root = root, landPos = landPos, apply = tpReassert, glue = tpWheelGlue, wheels = wheelState, nextAt = 0, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.6, applies = 1 }
     if FREE.on then
         pcall(freecamOff)  -- camera back on you, so you SEE where it landed
         pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
@@ -2022,9 +2076,10 @@ track(RunService.Heartbeat:Connect(function()
                 return
             end
         end
-        if drift > 6 and job.applies < 90 then
-            job.apply()
+        if drift > 6 and job.applies < 90 and os.clock() >= job.nextAt then
+            job.apply()  -- car + wheels only - never the whole loose-piece list
             job.applies = job.applies + 1
+            job.nextAt = os.clock() + 0.1  -- max 10 re-pins/s (unthrottled full re-apply = the cargo lagspike)
         end
         if job.glue then job.glue() end  -- locked wheels stay glued through the settle window
     end)
