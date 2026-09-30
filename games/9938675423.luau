@@ -123,7 +123,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.1"
+local SCRIPT_VERSION = "oak-v29.2"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -2006,12 +2006,15 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end))
 
 -- ============================================================
--- VEHICLE FLY WHEEL LOCK (oak-v29.1) - the one piece asked for: while
--- flying, the wheels get glued rigid to the car - nocollide + massless
--- + velocities pinned - and every joint crossing between a wheel and
--- the chassis is cut (a live joint + a glued wheel makes the solver
--- shove the CAR, so the cut is part of the lock). Restored the moment
--- fly ends or you dismount. Wheels + car only, nothing else touched.
+-- VEHICLE FLY WHEEL LOCK (oak-v29.2) - while flying, wheels that live
+-- in their OWN assembly (suspension-hung ones - welded-in wheels are
+-- already rigid with the car and are left alone) get nocollide +
+-- massless + glued to the car, and every joint crossing between a
+-- wheel and the chassis is cut (a live joint + a glued wheel makes the
+-- solver shove the CAR, so the cut is part of the lock). The glue pins
+-- POSITION ONLY - the wheel's spin/rotation is never fought (freezing
+-- the spin while the game keeps driving it was the tug-of-war that
+-- read as wobble). Restored the moment fly ends or you dismount.
 -- ============================================================
 local function findWheelParts(scope)
     local wheelParts, seenW = {}, {}
@@ -2098,18 +2101,19 @@ flyWheelApply = function(seat)
                         p.Massless = true
                     end)
                 end
-                if st.glue and p.AssemblyRootPart ~= job.root then
+                if st.glue and p.AssemblyRootPart ~= (job.root.AssemblyRootPart or job.root) then
                     if not st.off then
                         st.off = rc:Inverse() * p.CFrame
                     end
                     local want = rc * st.off
                     local dpos = (p.Position - want.Position).Magnitude
-                    local dlook = (p.CFrame.LookVector - want.LookVector).Magnitude
-                    if dpos > 0.02 or dlook > 0.02 then
+                    -- pin POSITION only and never fight rotation or the
+                    -- wheel's spin - the game keeps driving the wheel
+                    -- while it rides glued in place
+                    if dpos > 0.02 then
                         pcall(function()
-                            p.CFrame = want
+                            p.CFrame = CFrame.new(want.Position - p.Position) * p.CFrame
                             p.AssemblyLinearVelocity = Vector3.zero
-                            p.AssemblyAngularVelocity = Vector3.zero
                         end)
                     end
                 end
@@ -2165,18 +2169,28 @@ flyWheelApply = function(seat)
             end
         end
     end
-    -- lock every wheel part (nocollide + massless); separate-assembly
-    -- wheels also get a glue anchor below
-    local state, count = {}, 0
+    -- lock only wheels that live in their OWN assembly: a welded-in
+    -- wheel is already rigid with the car, and making the car's own
+    -- assembly parts massless/nocollide is how a lock destabilizes it
+    local state, count, skipRigid = {}, 0, 0
     for _, p in ipairs(wheelList) do
-        local ok = pcall(function()
-            state[p] = { cc = p.CanCollide, ml = p.Massless }
-            p.CanCollide = false
-            p.Massless = true
-        end)
-        if ok then count = count + 1 end
+        if p.AssemblyRootPart == root then
+            skipRigid = skipRigid + 1
+        else
+            local ok = pcall(function()
+                state[p] = { cc = p.CanCollide, ml = p.Massless }
+                p.CanCollide = false
+                p.Massless = true
+            end)
+            if ok then count = count + 1 end
+        end
     end
-    if count == 0 then return end
+    if count == 0 then
+        if skipRigid > 0 then
+            print(("[oaklands] fly: %d welded-in wheel part(s) - already rigid with the car, nothing to lock"):format(skipRigid))
+        end
+        return
+    end
     local glueSeen = {}
     for _, p in ipairs(wheelList) do
         local st = state[p]
@@ -2188,7 +2202,6 @@ flyWheelApply = function(seat)
                     st.glue = true
                     st.off = root.CFrame:Inverse() * p.CFrame
                     p.AssemblyLinearVelocity = Vector3.zero
-                    p.AssemblyAngularVelocity = Vector3.zero
                 end)
             end
         end
@@ -2231,25 +2244,32 @@ flyWheelApply = function(seat)
         end
     end
     for _, p in ipairs(wheelList) do
-        local okD, descs = pcall(function() return p:GetDescendants() end)
-        if okD and descs then
-            for _, d in ipairs(descs) do
-                if d:IsA("Attachment") then
-                    local c = d.ParentConstraint
-                    if c then considerCut(c) end
+        if state[p] then
+            local okD, descs = pcall(function() return p:GetDescendants() end)
+            if okD and descs then
+                for _, d in ipairs(descs) do
+                    if d:IsA("Attachment") then
+                        local c = d.ParentConstraint
+                        if c then considerCut(c) end
+                    elseif d:IsA("JointInstance") or d:IsA("Constraint") or d:IsA("WeldConstraint") then
+                        considerCut(d)
+                    end
                 end
             end
-        end
-        local okJ, joints = pcall(function() return p:GetJoints() end)
-        if okJ and joints then
-            for _, j in ipairs(joints) do
-                considerCut(j)
+            local okJ, joints = pcall(function() return p:GetJoints() end)
+            if okJ and joints then
+                for _, j in ipairs(joints) do
+                    considerCut(j)
+                end
             end
         end
     end
     VEH_STATE.flyWheelJob = { seat = seat, model = scope, root = root, state = state, count = count, cons = cons, rigid = rigidLeft }
-    local rigidNote = rigidLeft > 0 and (", " .. rigidLeft .. " rigid weld(s) left") or ""
-    print(("[oaklands] fly: wheels locked (%d parts, %d joints cut%s) - nocollide + massless + glued until you stop flying"):format(count, #cons, rigidNote))
+    local notes = {}
+    if rigidLeft > 0 then notes[#notes + 1] = rigidLeft .. " rigid left" end
+    if skipRigid > 0 then notes[#notes + 1] = skipRigid .. " welded-in skipped" end
+    local note = #notes > 0 and (", " .. table.concat(notes, ", ")) or ""
+    print(("[oaklands] fly: wheels locked (%d parts, %d joints cut%s) - nocollide + massless + glued until you stop flying"):format(count, #cons, note))
 end
 
 track(task.spawn(function()
