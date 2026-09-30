@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v6
+    HAVOC HUB - OAKLANDS                           oak-v7
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -41,7 +41,8 @@
                             * pull  - DragConstructors AlignPosition.
                               MaxForce / AlignOrientation.MaxTorque (the
                               module reuses ONE pair for every drag; the
-                              strength slider multiplies it up to 10x)
+                              strength slider multiplies it up to 1000x,
+                              final force clamped at 1e9 to stay sane)
                           Console prints a scan line on toggle. Pure client
                           physics of a drag the server already granted - no
                           packets. Server checks on dragging are unknown:
@@ -70,7 +71,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v6"
+local SCRIPT_VERSION = "oak-v7"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -194,7 +195,7 @@ Config.Movement.WalkSpeed = 16
 Config.Movement.JumpPower = 50
 Config.Movement.SprintBoost = 1
 Config.Drag.Reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
-Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 10)
+Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 1000)
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
 
 local function saveConfig()
@@ -773,14 +774,16 @@ local function dragStep()
                         local ok2, v2 = pcall(function() return root:GetAttribute("DragTorque") end)
                         if ok2 and typeof(v2) == "number" and v2 > 0 and v2 < 1e12 then baseT = v2 end
                     end
+                    local boostF = math.min(baseF * mult, 1e9)
+                    local boostT = math.min(baseT * mult, 1e9)
                     DRAG_STATE.savedBase[d.mod] = { f = baseF, t = baseT }
                     pcall(function()
-                        ap.MaxForce = baseF * mult
-                        ao.MaxTorque = baseT * mult
+                        ap.MaxForce = boostF
+                        ao.MaxTorque = boostT
                     end)
                     if DRAG_STATE.boostAnnounced ~= mult then
                         DRAG_STATE.boostAnnounced = mult
-                        print(("[oaklands] drag pull boost live x%s (force %d / torque %d)"):format(tostring(mult), math.floor(baseF * mult), math.floor(baseT * mult)))
+                        print(("[oaklands] drag pull boost live x%s (force %d / torque %d)"):format(tostring(mult), math.floor(boostF), math.floor(boostT)))
                     end
                 elseif not dragging and DRAG_STATE.savedBase[d.mod] ~= nil then
                     local kept = DRAG_STATE.savedBase[d.mod]
@@ -1114,9 +1117,13 @@ local function buildMenu()
         function(v) return v <= 12 and "12 (vanilla)" or ("%d studs"):format(v) end)
     slider(pmv, "Drag Strength",
         function() return Config.Drag.Strength end,
-        function(v) Config.Drag.Strength = v end, 0.25, 1, 10,
-        function(v) return v <= 1.001 and "1.00x (vanilla)" or ("%.2fx"):format(v) end)
-    note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force (now up to 10x). Console prints each multiplier the moment it lands on a live drag - creep it up and watch for rubber-banding.")
+        function(v) Config.Drag.Strength = v end, 0.25, 1, 1000,
+        function(v)
+            if v <= 1.001 then return "1.00x (vanilla)" end
+            if v >= 100 then return ("%dx"):format(math.floor(v + 0.5)) end
+            return ("%.2fx"):format(v)
+        end)
+    note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force, up to 1000x. Past ~20x only matters for heavy stuff (cars) - and it will FLY. Console prints each multiplier the moment it lands on a live drag; if things vibrate or rubber-band, come back down.")
 
     note(pmv, "Removed: speed / jump (oak-v2 - server bans) and Infinite Stamina (oak-v4 - it got detected and crashed the client). Everything left in this tab is client-side only.")
 
