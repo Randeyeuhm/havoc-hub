@@ -45,12 +45,14 @@
         hovers instead of fighting the camera.
       • Cam Teleport   - optional: sit in a vehicle, fly the freecam
         to a spot, press T - the WHOLE vehicle (wheels included) and
-        you teleport straight there. The wheels hang off the body on
-        free suspension constraints (separate physics assemblies) -
-        every assembly moves together now, no more half-way jumps.
-        The landing is probed clear first and the camera must be >20
-        studs away, so the normal chase cam can never trigger it.
-        Same client-side mechanism as the store teleports.
+        you teleport straight there. Every jointed part of the rig is
+        collected (joint-graph walk), the landing nudges up over
+        obstacles, and the camera must be >20 studs away so the chase
+        cam can never trigger it. The car is pinned at the landing
+        spot for a moment (beats physics / server drag), then the
+        freecam drops so you SEE where it landed. Console prints the
+        parts / assemblies moved plus a settle line.
+        Same class of teleport as the store warps.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -113,7 +115,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v23"
+local SCRIPT_VERSION = "oak-v24"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1605,8 +1607,13 @@ local function collectVehicleParts(seat)
     return list
 end
 
+local TP_JOB = nil
+
 local function cameraTeleport()
-    if not Config.Vehicle.CamTP then return end
+    if not Config.Vehicle.CamTP then
+        print("[oaklands] cam tp: toggle is off (Movement > Vehicles > Cam Teleport)")
+        return
+    end
     local ch = LocalPlayer.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
@@ -1623,40 +1630,95 @@ local function cameraTeleport()
         print("[oaklands] cam tp: camera too close - fly the freecam further out first")
         return
     end
-    local oparams = OverlapParams.new()
-    oparams.FilterType = Enum.RaycastFilterType.Exclude
-    oparams.FilterDescendantsInstances = { ch }
-    oparams.RespectCanCollide = true
-    local okh, hits = pcall(function()
-        return Workspace:GetPartBoundsInRadius(camPos, 3, oparams)
-    end)
-    if not okh or not hits or #hits > 0 then
+    -- landing probe - nudge straight up over obstacles (a freecam can
+    -- sit inside a slope); refuse only when even +20 studs is buried
+    local function landingClear(pos)
+        local oparams = OverlapParams.new()
+        oparams.FilterType = Enum.RaycastFilterType.Exclude
+        oparams.FilterDescendantsInstances = { ch }
+        oparams.RespectCanCollide = true
+        local okh, hits = pcall(function()
+            return Workspace:GetPartBoundsInRadius(pos, 2.5, oparams)
+        end)
+        return okh and hits and #hits == 0
+    end
+    local landPos = nil
+    for _, dy in ipairs({ 0, 4, 8, 12, 16, 20 }) do
+        local p = camPos + Vector3.new(0, dy, 0)
+        if landingClear(p) then
+            landPos = p
+            break
+        end
+    end
+    if not landPos then
         print("[oaklands] cam tp: landing spot is blocked - aim the freecam at open space")
         return
     end
-    local delta = CFrame.new(camPos - root.Position)
     local parts = collectVehicleParts(seat)
     if ch then
         local hrp = ch:FindFirstChild("HumanoidRootPart")
         if hrp then parts[#parts + 1] = hrp end
     end
     if #parts == 0 then parts[1] = root end
-    local moved = {}
-    local count, fails = 0, 0
-    for _, p in ipairs(parts) do
-        local a = p.AssemblyRootPart
-        if a and not moved[a] then
-            moved[a] = true
-            local okp = pcall(function()
-                p.CFrame = delta * p.CFrame
-                p.AssemblyLinearVelocity = Vector3.zero
-                p.AssemblyAngularVelocity = Vector3.zero
-            end)
-            if okp then count = count + 1 else fails = fails + 1 end
+    -- one CFrame write per unique assembly (setting one part moves its
+    -- whole rigid assembly - a second write would double-move it)
+    local function tpApply()
+        local shift = landPos - root.Position
+        if shift.Magnitude < 0.5 then return 0 end
+        local moved, cnt = {}, 0
+        for _, p in ipairs(parts) do
+            local a = p.AssemblyRootPart
+            if a and not moved[a] then
+                moved[a] = true
+                pcall(function()
+                    p.AssemblyLinearVelocity = Vector3.zero
+                    p.AssemblyAngularVelocity = Vector3.zero
+                    p.CFrame = CFrame.new(shift) * p.CFrame
+                end)
+                cnt = cnt + 1
+            end
         end
+        return cnt
     end
-    print(("[oaklands] cam tp: moved %d studs to the camera (vehicle: %d parts, %d assemblies, %d failed)"):format(math.floor(dist), #parts, count, fails))
+    local count = tpApply()
+    print(("[oaklands] cam tp: moved %d studs to the camera (vehicle: %d parts, %d assemblies)"):format(math.floor(dist), #parts, count))
+    -- pin the car where it landed for a moment in case anything (server
+    -- replication, physics wake-up, streaming) tries to drag it back;
+    -- the settle line is the evidence when something persistent fights
+    TP_JOB = { root = root, landPos = landPos, apply = tpApply, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.6, applies = 1 }
+    if FREE.on then pcall(freecamOff) end  -- camera back on you, so you SEE where it landed
 end
+
+-- settle watch: re-assert the car at the landing spot while the world
+-- catches up (physics wake-up, server ack, streaming). Gives up after
+-- hardUntil and prints a settle line either way.
+track(RunService.Heartbeat:Connect(function()
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    local job = TP_JOB
+    if not job then return end
+    pcall(function()
+        local root = job.root
+        if not root or not root.Parent then
+            TP_JOB = nil
+            return
+        end
+        local drift = (job.landPos - root.Position).Magnitude
+        if os.clock() > job.doneAt then
+            if drift > 8 and os.clock() < job.hardDoneAt and job.applies < 90 then
+                job.doneAt = os.clock() + 0.25
+            else
+                local note = drift > 8 and " - something keeps dragging it back" or ""
+                print(("[oaklands] cam tp: settle check - %d studs off target after %d applies%s"):format(math.floor(drift), job.applies, note))
+                TP_JOB = nil
+                return
+            end
+        end
+        if drift > 6 and job.applies < 90 then
+            job.apply()
+            job.applies = job.applies + 1
+        end
+    end)
+end))
 
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
