@@ -31,17 +31,15 @@
                           jump_multiplier). Live per loadout, works through
                           respawns, no side effects on stamina / vault /
                           camera stiffness.
-          Ballistics    - Bullet Velocity x1-x50 / Wallbang x1-x100: bullets
-                          are real client-simulated projectiles (caster
-                          module). Drop = gravity * t^2, and t = distance /
-                          velocity - so a high muzzle velocity removes the
-                          drop in practice (x15 flies essentially flat) and
-                          the mod zeroes velocity_drop to kill the drag. The
-                          values are written on weapon.build_result.
-                          ammunition (the exact table every shot reads).
-                          Wallbang scales plr_penetration_multiplier - the
-                          game's own projectile penetration multiplier
-                          (per-surface check L334985).
+          Ballistics    - Wallbang x1-x100: bullets are real client-
+                          simulated projectiles (caster module). Wallbang
+                          scales plr_penetration_multiplier - the game's
+                          own projectile penetration multiplier
+                          (per-surface check L334985). NOTE: Bullet
+                          Velocity was REMOVED (dl-v47) after live testing
+                          showed the server's shot validation instantly
+                          bans client-side muzzle-velocity changes the
+                          moment they actually apply.
           No Bullet Drop - true zero-drop: the caster module's shared gravity
                           upvalue (`local u10` in module/caster/caster,
                           rewritten by fire / fire_server at every bullet
@@ -214,6 +212,11 @@
           reads), refreshing via the shared scan only when the cache is
           empty (rate-limited) plus a respawn rescan, so every loadout
           gun is covered without per-frame heap walks.
+          dl-v47: Bullet Velocity REMOVED - the first time the boost
+          actually applied in a live match (the v46 fix), the server's
+          shot validation instantly banned the account. The slider is
+          gone from the menu, the saved value is forced back to vanilla
+          on load, and the per-frame painter is inert (restore only).
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -276,7 +279,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v46"
+local SCRIPT_VERSION = "dl-v47"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -394,10 +397,12 @@ Config.Weapons.AimSpeed = math.clamp(tonumber(Config.Weapons.AimSpeed) or 1, 1, 
 -- feeding the live reload track extra time per frame - see FAST RELOAD.
 Config.Weapons.ReloadSpeed = math.clamp(tonumber(Config.Weapons.ReloadSpeed) or 2, 1, 3)
 
--- Ballistics: Bullet Velocity multiplies the muzzle velocity written on the
--- weapon build (see BALLISTICS section); Wallbang scales the game's live
--- projectile penetration multiplier.
-Config.Weapons.BulletVelocity = math.clamp(tonumber(Config.Weapons.BulletVelocity) or 1, 1, 50)
+-- Ballistics: Wallbang scales the game's live projectile penetration
+-- multiplier. Bullet Velocity was REMOVED (dl-v47) - live testing showed
+-- the server's shot validation instantly bans client-side muzzle-velocity
+-- changes the moment they actually apply; the saved value is forced back
+-- to vanilla and the slider is gone from the menu.
+Config.Weapons.BulletVelocity = 1
 Config.Weapons.Wallbang = math.clamp(tonumber(Config.Weapons.Wallbang) or 1, 1, 100)
 Config.SilentAim.MaxAngle = math.clamp(tonumber(Config.SilentAim.MaxAngle) or 20, 5, 45)
 
@@ -1288,37 +1293,12 @@ local function ballisticsRestore()
     end
 end
 
-local ballScanAt = 0
+-- REMOVED (dl-v47): the first time this boost actually applied in a live
+-- match it triggered an instant server ban - the shot validation rejects
+-- client-side muzzle-velocity changes. The step is now inert: it only
+-- restores any values left behind and never paints.
 local function ballisticsStep()
-    local mult = tonumber(Config.Weapons.BulletVelocity) or 1
-    if mult <= 1 then
-        if next(BALL_STATE.saved) ~= nil then pcall(ballisticsRestore) end
-        return
-    end
-    -- primary: the match weapon tables from the shared scan (the lobby
-    -- controller cache below never matches match-mode objects - that is
-    -- exactly why this used to do nothing in game)
-    local weapons = weaponTablesCached()
-    if #weapons == 0 then
-        local now = os.clock()
-        if now - ballScanAt > 4 then
-            ballScanAt = now
-            pcall(refreshWeaponCache)
-            weapons = weaponTablesCached()
-        end
-    end
-    for _, weapon in ipairs(weapons) do
-        paintAmmo(ammoFromWeapon(weapon), mult)
-    end
-    -- legacy path: lobby-style controllers (harmless when empty)
-    for controller in pairs(CTRL_STATE.tracked) do
-        if type(controller) == "table" then
-            local cd = rawget(controller, "char_data")
-            if type(cd) == "table" and isLocalCharData(controller, cd) then
-                paintAmmo(ammoTableFor(controller), mult)
-            end
-        end
-    end
+    if next(BALL_STATE.saved) ~= nil then pcall(ballisticsRestore) end
 end
 
 local ballErrCount = 0
@@ -3508,18 +3488,8 @@ local function buildMenu()
         end, 0.25, 1, 3, function(v) return ("%g×"):format(v) end)
 
     section(p1, "Ballistics")
-    slider(p1, "Bullet Velocity",
-        function() return Config.Weapons.BulletVelocity end,
-        function(v)
-            Config.Weapons.BulletVelocity = v
-            if v > 1 and Config.Weapons.ZeroedAim then
-                Config.Weapons.ZeroedAim = false
-                pcall(applyZeroed)
-                notify("Zeroed aim off - it needs x1 bullet velocity")
-                refreshGUI()
-            end
-            refreshStatus()
-        end, 1, 1, 50, function(v) return ("%g×"):format(v) end)
+    -- Bullet Velocity slider REMOVED (dl-v47): it triggered an instant
+    -- server ban the first time it actually applied in a match.
     slider(p1, "Wallbang",
         function() return Config.Weapons.Wallbang end,
         function(v)
