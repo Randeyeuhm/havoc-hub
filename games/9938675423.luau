@@ -60,10 +60,10 @@
         teleport as the store warps.
       • Wood Lock      - automatic cargo lock: while you are seated in a
         vehicle, loose wood (logs / planks / lumber) on or in it is
-        welded to the chassis (client-side) and made massless - it
-        cannot slide off, fall out or tip the truck. Releases when you
-        hop out or the piece is taken far away, so unloading stays
-        normal.
+        glued to the chassis by re-applying its car-relative offset
+        every frame (+ massless), so it cannot slide off, fall out or
+        tip the truck. No welds - the car's own physics is never
+        touched. Releases when you hop out or a piece is taken away.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -126,7 +126,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v33"
+local SCRIPT_VERSION = "oak-v34"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -2010,39 +2010,57 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end))
 
 -- ============================================================
--- WOOD LOCK (oak-v33) - while you are seated in a vehicle, loose wood
--- (logs / planks / lumber) on or in it is welded to the chassis
--- client-side and made massless: cargo can't slide off, fall out or
--- tip the truck, and driving feel is untouched. Releases the moment
--- you hop out (or a piece is taken far away / unloaded). Re-run safe
--- via the genv table.
+-- WOOD LOCK (oak-v34) - while you are seated in a vehicle, loose wood
+-- (logs / planks / lumber) on or in it is glued to the chassis: its
+-- car-relative offset is measured once and re-applied every frame
+-- (plus massless), so cargo can't slide off, fall out or tip the
+-- truck. NO welds and NO assembly merges - the v33 weld version could
+-- flip the car's network ownership to the server when the game
+-- re-owned the merged assembly, which left the car acting anchored /
+-- un-drivable. This one never touches the car's own physics.
+-- Releases on dismount, re-exec, or when a piece is taken away.
 -- ============================================================
 local WOODLOCK = genv.__HAVOC_OAKLANDS_WOODLOCK
-if type(WOODLOCK) ~= "table" then
-    WOODLOCK = { welds = {}, byPart = setmetatable({}, { __mode = "k" }), mass = setmetatable({}, { __mode = "k" }) }
-    genv.__HAVOC_OAKLANDS_WOODLOCK = WOODLOCK
+if type(WOODLOCK) == "table" then
+    -- clean leftovers from an older run (weld builds / stale items)
+    pcall(function()
+        if type(WOODLOCK.welds) == "table" then
+            for _, w in ipairs(WOODLOCK.welds) do
+                pcall(function()
+                    if w and w.Parent then
+                        local p = w.Part0
+                        if p and type(WOODLOCK.mass) == "table" and WOODLOCK.mass[p] ~= nil then
+                            p.Massless = WOODLOCK.mass[p]
+                        end
+                        w:Destroy()
+                    end
+                end)
+            end
+        end
+        if type(WOODLOCK.items) == "table" then
+            for p, st in pairs(WOODLOCK.items) do
+                pcall(function()
+                    if p.Parent and st and st.massless ~= nil then
+                        p.Massless = st.massless
+                    end
+                end)
+            end
+        end
+    end)
 end
+WOODLOCK = { items = setmetatable({}, { __mode = "k" }) }
+genv.__HAVOC_OAKLANDS_WOODLOCK = WOODLOCK
 
 local function woodUnlockAll()
     local count = 0
-    for i = #WOODLOCK.welds, 1, -1 do
-        local w = WOODLOCK.welds[i]
-        WOODLOCK.welds[i] = nil
-        if w then
-            pcall(function()
-                local p = w.Part0
-                if p then
-                    local m = WOODLOCK.mass[p]
-                    if m ~= nil then
-                        p.Massless = m
-                        WOODLOCK.mass[p] = nil
-                    end
-                    WOODLOCK.byPart[p] = nil
-                end
-                w:Destroy()
-            end)
-            count = count + 1
-        end
+    for p, st in pairs(WOODLOCK.items) do
+        WOODLOCK.items[p] = nil
+        count = count + 1
+        pcall(function()
+            if p.Parent and st and st.massless ~= nil then
+                p.Massless = st.massless
+            end
+        end)
     end
     if count > 0 then
         print(("[oaklands] wood lock: released %d piece(s)"):format(count))
@@ -2066,70 +2084,74 @@ local function woodLockStep()
         return
     end
     local root = seat.AssemblyRootPart or seat
-    local vparts = collectVehicleParts(seat)
-    local scope = commonVehicleModel(seat, vparts, ch) or seat:FindFirstAncestorOfClass("Model")
-    if not scope then
-        woodUnlockAll()
-        return
-    end
-    -- drop welds whose wood is gone or being taken away (unload)
-    for i = #WOODLOCK.welds, 1, -1 do
-        local w = WOODLOCK.welds[i]
-        local p = w and w.Part0
-        local drop = false
-        if not (p and p.Parent and w.Parent) then
-            drop = true
-        else
-            local okD, dist = pcall(function()
-                return (p.Position - root.Position).Magnitude
+    -- release pieces that are gone or being taken away by the game
+    for p, st in pairs(WOODLOCK.items) do
+        local drop = not p.Parent
+        if not drop then
+            local okD, want = pcall(function()
+                return (root.CFrame * st.off).Position
             end)
-            if not okD or dist > 40 then
+            if not okD or (p.Position - want).Magnitude > 15 then
                 drop = true
             end
         end
         if drop then
-            WOODLOCK.welds[i] = nil
-            if p then
-                pcall(function()
-                    local m = WOODLOCK.mass[p]
-                    if m ~= nil then
-                        p.Massless = m
-                        WOODLOCK.mass[p] = nil
-                    end
-                    WOODLOCK.byPart[p] = nil
-                end)
-            end
-            pcall(function() if w then w:Destroy() end end)
+            WOODLOCK.items[p] = nil
+            pcall(function()
+                if p.Parent and st and st.massless ~= nil then
+                    p.Massless = st.massless
+                end
+            end)
         end
     end
-    -- weld new wood found on / in the rig
+    -- find new wood on / in the rig (soft-locked by offset, not welded)
+    local vparts = collectVehicleParts(seat)
+    local scope = commonVehicleModel(seat, vparts, ch) or seat:FindFirstAncestorOfClass("Model")
+    if not scope then return end
     local ok, descs = pcall(function() return scope:GetDescendants() end)
     if not ok or not descs then return end
     local added = 0
     for _, p in ipairs(descs) do
         if p:IsA("BasePart") and not p.Anchored
             and not (ch and p:IsDescendantOf(ch))
-            and not WOODLOCK.byPart[p]
+            and not WOODLOCK.items[p]
             and p.AssemblyRootPart ~= root
             and isWoodName(string.lower(p.Name)) then
-            local okW = pcall(function()
-                local w = Instance.new("WeldConstraint")
-                w.Name = "HavocWoodLock"
-                w.Part0 = p
-                w.Part1 = root
-                w.Parent = p
-                WOODLOCK.welds[#WOODLOCK.welds + 1] = w
-                WOODLOCK.byPart[p] = w
-                WOODLOCK.mass[p] = p.Massless
+            local okL = pcall(function()
+                WOODLOCK.items[p] = {
+                    off = root.CFrame:Inverse() * p.CFrame,
+                    massless = p.Massless,
+                }
                 p.Massless = true
             end)
-            if okW then added = added + 1 end
+            if okL then added = added + 1 end
         end
     end
     if added > 0 then
-        print(("[oaklands] wood lock: %d piece(s) welded to the vehicle"):format(added))
+        print(("[oaklands] wood lock: %d piece(s) locked to the vehicle"):format(added))
     end
 end
+
+-- hold the locked wood on the car every frame (cheap - only touches wood)
+track(RunService.RenderStepped:Connect(function()
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    if next(WOODLOCK.items) == nil then return end
+    pcall(function()
+        local ch = LocalPlayer.Character
+        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+        local seat = hum and hum.SeatPart
+        if not (seat and seat:IsA("VehicleSeat")) then
+            woodUnlockAll()
+            return
+        end
+        local root = seat.AssemblyRootPart or seat
+        for p, st in pairs(WOODLOCK.items) do
+            if p.Parent then
+                p.CFrame = root.CFrame * st.off
+            end
+        end
+    end)
+end))
 
 track(task.spawn(function()
     while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
@@ -2172,24 +2194,6 @@ pcall(function()
         end
     end
 end)
--- leftover wood-lock welds from an old build: release them
-if type(genv.__HAVOC_OAKLANDS_WOODLOCK) == "table" then
-    local oldWL = genv.__HAVOC_OAKLANDS_WOODLOCK
-    if type(oldWL.welds) == "table" then
-        for _, w in ipairs(oldWL.welds) do
-            pcall(function()
-                if w and w.Parent then
-                    local p = w.Part0
-                    if p and type(oldWL.mass) == "table" and oldWL.mass[p] ~= nil then
-                        p.Massless = oldWL.mass[p]
-                    end
-                    w:Destroy()
-                end
-            end)
-        end
-    end
-    genv.__HAVOC_OAKLANDS_WOODLOCK = nil
-end
 
 -- ============================================================
 -- MOVEMENT  (experimental block REMOVED in oak-v2)
