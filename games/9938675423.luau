@@ -45,15 +45,17 @@
         hovers instead of fighting the camera.
       • Cam Teleport   - optional: sit in a vehicle, fly the freecam
         to a spot, press T - the WHOLE vehicle (wheels included) and
-        you teleport straight there. Collection walks the joint graph
-        AND sweeps the rig model + attachment reverse-lookups (catches
-        wheels whose constraints sit in rig folders - the "wheels
-        bug"), the landing nudges up over obstacles, and the camera
-        must be >20 studs away so the chase cam can never trigger it.
-        The car is pinned at the landing spot for a moment (beats
-        physics / server drag), then the freecam drops so you SEE
-        where it landed. Console prints parts / assemblies + a settle
-        line. Same class of teleport as the store warps.
+        you teleport straight there. Collection walks the joint graph,
+        sweeps the rig model + attachment reverse-lookups, and picks
+        wheels up by NAME (the live car hides them from every joint
+        scan); during the jump the wheels go nocollide + weightless so
+        nothing catches on them, then their physics comes back. The
+        landing nudges up over obstacles; the camera must be >20 studs
+        away so the chase cam can never trigger it. The car is pinned
+        at the landing spot for a moment (beats physics / server
+        drag), then the freecam drops so you SEE where it landed.
+        Console prints parts / assemblies / wheels + a settle line.
+        Same class of teleport as the store warps.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -116,7 +118,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v25"
+local SCRIPT_VERSION = "oak-v26"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1613,6 +1615,28 @@ local function collectVehicleParts(seat)
     return list, seen
 end
 
+-- deepest ancestor of the seat that holds every collected
+-- non-character part (the vehicle model, whatever it is called);
+-- nil if that would be Workspace or above.
+local function commonVehicleModel(seat, list, ch)
+    local node = seat
+    while node and node ~= game do
+        local all = true
+        for _, p in ipairs(list) do
+            if not (ch and p:IsDescendantOf(ch)) and not p:IsDescendantOf(node) then
+                all = false
+                break
+            end
+        end
+        if all then
+            if node == Workspace or node == game then return nil end
+            return node
+        end
+        node = node.Parent
+    end
+    return nil
+end
+
 -- The wheels can hang off the body through constraints parented OUTSIDE
 -- the parts they connect (rig folders), which a walk from the seat can
 -- miss - a missed wheel assembly rubber-bands behind the car ("the
@@ -1684,25 +1708,7 @@ local function augmentVehicleParts(list, seen, seat, ch)
     for _ = 1, 2 do
         if not reversePass() then break end
     end
-    local common = nil
-    do
-        local node = seat
-        while node and node ~= game do
-            local all = true
-            for _, p in ipairs(list) do
-                if not (ch and p:IsDescendantOf(ch)) and not p:IsDescendantOf(node) then
-                    all = false
-                    break
-                end
-            end
-            if all then
-                common = node
-                break
-            end
-            node = node.Parent
-        end
-        if common == Workspace or common == game then common = nil end
-    end
+    local common = commonVehicleModel(seat, list, ch)
     if common then
         local ok, descs = pcall(function() return common:GetDescendants() end)
         if ok and descs then
@@ -1718,6 +1724,22 @@ local function augmentVehicleParts(list, seen, seat, ch)
 end
 
 local TP_JOB = nil
+
+-- restore wheel physics when a settle watch ends (any reason)
+local function finishTpJob(job, note)
+    if not job then return end
+    if job.wheels then
+        for p, st in pairs(job.wheels) do
+            pcall(function()
+                if p.Parent then
+                    p.CanCollide = st.cc
+                    p.Massless = st.ml
+                end
+            end)
+        end
+    end
+    if note then print(note) end
+end
 
 local function cameraTeleport()
     if not Config.Vehicle.CamTP then
@@ -1773,6 +1795,65 @@ local function cameraTeleport()
             parts[#parts + 1] = hrp
         end
     end
+    -- a fresh jump replaces any settle watch still running (and restores
+    -- the previous jump's wheel physics first)
+    if TP_JOB then
+        finishTpJob(TP_JOB)
+        TP_JOB = nil
+    end
+    -- wheels, picked out by NAME this time: the live car reports as ONE
+    -- rigid assembly with no wheel assemblies visible to the joint scans
+    -- (console: "1 assemblies, +0 rigged"), so a name sweep of the rig is
+    -- the tool that catches them. They move WITH the car and go nocollide
+    -- + massless for the jump + settle so nothing catches on them, then
+    -- their physics comes back.
+    local wheelParts = {}
+    do
+        local scope = commonVehicleModel(seat, parts, ch) or seat:FindFirstAncestorOfClass("Model")
+        local seenW = {}
+        local function addWheel(p)
+            if p and p:IsA("BasePart") and not seenW[p] and #wheelParts < 60 then
+                seenW[p] = true
+                wheelParts[#wheelParts + 1] = p
+            end
+        end
+        if scope then
+            local okW, descsW = pcall(function() return scope:GetDescendants() end)
+            if okW and descsW then
+                for _, p in ipairs(descsW) do
+                    if p:IsA("BasePart") then
+                        local wheelish = string.find(string.lower(p.Name), "wheel", 1, true) ~= nil
+                        if not wheelish then
+                            local anc = p.Parent
+                            while anc and anc ~= scope do
+                                if string.find(string.lower(anc.Name), "wheel", 1, true) then
+                                    wheelish = true
+                                    break
+                                end
+                                anc = anc.Parent
+                            end
+                        end
+                        if wheelish then addWheel(p) end
+                    end
+                end
+            end
+        end
+        for _, p in ipairs(wheelParts) do
+            if not seenParts[p] then
+                seenParts[p] = true
+                parts[#parts + 1] = p
+            end
+        end
+    end
+    local wheelState = {}
+    for _, p in ipairs(wheelParts) do
+        pcall(function()
+            local cc, ml = p.CanCollide, p.Massless
+            wheelState[p] = { cc = cc, ml = ml }
+            p.CanCollide = false
+            p.Massless = true
+        end)
+    end
     if #parts == 0 then parts[1] = root end
     -- one CFrame write per unique assembly (setting one part moves its
     -- whole rigid assembly - a second write would double-move it)
@@ -1798,12 +1879,13 @@ local function cameraTeleport()
     local extra = {}
     if fails > 0 then extra[#extra + 1] = ("%d failed"):format(fails) end
     if rigged > 0 then extra[#extra + 1] = ("+%d rigged"):format(rigged) end
+    if #wheelParts > 0 then extra[#extra + 1] = ("%d wheels"):format(#wheelParts) end
     local suffix = #extra > 0 and (" [" .. table.concat(extra, ", ") .. "]") or ""
     print(("[oaklands] cam tp: moved %d studs (vehicle: %d parts, %d assemblies)%s"):format(math.floor(dist), #parts, count, suffix))
     -- pin the car where it landed for a moment in case anything (server
     -- replication, physics wake-up, streaming) tries to drag it back;
     -- the settle line is the evidence when something persistent fights
-    TP_JOB = { root = root, landPos = landPos, apply = tpApply, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.6, applies = 1 }
+    TP_JOB = { root = root, landPos = landPos, apply = tpApply, wheels = wheelState, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.6, applies = 1 }
     if FREE.on then pcall(freecamOff) end  -- camera back on you, so you SEE where it landed
 end
 
@@ -1817,16 +1899,18 @@ track(RunService.Heartbeat:Connect(function()
     pcall(function()
         local root = job.root
         if not root or not root.Parent then
+            finishTpJob(job)
             TP_JOB = nil
             return
         end
-        local drift = (job.landPos - root.Position).Magnitude
+        local d = job.landPos - root.Position
+        local drift = Vector3.new(d.X, 0, d.Z).Magnitude  -- horizontal only: gravity may drop it on landing, that's fine
         if os.clock() > job.doneAt then
             if drift > 8 and os.clock() < job.hardDoneAt and job.applies < 90 then
                 job.doneAt = os.clock() + 0.25
             else
                 local note = drift > 8 and " - something keeps dragging it back" or ""
-                print(("[oaklands] cam tp: settle check - %d studs off target after %d applies%s"):format(math.floor(drift), job.applies, note))
+                finishTpJob(job, ("[oaklands] cam tp: settle check - %d studs off target after %d applies%s"):format(math.floor(drift), job.applies, note))
                 TP_JOB = nil
                 return
             end
