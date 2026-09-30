@@ -37,10 +37,9 @@
         compensated). Roll/pitch is locked so the car cannot capsize -
         pull a flip and it rights itself. While flying the wheels are
         locked rigid to the car (nocollide + massless + frame-glued,
-        velocities pinned) so the game's own wheel drive can't spin or
-        knock them and they never fight the hover or glitch after a
-        jump. Direct velocity + angular writes on your own vehicle -
-        cars work best. Off by default.
+        velocities pinned) AND their joints to the chassis are cut, so
+        no wheel force can reach the hover. Direct velocity + angular
+        writes on your own vehicle - cars work best. Off by default.
       • Freecam        - built in: toggles on a rebindable key
         (default RightCtrl - Camera section row; the toggle shows the
         live key chip), WASD flies, mouse looks, Space/LeftCtrl
@@ -134,7 +133,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v39"
+local SCRIPT_VERSION = "oak-v40"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1425,7 +1424,7 @@ local function vehicleFlyStep(dt)
         return
     end
     -- wheels locked rigid to the car while flying - nocollide + massless
-    -- + glued, so the game's own wheel drive cannot spin or knock them
+    -- + glued + joints cut, so no wheel force can reach the hover
     if flyWheelApply then pcall(flyWheelApply, seat) end
     local root = seat.AssemblyRootPart or seat
     local speed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
@@ -1857,16 +1856,29 @@ local function findWheelParts(scope)
     return wheelParts
 end
 
--- Vehicle Fly wheel lock (oak-v38): while flying, the wheels get glued
+-- Vehicle Fly wheel lock (oak-v40): while flying, the wheels get glued
 -- rigid to the car - nocollide + massless + frame-snapped to the offset
--- captured when fly started, velocities pinned at zero - so nothing
--- (not even the game's own wheel drive) can spin, bounce or rubber-band
--- them while the car hovers. Restored the moment fly ends or you
--- dismount.
+-- captured when fly started, velocities pinned at zero - AND the joints
+-- connecting each wheel to the chassis are cut. The live joints were
+-- feeding wheel forces straight back into the hover ("the wheels give
+-- the body velocity when i fly"): a glued wheel plus a live joint means
+-- the joint solver resolves the contradiction with impulses on BOTH
+-- sides - one of them is your car. Everything is restored the moment
+-- fly ends or you dismount.
 flyWheelRestoreAll = function()
     local job = VEH_STATE.flyWheelJob
     if not job then return end
     VEH_STATE.flyWheelJob = nil
+    -- joints back first (oak-v40), then the wheel physics
+    if type(job.cons) == "table" then
+        for _, rec in ipairs(job.cons) do
+            pcall(function()
+                if rec and rec.c and rec.c.Parent and rec.was then
+                    rec.c.Enabled = true
+                end
+            end)
+        end
+    end
     for p, st in pairs(job.state) do
         pcall(function()
             if p.Parent then
@@ -1909,6 +1921,18 @@ flyWheelApply = function(seat)
                 end
             end
         end
+        -- if anything re-enabled a cut wheel joint, cut it again
+        if type(job.cons) == "table" then
+            for _, rec in ipairs(job.cons) do
+                local c = rec and rec.c
+                if c and c.Parent then
+                    local okE, en = pcall(function() return c.Enabled end)
+                    if okE and en == true then
+                        pcall(function() c.Enabled = false end)
+                    end
+                end
+            end
+        end
         return
     end
     if job then
@@ -1941,8 +1965,47 @@ flyWheelApply = function(seat)
         end
     end
     if count == 0 then return end
-    VEH_STATE.flyWheelJob = { seat = seat, model = scope, root = root, state = state, count = count }
-    print(("[oaklands] fly: wheels locked (%d) - nocollide + massless + glued until you stop flying"):format(count))
+    -- cut every joint between a locked wheel and the rest (oak-v40):
+    -- while the wheels are glued, a live joint solves the disagreement
+    -- by shoving the CAR around - the wheels feed velocity into the
+    -- hover and bug it. Constraints hang off attachments even when the
+    -- constraint instance itself lives in a rig folder, so scan each
+    -- wheel's attachments; legacy joints come from GetJoints. All of it
+    -- is restored when fly ends.
+    local cons, seenC = {}, {}
+    for p in pairs(state) do
+        local okD, descs = pcall(function() return p:GetDescendants() end)
+        if okD and descs then
+            for _, d in ipairs(descs) do
+                if d:IsA("Attachment") then
+                    local c = d.ParentConstraint
+                    if c and not seenC[c] then
+                        seenC[c] = true
+                        local okE, en = pcall(function() return c.Enabled end)
+                        if okE and type(en) == "boolean" and en == true then
+                            pcall(function() c.Enabled = false end)
+                            cons[#cons + 1] = { c = c, was = true }
+                        end
+                    end
+                end
+            end
+        end
+        local okJ, joints = pcall(function() return p:GetJoints() end)
+        if okJ and joints then
+            for _, j in ipairs(joints) do
+                if not seenC[j] then
+                    seenC[j] = true
+                    local okE, en = pcall(function() return j.Enabled end)
+                    if okE and type(en) == "boolean" and en == true then
+                        pcall(function() j.Enabled = false end)
+                        cons[#cons + 1] = { c = j, was = true }
+                    end
+                end
+            end
+        end
+    end
+    VEH_STATE.flyWheelJob = { seat = seat, model = scope, root = root, state = state, count = count, cons = cons }
+    print(("[oaklands] fly: wheels locked (%d, %d joints cut) - glued, nocollide, massless until you stop flying"):format(count, #cons))
 end
 
 local function cameraTeleport()
