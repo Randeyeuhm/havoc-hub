@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v18
+    HAVOC HUB - OAKLANDS                           oak-v19
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -43,10 +43,10 @@
         detects (noclip = ban).
       • Wall Phase     - optional, the ban-safe way through walls, works
         in a vehicle OR on foot: blocked (holding W, barely moving, wall
-        right ahead) -> teleported PAST it in one atomic step with a
-        verified-clear landing spot - never left inside solid geometry.
-        Same mechanism the game's own store teleports use. Car hops
-        scale with vehicle size (semis clear thick walls in one go).
+        right ahead) -> teleported PAST it - chains several hops in one
+        tick for thick objects and only lands on verified-clear spots
+        with ground below (no random drops). Never left inside solid
+        geometry - same mechanism the game's own store teleports use.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -109,7 +109,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v18"
+local SCRIPT_VERSION = "oak-v19"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1467,19 +1467,30 @@ if type(PHASE_STATE) ~= "table" then
     genv.__HAVOC_OAKLANDS_PHASE = PHASE_STATE
 end
 
-local function phaseLanding(origin, flat, hit, exclude, probeRadius, margin, extend)
+local function phaseTryHop(origin, flat, exclude, hit, probeRadius, margin, extend)
     local oparams = OverlapParams.new()
     oparams.FilterType = Enum.RaycastFilterType.Exclude
     oparams.FilterDescendantsInstances = exclude
     oparams.RespectCanCollide = true
+    local fparams = RaycastParams.new()
+    fparams.FilterType = Enum.RaycastFilterType.Exclude
+    fparams.FilterDescendantsInstances = exclude
+    fparams.RespectCanCollide = true
     local step = hit.Distance + margin
-    for _ = 1, 8 do
+    for _ = 1, 10 do
+        if step > 140 then return nil end
         local candidate = origin + flat * step
         local okh, hits = pcall(function()
             return Workspace:GetPartBoundsInRadius(candidate, probeRadius, oparams)
         end)
         if okh and hits and #hits == 0 then
-            return step
+            -- landing must also have ground below (no random drops into voids)
+            local okf, flo = pcall(function()
+                return Workspace:Raycast(candidate + Vector3.new(0, 4, 0), Vector3.new(0, -40, 0), fparams)
+            end)
+            if okf and flo and flo.Distance <= 30 then
+                return step
+            end
         end
         step = step + extend
     end
@@ -1514,11 +1525,6 @@ local function phaseCar()
     local exclude = { ch }
     local model = ghostTopModel(seat)
     if model then exclude[#exclude + 1] = model end
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = exclude
-    params.RespectCanCollide = true
-    local origin = root.Position + Vector3.new(0, 2, 0)
     local half = 8
     if model then
         local okex, ex = pcall(function() return model:GetExtentsSize() end)
@@ -1526,17 +1532,26 @@ local function phaseCar()
             half = math.max(ex.X, ex.Z) * 0.5
         end
     end
-    local reach = half + 8
-    local hit = Workspace:Raycast(origin, flat * (reach + 8), params)
-    if not hit or hit.Distance > reach then return end
-    if hit.Normal.Y > 0.6 then return end
-    local step = phaseLanding(origin, flat, hit, exclude, 3, half + 6, 10)
-    if not step then return end
-    local ok = pcall(function()
-        root.CFrame = root.CFrame + flat * step
-    end)
-    if ok then
-        phasePrint("car", step)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = exclude
+    params.RespectCanCollide = true
+    local total = 0
+    for _ = 1, 4 do
+        local origin = root.Position + Vector3.new(0, 2, 0)
+        local reach = half + 8
+        local hit = Workspace:Raycast(origin, flat * (reach + 8), params)
+        if not hit or hit.Distance > reach or hit.Normal.Y > 0.6 then break end
+        local step = phaseTryHop(origin, flat, exclude, hit, 3, half + 6, 10)
+        if not step then break end
+        local ok = pcall(function()
+            root.CFrame = root.CFrame + flat * step
+        end)
+        if not ok then break end
+        total = total + step
+    end
+    if total > 0 then
+        phasePrint("car", total)
     end
 end
 
@@ -1563,17 +1578,21 @@ local function phaseFoot()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = exclude
     params.RespectCanCollide = true
-    local origin = hrp.Position
-    local hit = Workspace:Raycast(origin, flat * 7, params)
-    if not hit or hit.Distance > 4.5 then return end
-    if hit.Normal.Y > 0.6 then return end
-    local step = phaseLanding(origin, flat, hit, exclude, 2.5, 3, 6)
-    if not step then return end
-    local ok = pcall(function()
-        hrp.CFrame = hrp.CFrame + flat * step
-    end)
-    if ok then
-        phasePrint("foot", step)
+    local total = 0
+    for _ = 1, 4 do
+        local origin = hrp.Position
+        local hit = Workspace:Raycast(origin, flat * 7, params)
+        if not hit or hit.Distance > 5.5 or hit.Normal.Y > 0.6 then break end
+        local step = phaseTryHop(origin, flat, exclude, hit, 2.5, 3, 6)
+        if not step then break end
+        local ok = pcall(function()
+            hrp.CFrame = hrp.CFrame + flat * step
+        end)
+        if not ok then break end
+        total = total + step
+    end
+    if total > 0 then
+        phasePrint("foot", total)
     end
 end
 
@@ -1585,7 +1604,7 @@ end
 
 track(task.spawn(function()
     while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
-        task.wait(0.15)
+        task.wait(0.05)
         pcall(phaseStep)
     end
 end))
