@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v8
+    HAVOC HUB - OAKLANDS                           oak-v9
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -41,8 +41,10 @@
                             * pull  - DragConstructors AlignPosition.
                               MaxForce / AlignOrientation.MaxTorque (the
                               module reuses ONE pair for every drag; the
-                              strength slider multiplies it up to 1000x,
-                              final force clamped at 1e9 to stay sane)
+                              strength slider multiplies it up to
+                              100000x, final force clamped at 1e12
+                              (past ~100x physics velocity-caps it
+                              anyway)
                             * throw - extra impulse on the G-throw equal
                               to (multiplier-1) x the game's own impulse,
                               applied at the same spot/direction one
@@ -77,7 +79,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v8"
+local SCRIPT_VERSION = "oak-v9"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -202,8 +204,8 @@ Config.Movement.WalkSpeed = 16
 Config.Movement.JumpPower = 50
 Config.Movement.SprintBoost = 1
 Config.Drag.Reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
-Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 1000)
-Config.Drag.Throw = math.clamp(tonumber(Config.Drag.Throw) or 1, 1, 1000)
+Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 100000)
+Config.Drag.Throw = math.clamp(tonumber(Config.Drag.Throw) or 1, 1, 100000)
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
 
 local function saveConfig()
@@ -782,8 +784,8 @@ local function dragStep()
                         local ok2, v2 = pcall(function() return root:GetAttribute("DragTorque") end)
                         if ok2 and typeof(v2) == "number" and v2 > 0 and v2 < 1e12 then baseT = v2 end
                     end
-                    local boostF = math.min(baseF * mult, 1e9)
-                    local boostT = math.min(baseT * mult, 1e9)
+                    local boostF = math.min(baseF * mult, 1e12)
+                    local boostT = math.min(baseT * mult, 1e12)
                     DRAG_STATE.savedBase[d.mod] = { f = baseF, t = baseT }
                     pcall(function()
                         ap.MaxForce = boostF
@@ -901,7 +903,7 @@ local function applyThrowBoost(pending, dur)
     local mult = tonumber(Config.Drag.Throw) or 1
     local extra = (mult - 1) * u2 * 700 * (u3 / 75)
     if extra <= 0 then return end
-    if extra > 1e9 then extra = 1e9 end
+    if extra > 1e12 then extra = 1e12 end
     pcall(function() part:ApplyImpulseAtPosition(dir * extra, objPos) end)
     local nowc = os.clock()
     if nowc - (THROW_STATE.lastPrint or 0) > 1.5 then
@@ -1288,7 +1290,7 @@ local function buildMenu()
         function(v) return v <= 12 and "12 (vanilla)" or ("%d studs"):format(v) end)
     slider(pmv, "Drag Strength",
         function() return Config.Drag.Strength end,
-        function(v) Config.Drag.Strength = v end, 0.25, 1, 1000,
+        function(v) Config.Drag.Strength = v end, 0.25, 1, 100000,
         function(v)
             if v <= 1.001 then return "1.00x (vanilla)" end
             if v >= 100 then return ("%dx"):format(math.floor(v + 0.5)) end
@@ -1296,13 +1298,13 @@ local function buildMenu()
         end)
     slider(pmv, "Throw Power",
         function() return Config.Drag.Throw end,
-        function(v) Config.Drag.Throw = v end, 0.25, 1, 1000,
+        function(v) Config.Drag.Throw = v end, 0.25, 1, 100000,
         function(v)
             if v <= 1.001 then return "1.00x (vanilla)" end
             if v >= 100 then return ("%dx"):format(math.floor(v + 0.5)) end
             return ("%.2fx"):format(v)
         end)
-    note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force, up to 1000x; Throw Power = extra impulse on the G-throw (hold G while dragging, release - Enhanced Drag must be on), up to 1000x. Past ~20x only matters for heavy stuff - and it will FLY. Console prints when each boost lands.")
+    note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force, up to 100000x; Throw Power = extra impulse on the G-throw (hold G while dragging, release - Enhanced Drag must be on), up to 100000x. Honest physics: past ~100x everything hits Roblox's own velocity cap - same result, bigger number. Console prints when each boost lands.")
 
     note(pmv, "Removed: speed / jump (oak-v2 - server bans) and Infinite Stamina (oak-v4 - it got detected and crashed the client). Everything left in this tab is client-side only.")
 
