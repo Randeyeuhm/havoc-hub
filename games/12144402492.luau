@@ -279,7 +279,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v47"
+local SCRIPT_VERSION = "dl-v48"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -3340,7 +3340,6 @@ local function buildMenu()
     toggle(pa, "Visible Only",
         function() return Config.SilentAim.VisibleOnly end,
         function(v) Config.SilentAim.VisibleOnly = v end)
-    note(pa, "The FOV angle is a cone around where the barrel points - each shot fires at the nearest enemy inside it; the server gets the redirected direction and your camera never moves. The ring is grey until the aim module arms, then orange. Keep the angle modest for believable replays.")
 
     -- ---------------- ESP ----------------
     section(pe, "Player ESP")
@@ -3645,7 +3644,6 @@ local function buildMenu()
         end)
 
     section(pm, "Anticheat Trap (test)")
-    note(pm, "Fires the caster's honeypot for real: prints its taunt + busy-loops a thread until rejoin. Test only.")
     button(pm, "Trigger caster.fire trap", function()
         local orig = nil
         if type(DROP_STATE.originals) == "table" then

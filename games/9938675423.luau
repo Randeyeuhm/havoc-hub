@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v9
+    HAVOC HUB - OAKLANDS                           oak-v10
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -79,7 +79,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v9"
+local SCRIPT_VERSION = "oak-v10"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1186,11 +1186,6 @@ local function buildMenu()
     local function button(page, text, onClick, opts)
         guard("button " .. text, function() return UILib.makeButton(page, text, onClick, opts) end)
     end
-    local function note(page, text)
-        local lbl
-        pcall(function() lbl = UILib.makeNote(page, text, "auto") end)
-        return lbl
-    end
     local function dropdown(page, label, getItems, getSelected, onSelect)
         guard("dropdown " .. label, function()
             return UILib.makeDropdown(page, label, getItems, getSelected, function(v)
@@ -1230,7 +1225,6 @@ local function buildMenu()
             end
             table.sort(species)
         end
-        note(pw, ("%d species from INFO - unchecked ones are hidden."):format(#species))
         multiselect(pw, "Species", species,
             function(name) return Config.World.Species[name] ~= false end,
             function(name, on)
@@ -1304,10 +1298,6 @@ local function buildMenu()
             if v >= 100 then return ("%dx"):format(math.floor(v + 0.5)) end
             return ("%.2fx"):format(v)
         end)
-    note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force, up to 100000x; Throw Power = extra impulse on the G-throw (hold G while dragging, release - Enhanced Drag must be on), up to 100000x. Honest physics: past ~100x everything hits Roblox's own velocity cap - same result, bigger number. Console prints when each boost lands.")
-
-    note(pmv, "Removed: speed / jump (oak-v2 - server bans) and Infinite Stamina (oak-v4 - it got detected and crashed the client). Everything left in this tab is client-side only.")
-
     -- ---------------- Misc ----------------
     section(pmi, "Lighting")
     toggle(pmi, "Fullbright",
@@ -1335,7 +1325,6 @@ local function buildMenu()
     button(pmi, "Teleport", function()
         pcall(teleportTo, Config.Misc.TeleportTarget)
     end)
-    note(pmi, "Stores list comes live from World.Regions.Stores. If a zone is protected the game may pull you back.")
 
     section(pmi, "Utility")
     toggle(pmi, "Anti-AFK",
