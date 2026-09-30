@@ -123,7 +123,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.3"
+local SCRIPT_VERSION = "oak-v29.4"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -2006,7 +2006,7 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end))
 
 -- ============================================================
--- VEHICLE FLY WHEEL LOCK (oak-v29.3) - while flying, wheels that live
+-- VEHICLE FLY WHEEL LOCK (oak-v29.4) - while flying, wheels that live
 -- in their OWN assembly get ANCHORED (nocollide + massless + a
 -- position-only follow glued to the car) and every joint crossing
 -- between a wheel and the chassis is cut. Anchoring is the jitter
@@ -2204,7 +2204,7 @@ flyWheelApply = function(seat)
     local glueSeen = {}
     for _, p in ipairs(wheelList) do
         local st = state[p]
-        if st and not p.Anchored and p.AssemblyRootPart ~= root then
+        if st and st.an ~= true and p.AssemblyRootPart ~= root then
             local a = p.AssemblyRootPart
             if a and not glueSeen[a] then
                 glueSeen[a] = true
