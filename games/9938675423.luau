@@ -50,8 +50,12 @@
         sweeps the rig model + attachment reverse-lookups, and picks
         wheels up by NAME (FL/FR/BL/BR corner names + anything called
         wheel, tire or tyre - the live car hides them from every joint
-        scan); during the jump the wheels go nocollide + weightless so
-        nothing catches on them, then their physics comes back. The
+        scan); during the jump the wheels go nocollide + weightless
+        AND are glued to the car - held at their exact car-relative
+        pose every frame, so they cannot move at all - and the glue
+        releases when it settles (deliberate glue, not a weld: welds
+        merge the assemblies and can trip the car into server mode).
+        Then their physics comes back. The
         landing nudges up over obstacles; the camera must be >20 studs
         away so the chase cam can never trigger it. The car is pinned
         at the landing spot for a moment (beats physics / server
@@ -120,7 +124,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29"
+local SCRIPT_VERSION = "oak-v29.5"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1903,6 +1907,50 @@ local function cameraTeleport()
             p.Massless = true
         end)
     end
+    -- TELEPORT WHEEL LOCK: glue every separate wheel assembly to its
+    -- exact car-relative pose for the jump + settle, so the wheels
+    -- physically cannot lag, drift, spin or glitch while the car
+    -- teleports. Welded-in wheels are skipped (a CFrame write on a
+    -- part of the car's OWN assembly would move the car itself).
+    -- Deliberate glue, NOT a WeldConstraint: welds MERGE the two
+    -- assemblies and can flip the car into server mode ("car acts
+    -- anchored"). Drift-gated writes = parked wheels cost nothing.
+    local wheelLock = {}
+    do
+        local rootAsm = root.AssemblyRootPart or root
+        local seenLock = {}
+        for _, p in ipairs(wheelParts) do
+            if not seenLock[p] then
+                seenLock[p] = true
+                if p.AssemblyRootPart ~= rootAsm and not p.Anchored then
+                    local okL, off = pcall(function() return root.CFrame:Inverse() * p.CFrame end)
+                    if okL and off then
+                        wheelLock[#wheelLock + 1] = { p = p, off = off }
+                    end
+                end
+            end
+        end
+    end
+    local function tpWheelGlue()
+        if #wheelLock == 0 then return end
+        if not root or not root.Parent then return end
+        local rcf = root.CFrame
+        for _, w in ipairs(wheelLock) do
+            local p = w.p
+            if p and p.Parent and not p.Anchored and p.AssemblyRootPart ~= root then
+                local want = rcf * w.off
+                local dp = (p.Position - want.Position).Magnitude
+                local dl = (p.CFrame.LookVector - want.LookVector).Magnitude
+                if dp > 0.02 or dl > 0.02 then
+                    pcall(function()
+                        p.CFrame = want
+                        p.AssemblyLinearVelocity = Vector3.zero
+                        p.AssemblyAngularVelocity = Vector3.zero
+                    end)
+                end
+            end
+        end
+    end
     if #parts == 0 then parts[1] = root end
     -- one CFrame write per unique assembly (setting one part moves its
     -- whole rigid assembly - a second write would double-move it)
@@ -1925,16 +1973,23 @@ local function cameraTeleport()
         return cnt, fls
     end
     local count, fails = tpApply()
+    tpWheelGlue()  -- wheels freeze onto the car from the very first frame
     local extra = {}
     if fails > 0 then extra[#extra + 1] = ("%d failed"):format(fails) end
     if rigged > 0 then extra[#extra + 1] = ("+%d rigged"):format(rigged) end
-    if #wheelParts > 0 then extra[#extra + 1] = ("%d wheels"):format(#wheelParts) end
+    if #wheelParts > 0 then
+        if #wheelLock > 0 then
+            extra[#extra + 1] = ("%d wheels (%d locked)"):format(#wheelParts, #wheelLock)
+        else
+            extra[#extra + 1] = ("%d wheels"):format(#wheelParts)
+        end
+    end
     local suffix = #extra > 0 and (" [" .. table.concat(extra, ", ") .. "]") or ""
     print(("[oaklands] cam tp: moved %d studs (vehicle: %d parts, %d assemblies)%s"):format(math.floor(dist), #parts, count, suffix))
     -- pin the car where it landed for a moment in case anything (server
     -- replication, physics wake-up, streaming) tries to drag it back;
     -- the settle line is the evidence when something persistent fights
-    TP_JOB = { root = root, landPos = landPos, apply = tpApply, wheels = wheelState, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.6, applies = 1 }
+    TP_JOB = { root = root, landPos = landPos, apply = tpApply, glue = tpWheelGlue, wheels = wheelState, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.6, applies = 1 }
     if FREE.on then
         pcall(freecamOff)  -- camera back on you, so you SEE where it landed
         pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
@@ -1971,6 +2026,7 @@ track(RunService.Heartbeat:Connect(function()
             job.apply()
             job.applies = job.applies + 1
         end
+        if job.glue then job.glue() end  -- locked wheels stay glued through the settle window
     end)
 end))
 
