@@ -36,12 +36,12 @@
         strafe, Space/Shift up, LeftCtrl down, neutral hovers (gravity
         compensated). Roll/pitch is locked so the car cannot capsize -
         pull a flip and it rights itself. While flying the wheels are
-        fully removed: hidden, glued rigid to the car (nocollide +
-        massless), chassis joints cut, velocities pinned - they can't
-        be seen or feed force into the hover, and child pieces riding
-        on them are handled too. All restored when fly ends. Direct
-        velocity + angular writes on your own vehicle - cars work best.
-        Off by default.
+        fully removed (hidden, nocollide + massless + glued, chassis
+        joints cut) AND the seat's own drive is muted (seat disabled,
+        throttle/steer pinned neutral) - with no drivetrain left,
+        nothing can push the car under the hover. All restored when
+        fly ends. Direct velocity + angular writes on your own
+        vehicle - cars work best. Off by default.
       • Freecam        - built in: toggles on a rebindable key
         (default RightCtrl - Camera section row; the toggle shows the
         live key chip), WASD flies, mouse looks, Space/LeftCtrl
@@ -135,7 +135,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v41"
+local SCRIPT_VERSION = "oak-v42"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1412,23 +1412,99 @@ end
 -- always happened by then
 local flyWheelApply = nil
 local flyWheelRestoreAll = nil
+local flySeatKill = nil
+local flySeatRestore = nil
+-- fly diag (oak-v42): the last velocity we wrote - the gap to the next
+-- frame's velocity is what physics (or something else) did behind our
+-- back. Gravity baseline shows as ~-gravity*dt on Y.
+local flyLastV, flyLastAV, flyDiagAt = nil, nil, 0
+
+-- Vehicle Fly drivetrain mute (oak-v42): with the wheels fully removed
+-- the car STILL caught weird forces - the driver left is the game
+-- itself. Your WASD reaches the seat too, and the seat engine plus the
+-- game's own vehicle module keep reacting to it, pushing the chassis
+-- around under the hover. While flying the seat goes Disabled and
+-- throttle / steer stay pinned neutral (the fly keys are read straight
+-- from UserInputService, so flying still works). Restored when fly ends.
+local FLY_SEAT_SAVED = VEH_STATE.seatKill
+if type(FLY_SEAT_SAVED) ~= "table" then
+    FLY_SEAT_SAVED = setmetatable({}, { __mode = "k" })
+    VEH_STATE.seatKill = FLY_SEAT_SAVED
+end
+flySeatKill = function(seat)
+    local rec = FLY_SEAT_SAVED[seat]
+    if not rec then
+        rec = {}
+        pcall(function()
+            rec.disabled = seat.Disabled
+            rec.tf = seat.ThrottleFloat
+            rec.sf = seat.SteerFloat
+        end)
+        FLY_SEAT_SAVED[seat] = rec
+        print("[oaklands] fly: drivetrain muted (seat disabled, throttle/steer pinned neutral)")
+    end
+    if seat.Disabled ~= true then
+        pcall(function() seat.Disabled = true end)
+    end
+    pcall(function()
+        if seat.ThrottleFloat ~= 0 then seat.ThrottleFloat = 0 end
+        if seat.SteerFloat ~= 0 then seat.SteerFloat = 0 end
+    end)
+end
+flySeatRestore = function()
+    local n = 0
+    for seat, rec in pairs(FLY_SEAT_SAVED) do
+        FLY_SEAT_SAVED[seat] = nil
+        n = n + 1
+        pcall(function()
+            if seat.Parent then
+                seat.Disabled = rec.disabled
+                seat.ThrottleFloat = rec.tf
+                seat.SteerFloat = rec.sf
+            end
+        end)
+    end
+    if n > 0 then
+        print(("[oaklands] fly: drivetrain restored (%d)"):format(n))
+    end
+end
 
 local function vehicleFlyStep(dt)
     if not Config.Vehicle.Fly then
+        flyLastV, flyLastAV = nil, nil
         if flyWheelRestoreAll then pcall(flyWheelRestoreAll) end
+        if flySeatRestore then pcall(flySeatRestore) end
         return
     end
     local ch = LocalPlayer.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
     if not seat or not seat:IsA("VehicleSeat") then
+        flyLastV, flyLastAV = nil, nil
         if flyWheelRestoreAll then pcall(flyWheelRestoreAll) end
+        if flySeatRestore then pcall(flySeatRestore) end
         return
     end
-    -- wheels fully removed while flying - hidden + nocollide + massless
-    -- + glued + chassis joints cut, so nothing wheel-side can reach the hover
+    -- wheels fully removed + the seat's own drive muted while flying, so
+    -- nothing - wheels or engine - can push the car under the hover
+    if flySeatKill then pcall(flySeatKill, seat) end
     if flyWheelApply then pcall(flyWheelApply, seat) end
     local root = seat.AssemblyRootPart or seat
+    -- diag: what did physics do to the car between frames? (dv = this
+    -- frame's velocity minus the one we wrote last frame; gravity shows
+    -- as ~-gravity*dt on Y, anything bigger is an outside force)
+    local preV = root.AssemblyLinearVelocity
+    local preAV = root.AssemblyAngularVelocity
+    if flyLastV and os.clock() >= flyDiagAt then
+        local dv = preV - flyLastV
+        local dav = preAV - flyLastAV
+        if dv.Magnitude > Workspace.Gravity * (dt or 0) * 2 + 4 or dav.Magnitude > 4 then
+            flyDiagAt = os.clock() + 1
+            local touch = 0
+            pcall(function() touch = #root:GetTouchingParts() end)
+            print(("[oaklands] fly diag: unexplained dv/frame (%.1f, %.1f, %.1f) | av (%.1f, %.1f, %.1f) | touching %d"):format(dv.X, dv.Y, dv.Z, dav.X, dav.Y, dav.Z, touch))
+        end
+    end
     local speed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
     local cam = Workspace.CurrentCamera
     local look = (cam and cam.CFrame.LookVector) or seat.CFrame.LookVector
@@ -1470,6 +1546,9 @@ local function vehicleFlyStep(dt)
     local corr = math.min(math.acos(d) * 6, 12)
     local av = root.AssemblyAngularVelocity
     root.AssemblyAngularVelocity = Vector3.new(0, av.Y * 0.7, 0) + axis * corr
+    -- remember what we wrote so next frame's diag can spot outside forces
+    flyLastV = root.AssemblyLinearVelocity
+    flyLastAV = root.AssemblyAngularVelocity
 end
 
 track(RunService.RenderStepped:Connect(function(dt)
@@ -2552,6 +2631,12 @@ end)
 pcall(function()
     if VEH_STATE.flyWheelJob and flyWheelRestoreAll then
         flyWheelRestoreAll()
+    end
+end)
+-- leftover fly drivetrain mute from an old build: give the seat back
+pcall(function()
+    if type(VEH_STATE.seatKill) == "table" and flySeatRestore then
+        flySeatRestore()
     end
 end)
 
