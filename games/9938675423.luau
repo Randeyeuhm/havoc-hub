@@ -123,7 +123,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v31"
+local SCRIPT_VERSION = "oak-v32"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1931,11 +1931,13 @@ local function cameraTeleport()
     end
     if #parts == 0 then parts[1] = root end
     -- one CFrame write per unique assembly (setting one part moves its
-    -- whole rigid assembly - a second write would double-move it). Each
-    -- written assembly is FROZEN (anchored, client-side only) until the
-    -- settle window ends: that is what stops loaded cargo from tipping
-    -- the truck or slipping out mid-jump, and it kills the physics-storm
-    -- lag that came with teleporting a bed full of logs.
+    -- whole rigid assembly - a second write would double-move it). The
+    -- MOVE happens while the assembly is still UNANCHORED: anchoring it
+    -- first breaks the ride-along (the rest of the assembly does not
+    -- come, physics drags it after), which landed cars somewhere
+    -- completely different from the camera. Anchor AFTER the move. The
+    -- freeze is what stops cargo tipping the truck, keeps cargo from
+    -- slipping out mid-jump, and kills the physics-storm lag.
     local anchorState = {}
     local function tpApply()
         local shift = landPos - root.Position
@@ -1946,13 +1948,15 @@ local function cameraTeleport()
             if a and not moved[a] then
                 moved[a] = true
                 local okp = pcall(function()
+                    -- move FIRST, unanchored: the whole rigid assembly rides
+                    -- along; only then freeze it in place (client-side only)
+                    p.AssemblyLinearVelocity = Vector3.zero
+                    p.AssemblyAngularVelocity = Vector3.zero
+                    p.CFrame = CFrame.new(shift) * p.CFrame
                     if anchorState[p] == nil then
                         anchorState[p] = p.Anchored
                     end
                     p.Anchored = true
-                    p.AssemblyLinearVelocity = Vector3.zero
-                    p.AssemblyAngularVelocity = Vector3.zero
-                    p.CFrame = CFrame.new(shift) * p.CFrame
                 end)
                 if okp then cnt = cnt + 1 else fls = fls + 1 end
             end
