@@ -123,7 +123,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.2"
+local SCRIPT_VERSION = "oak-v29.3"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -2006,15 +2006,17 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end))
 
 -- ============================================================
--- VEHICLE FLY WHEEL LOCK (oak-v29.2) - while flying, wheels that live
--- in their OWN assembly (suspension-hung ones - welded-in wheels are
--- already rigid with the car and are left alone) get nocollide +
--- massless + glued to the car, and every joint crossing between a
--- wheel and the chassis is cut (a live joint + a glued wheel makes the
--- solver shove the CAR, so the cut is part of the lock). The glue pins
--- POSITION ONLY - the wheel's spin/rotation is never fought (freezing
--- the spin while the game keeps driving it was the tug-of-war that
--- read as wobble). Restored the moment fly ends or you dismount.
+-- VEHICLE FLY WHEEL LOCK (oak-v29.3) - while flying, wheels that live
+-- in their OWN assembly get ANCHORED (nocollide + massless + a
+-- position-only follow glued to the car) and every joint crossing
+-- between a wheel and the chassis is cut. Anchoring is the jitter
+-- killer: an anchored part ignores gravity, the solver AND any
+-- velocity the game keeps writing to it - only our own follow write
+-- can move it, and that one is smooth. The cut stays part of the lock:
+-- an anchored wheel plus a live joint would tie the CAR to a fixed
+-- point. Everything - anchor, joints, physics - restores the moment
+-- fly ends or you dismount. Welded-in wheels are left alone (already
+-- rigid); the console counts them.
 -- ============================================================
 local function findWheelParts(scope)
     local wheelParts, seenW = {}, {}
@@ -2052,8 +2054,17 @@ flyWheelRestoreAll = function()
     local job = VEH_STATE.flyWheelJob
     if not job then return end
     VEH_STATE.flyWheelJob = nil
-    -- joints back first, then the wheel physics (tr/kids undo any
-    -- hiding left behind by pre-rollback builds)
+    -- unanchor FIRST: an anchored wheel plus a re-enabled joint would
+    -- tie the car to a fixed point for a frame
+    for p, st in pairs(job.state) do
+        pcall(function()
+            if p.Parent and st.an ~= nil then
+                p.Anchored = st.an
+            end
+        end)
+    end
+    -- joints next, then the wheel physics (tr/kids undo any hiding
+    -- left behind by pre-rollback builds)
     if type(job.cons) == "table" then
         for _, rec in ipairs(job.cons) do
             pcall(function()
@@ -2090,16 +2101,14 @@ end
 flyWheelApply = function(seat)
     local job = VEH_STATE.flyWheelJob
     if job and job.seat == seat and job.model and job.model.Parent and job.root and job.root.Parent then
-        -- keep them locked every frame: nocollide + massless, glue
-        -- anchors pinned to the car, velocities pinned at zero
+        -- keep them anchored + followed every frame: an anchored wheel
+        -- cannot jitter - gravity, the solver and every game velocity
+        -- write all bounce off it
         local rc = job.root.CFrame
         for p, st in pairs(job.state) do
-            if p.Parent and not p.Anchored then
-                if p.CanCollide then
-                    pcall(function()
-                        p.CanCollide = false
-                        p.Massless = true
-                    end)
+            if p.Parent and st.an ~= true then
+                if not p.Anchored then
+                    pcall(function() p.Anchored = true end)
                 end
                 if st.glue and p.AssemblyRootPart ~= (job.root.AssemblyRootPart or job.root) then
                     if not st.off then
@@ -2107,13 +2116,10 @@ flyWheelApply = function(seat)
                     end
                     local want = rc * st.off
                     local dpos = (p.Position - want.Position).Magnitude
-                    -- pin POSITION only and never fight rotation or the
-                    -- wheel's spin - the game keeps driving the wheel
-                    -- while it rides glued in place
+                    -- follow: pin POSITION only, rotation untouched
                     if dpos > 0.02 then
                         pcall(function()
                             p.CFrame = CFrame.new(want.Position - p.Position) * p.CFrame
-                            p.AssemblyLinearVelocity = Vector3.zero
                         end)
                     end
                 end
@@ -2178,9 +2184,13 @@ flyWheelApply = function(seat)
             skipRigid = skipRigid + 1
         else
             local ok = pcall(function()
-                state[p] = { cc = p.CanCollide, ml = p.Massless }
+                state[p] = { cc = p.CanCollide, ml = p.Massless, an = p.Anchored }
                 p.CanCollide = false
                 p.Massless = true
+                -- anchor it: frozen in world space, immune to gravity,
+                -- the solver and any velocity the game writes to it -
+                -- the follow write is the only thing that moves it
+                p.Anchored = true
             end)
             if ok then count = count + 1 end
         end
@@ -2201,7 +2211,6 @@ flyWheelApply = function(seat)
                 pcall(function()
                     st.glue = true
                     st.off = root.CFrame:Inverse() * p.CFrame
-                    p.AssemblyLinearVelocity = Vector3.zero
                 end)
             end
         end
@@ -2269,7 +2278,7 @@ flyWheelApply = function(seat)
     if rigidLeft > 0 then notes[#notes + 1] = rigidLeft .. " rigid left" end
     if skipRigid > 0 then notes[#notes + 1] = skipRigid .. " welded-in skipped" end
     local note = #notes > 0 and (", " .. table.concat(notes, ", ")) or ""
-    print(("[oaklands] fly: wheels locked (%d parts, %d joints cut%s) - nocollide + massless + glued until you stop flying"):format(count, #cons, note))
+    print(("[oaklands] fly: wheels locked (%d parts, %d joints cut%s) - anchored + nocollide + massless until you stop flying"):format(count, #cons, note))
 end
 
 track(task.spawn(function()
