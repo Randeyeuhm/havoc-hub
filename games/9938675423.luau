@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v4
+    HAVOC HUB - OAKLANDS                           oak-v5
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -29,15 +29,22 @@
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
-                          mechanic is the dragger, and both of its strength
-                          knobs are client-side live reads: reach
-                          (DefaultMaxDragDistance, vanilla 12 studs, the
-                          game range-checks grabs against it) and pull
-                          force (AlignPosition MaxForce / AlignOrientation
-                          MaxTorque under the dragged object's DragForce
-                          attachment). Pure client physics of a drag the
-                          server already granted - no packets. Server
-                          checks on dragging are unknown: keep modest.
+                          mechanic is the dragger. The live game runs the
+                          CLASSIC dragger (World Interaction flag
+                          Client_Drag2025Enabled = false - the newer "Drag"
+                          module is never required). This feature finds
+                          whichever dragger module is loaded (getgc) and
+                          tunes it client-side only:
+                            * reach - MaxDragDistance (vanilla 12): the
+                              game range-checks BOTH the grab and the held
+                              distance against it
+                            * pull  - DragConstructors AlignPosition.
+                              MaxForce / AlignOrientation.MaxTorque (the
+                              module reuses ONE pair for every drag)
+                          Console prints a scan line on toggle. Pure client
+                          physics of a drag the server already granted - no
+                          packets. Server checks on dragging are unknown:
+                          keep modest.
 
     Misc
       • Fullbright       - grey ambient + no fog, re-applied every second
@@ -62,7 +69,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v4"
+local SCRIPT_VERSION = "oak-v5"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -574,18 +581,28 @@ end
 -- ============================================================
 -- DRAGGING  (optional client-side dragger reach + pull strength)
 -- ============================================================
--- Oaklands' carry/pickup mechanic IS the dragger: the client range-checks
--- the grab against DefaultMaxDragDistance (= 12 on the live dragger
--- instance), asks the server once (RequestDrag), then pulls the object
--- with an AlignPosition + AlignOrientation pair whose attachment
--- "DragForce" is parented to the dragged part (MaxForce = the part's
--- "DragForce" attribute or 15000, MaxTorque = "DragTorque" or 48500).
--- Both knobs are read/written by the CLIENT live:
---   * reach - field write on the dragger instance (found via getgc)
---   * pull  - multiplier on the live constraints during a drag
+-- The carry/pickup mechanic is the dragger, and the dump has TWO
+-- implementations:
+--   * CLASSIC "Dragging"  - THE LIVE ONE. The World Interaction flag
+--                           Client_Drag2025Enabled = false, and every
+--                           caller short-circuits to this module (the
+--                           newer "Drag" module is never even required).
+--       reach = module.MaxDragDistance (= 12). CanDrag range-checks the
+--               grab against it and (while dragging, +2.5) re-checks the
+--               held distance every frame - raise it to grab/hold farther.
+--       pull  = module.DragConstructors.AlignPosition.MaxForce /
+--               ...AlignOrientation.MaxTorque - ONE reused instance pair,
+--               rewritten at each drag start from the part attributes
+--               "DragForce" / "DragTorque" or 15000 / 48500.
+--   * 2025 "Drag"         - dormant while that flag stays false:
+--       reach = DefaultMaxDragDistance, pull = per-drag constraints under
+--       the dragged part's "DragForce" attachment.
+-- findDraggers() detects whichever module(s) exist; reach writes the live
+-- field and pull boosts whatever constraint pair that module actually
+-- uses. Toggling Enhanced Drag on prints a scan line (what was found) plus
+-- one line per applied knob, so dead-in-the-water reports are debuggable.
 -- No packets are sent by this feature. Server-side drag checks are
--- unknown (the server scripts were undumpable) - the menu says keep it
--- modest.
+-- unknown - the menu says keep it modest.
 local DRAG_STATE = genv.__HAVOC_OAKLANDS_DRAG
 if type(DRAG_STATE) ~= "table" then
     DRAG_STATE = { draggers = nil, lastScan = 0 }
@@ -596,6 +613,15 @@ if type(DRAG_STATE.savedDist) ~= "table" then
 end
 if type(DRAG_STATE.savedForces) ~= "table" then
     DRAG_STATE.savedForces = setmetatable({}, { __mode = "k" })
+end
+if type(DRAG_STATE.savedBase) ~= "table" then
+    DRAG_STATE.savedBase = setmetatable({}, { __mode = "k" })
+end
+if type(DRAG_STATE.reported) ~= "table" then
+    DRAG_STATE.reported = setmetatable({}, { __mode = "k" })
+end
+if type(DRAG_STATE.emptyScans) ~= "number" then
+    DRAG_STATE.emptyScans = 0
 end
 
 local function findDraggers()
@@ -608,12 +634,21 @@ local function findDraggers()
         if ok1 and type(g1) == "table" then table.insert(heaps, g1) end
         local ok2, g2 = pcall(fn)
         if ok2 and type(g2) == "table" and g2 ~= g1 then table.insert(heaps, g2) end
+        local seen = {}
         for _, heap in ipairs(heaps) do
             for _, v in ipairs(heap) do
-                if type(v) == "table"
-                    and typeof(rawget(v, "DefaultMaxDragDistance")) == "number"
-                    and type(rawget(v, "DragInfo")) == "table" then
-                    table.insert(out, v)
+                if type(v) == "table" and not seen[v] then
+                    if typeof(rawget(v, "MaxDragDistance")) == "number"
+                        and type(rawget(v, "DragConstructors")) == "table"
+                        and type(rawget(v, "ActiveDragObject")) == "table"
+                        and typeof(rawget(v, "CurrentlyDragging")) == "boolean" then
+                        seen[v] = true
+                        table.insert(out, { kind = "classic", mod = v, field = "MaxDragDistance" })
+                    elseif typeof(rawget(v, "DefaultMaxDragDistance")) == "number"
+                        and type(rawget(v, "DragInfo")) == "table" then
+                        seen[v] = true
+                        table.insert(out, { kind = "drag2025", mod = v, field = "DefaultMaxDragDistance" })
+                    end
                 end
             end
         end
@@ -634,11 +669,26 @@ local function restoreDragForces()
         end
         DRAG_STATE.savedForces[con] = nil
     end
+    -- classic dragger: put its reused DragConstructors back to the bases
+    for mod, kept in pairs(DRAG_STATE.savedBase) do
+        local cd = rawget(mod, "DragConstructors")
+        if type(cd) == "table" then
+            local ap = rawget(cd, "AlignPosition")
+            local ao = rawget(cd, "AlignOrientation")
+            pcall(function()
+                if ap then ap.MaxForce = kept.f end
+                if ao then ao.MaxTorque = kept.t end
+            end)
+        end
+        DRAG_STATE.savedBase[mod] = nil
+    end
 end
 
 local function applyDragRestore()
     for dragger, orig in pairs(DRAG_STATE.savedDist) do
-        pcall(function() dragger.DefaultMaxDragDistance = orig end)
+        if type(orig) == "table" then
+            pcall(function() dragger[orig.field] = orig.value end)
+        end
         DRAG_STATE.savedDist[dragger] = nil
     end
     restoreDragForces()
@@ -646,28 +696,104 @@ end
 
 local function dragStep()
     if not Config.Drag.Enhanced then
-        if next(DRAG_STATE.savedDist) ~= nil or next(DRAG_STATE.savedForces) ~= nil then
+        if next(DRAG_STATE.savedDist) ~= nil or next(DRAG_STATE.savedForces) ~= nil or next(DRAG_STATE.savedBase) ~= nil then
             applyDragRestore()
         end
         return
     end
     local now = os.clock()
-    if type(DRAG_STATE.draggers) ~= "table" or #DRAG_STATE.draggers == 0 or now - DRAG_STATE.lastScan > 30 then
+    local okShape = type(DRAG_STATE.draggers) == "table"
+    if okShape then
+        for _, d in ipairs(DRAG_STATE.draggers) do
+            if type(d) ~= "table" or rawget(d, "mod") == nil then
+                okShape = false
+                break
+            end
+        end
+    end
+    if not okShape or #DRAG_STATE.draggers == 0 or now - DRAG_STATE.lastScan > 30 then
         DRAG_STATE.lastScan = now
         DRAG_STATE.draggers = findDraggers()
-    end
-    -- reach: the dragger itself range-checks every grab against this field
-    local reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
-    for _, dragger in ipairs(DRAG_STATE.draggers) do
-        if DRAG_STATE.savedDist[dragger] == nil then
-            DRAG_STATE.savedDist[dragger] = tonumber(rawget(dragger, "DefaultMaxDragDistance")) or 12
+        local olds, news = 0, 0
+        for _, d in ipairs(DRAG_STATE.draggers) do
+            if d.kind == "classic" then olds = olds + 1 else news = news + 1 end
         end
-        pcall(function() dragger.DefaultMaxDragDistance = reach end)
+        if #DRAG_STATE.draggers == 0 then
+            DRAG_STATE.emptyScans = (tonumber(DRAG_STATE.emptyScans) or 0) + 1
+            if DRAG_STATE.emptyScans == 3 then
+                print("[oaklands] drag: no dragger module found yet - if Enhanced Drag stays dead, report this line")
+            end
+        else
+            DRAG_STATE.emptyScans = 0
+            local summary = ("classic=%d drag2025=%d"):format(olds, news)
+            if DRAG_STATE.lastSummary ~= summary then
+                DRAG_STATE.lastSummary = summary
+                print("[oaklands] drag scan: " .. summary)
+            end
+            for _, d in ipairs(DRAG_STATE.draggers) do
+                if not DRAG_STATE.reported[d.mod] then
+                    DRAG_STATE.reported[d.mod] = true
+                    print(("[oaklands] dragger found: %s (reach %s = %s)"):format(d.kind, d.field, tostring(rawget(d.mod, d.field))))
+                end
+            end
+        end
     end
-    -- pull strength: boost the live constraints while a drag is active
+    -- reach: the dragger range-checks grabs + held distance against this field
+    local reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
+    for _, d in ipairs(DRAG_STATE.draggers) do
+        local mod = d.mod
+        if DRAG_STATE.savedDist[mod] == nil then
+            DRAG_STATE.savedDist[mod] = { field = d.field, value = tonumber(rawget(mod, d.field)) or 12 }
+        end
+        if tonumber(rawget(mod, d.field)) ~= reach then
+            pcall(function() mod[d.field] = reach end)
+            if DRAG_STATE.reachAnnounced ~= reach then
+                DRAG_STATE.reachAnnounced = reach
+                print(("[oaklands] drag reach -> %s (%s %s)"):format(tostring(reach), d.kind, d.field))
+            end
+        end
+    end
+    -- pull: the classic dragger reuses ONE DragConstructors pair per drag
     local mult = tonumber(Config.Drag.Strength) or 1
+    for _, d in ipairs(DRAG_STATE.draggers) do
+        if d.kind == "classic" then
+            local cd = rawget(d.mod, "DragConstructors")
+            local ap = type(cd) == "table" and rawget(cd, "AlignPosition") or nil
+            local ao = type(cd) == "table" and rawget(cd, "AlignOrientation") or nil
+            if ap and ao then
+                local dragging = rawget(d.mod, "CurrentlyDragging") == true
+                if dragging and mult > 1.001 then
+                    local baseF, baseT = 15000, 48500
+                    local ado = rawget(d.mod, "ActiveDragObject")
+                    local root = (type(ado) == "table" and (rawget(ado, "RootObject") or ado.RootObject)) or nil
+                    if root then
+                        local ok1, v1 = pcall(function() return root:GetAttribute("DragForce") end)
+                        if ok1 and typeof(v1) == "number" and v1 > 0 and v1 < 1e12 then baseF = v1 end
+                        local ok2, v2 = pcall(function() return root:GetAttribute("DragTorque") end)
+                        if ok2 and typeof(v2) == "number" and v2 > 0 and v2 < 1e12 then baseT = v2 end
+                    end
+                    DRAG_STATE.savedBase[d.mod] = { f = baseF, t = baseT }
+                    pcall(function()
+                        ap.MaxForce = baseF * mult
+                        ao.MaxTorque = baseT * mult
+                    end)
+                    if not DRAG_STATE.boostAnnounced then
+                        DRAG_STATE.boostAnnounced = true
+                        print(("[oaklands] drag pull boost live x%s (force %d / torque %d)"):format(tostring(mult), math.floor(baseF * mult), math.floor(baseT * mult)))
+                    end
+                elseif not dragging and DRAG_STATE.savedBase[d.mod] ~= nil then
+                    local kept = DRAG_STATE.savedBase[d.mod]
+                    pcall(function()
+                        ap.MaxForce = kept.f
+                        ao.MaxTorque = kept.t
+                    end)
+                    DRAG_STATE.savedBase[d.mod] = nil
+                end
+            end
+        end
+    end
     if mult <= 1.001 then
-        if next(DRAG_STATE.savedForces) ~= nil then restoreDragForces() end
+        if next(DRAG_STATE.savedForces) ~= nil or next(DRAG_STATE.savedBase) ~= nil then restoreDragForces() end
         return
     end
     local char = LocalPlayer.Character
@@ -989,7 +1115,7 @@ local function buildMenu()
         function() return Config.Drag.Strength end,
         function(v) Config.Drag.Strength = v end, 0.25, 1, 3,
         function(v) return v <= 1.001 and "1.00x (vanilla)" or ("%.2fx"):format(v) end)
-    note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force on the object. Server checks on dragging are unknown - keep it modest.")
+    note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force on the object. Toggling this on prints a scan line to the console - if it ever feels dead again, send me those lines. Keep it modest.")
 
     note(pmv, "Removed: speed / jump (oak-v2 - server bans) and Infinite Stamina (oak-v4 - it got detected and crashed the client). Everything left in this tab is client-side only.")
 
