@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v11
+    HAVOC HUB - OAKLANDS                           oak-v12
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -32,6 +32,11 @@
         and planes go faster. Slider 1-25x, off by default. Character
         movement untouched; server vehicle checks unknown - throwaway
         mindset.
+      • Vehicle Fly    - hovercar mode: W/S fly along the camera, Space
+        up, LeftCtrl down, neutral hovers (gravity compensated). Direct
+        AssemblyLinearVelocity writes on your own vehicle (the same
+        channel the game drives barrows with) - cars work best. Off by
+        default.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -85,7 +90,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v11"
+local SCRIPT_VERSION = "oak-v12"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -160,6 +165,8 @@ local DEFAULTS = {
     Vehicle = {
         Enabled = false,
         Mult    = 3,     -- multiplier on VehicleSeat MaxSpeed + Torque
+        Fly      = false,
+        FlySpeed = 150,  -- studs/s for the Vehicle Fly controller
     },
     Misc = {
         Fullbright          = false,
@@ -217,6 +224,7 @@ Config.Drag.Reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
 Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 100000)
 Config.Drag.Throw = math.clamp(tonumber(Config.Drag.Throw) or 1, 1, 100000)
 Config.Vehicle.Mult = math.clamp(tonumber(Config.Vehicle.Mult) or 3, 1, 25)
+Config.Vehicle.FlySpeed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
 
 local function saveConfig()
@@ -1081,6 +1089,44 @@ local function vehicleStep()
     end)
 end
 
+-- Vehicle Fly: while ON and seated, the vehicle becomes a hovercar.
+-- W/S fly along the camera look, Space = up, LeftCtrl = down, no input =
+-- hover (the gravity term cancels the fall between physics steps).
+-- Direct AssemblyLinearVelocity writes on the assembly root = the same
+-- channel the game itself uses to drive barrows - client-simulated, so
+-- it just moves. Cars (wheel-driven) respond cleanest.
+local function vehicleFlyStep(dt)
+    if not Config.Vehicle.Fly then return end
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local seat = hum and hum.SeatPart
+    if not seat or not seat:IsA("VehicleSeat") then return end
+    local root = seat.AssemblyRootPart or seat
+    local speed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
+    local cam = Workspace.CurrentCamera
+    local look = (cam and cam.CFrame.LookVector) or seat.CFrame.LookVector
+    local throttle, lift = 0, 0
+    pcall(function()
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then throttle = throttle + 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then throttle = throttle - 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then lift = lift + 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then lift = lift - 1 end
+    end)
+    local target = look * (throttle * speed) + Vector3.new(0, Workspace.Gravity * (dt or 0), 0)
+    if lift > 0 then
+        target = target + Vector3.new(0, speed, 0)
+    elseif lift < 0 then
+        target = target - Vector3.new(0, speed, 0)
+    end
+    local v = root.AssemblyLinearVelocity
+    root.AssemblyLinearVelocity = v + (target - v) * 0.35
+end
+
+track(RunService.RenderStepped:Connect(function(dt)
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    pcall(vehicleFlyStep, dt)
+end))
+
 track(task.spawn(function()
     while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
         task.wait(0.5)
@@ -1386,6 +1432,16 @@ local function buildMenu()
         function() return Config.Vehicle.Mult end,
         function(v) Config.Vehicle.Mult = v end, 0.5, 1, 25,
         function(v) return v <= 1.001 and "1.00x (vanilla)" or ("%.1fx"):format(v) end)
+    toggle(pmv, "Vehicle Fly",
+        function() return Config.Vehicle.Fly end,
+        function(v)
+            Config.Vehicle.Fly = v
+            notify(v and "Vehicle fly on - W/S fly, Space up, Ctrl down" or "Vehicle fly off")
+        end)
+    slider(pmv, "Fly Speed",
+        function() return Config.Vehicle.FlySpeed end,
+        function(v) Config.Vehicle.FlySpeed = v end, 5, 25, 500,
+        function(v) return ("%d studs/s"):format(v) end)
     -- ---------------- Misc ----------------
     section(pmi, "Lighting")
     toggle(pmi, "Fullbright",
