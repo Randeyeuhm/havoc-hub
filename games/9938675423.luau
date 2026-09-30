@@ -37,11 +37,18 @@
         compensated). Roll/pitch is locked so the car cannot capsize -
         pull a flip and it rights itself. Direct velocity + angular
         writes on your own vehicle - cars work best. Off by default.
-      • Cam Teleport   - optional: sit in a vehicle, fly your freecam to
-        a spot, press T - the vehicle (and you, welded in) teleports
-        straight there. The landing is probed clear first and the camera
-        must be >20 studs away, so the normal chase cam can never
-        trigger it. Same client-side mechanism as the store teleports.
+      • Freecam        - built in (oak-v22): RightCtrl toggles, WASD
+        flies, mouse looks, Space/LeftCtrl up-down, Shift is a 3x
+        boost. Movement keys are swallowed while it's on so the
+        character stays put.
+      • Cam Teleport   - optional: sit in a vehicle, fly the freecam
+        to a spot, press T - the WHOLE vehicle (wheels included) and
+        you teleport straight there. The wheels hang off the body on
+        free suspension constraints (separate physics assemblies) -
+        every assembly moves together now, no more half-way jumps.
+        The landing is probed clear first and the camera must be >20
+        studs away, so the normal chase cam can never trigger it.
+        Same client-side mechanism as the store teleports.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -104,7 +111,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v21"
+local SCRIPT_VERSION = "oak-v22"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -184,6 +191,10 @@ local DEFAULTS = {
         FlySpeed = 150,  -- studs/s for the Vehicle Fly controller
         CamTP    = false, -- press T while driving: teleport to the camera (freecam)
     },
+    Camera = {
+        Free  = false,
+        Speed = 120,  -- freecam fly speed (studs/s)
+    },
     Misc = {
         Fullbright          = false,
         FullbrightIntensity = 190,
@@ -224,6 +235,7 @@ Config.World.TreeMaxDist = math.clamp(tonumber(Config.World.TreeMaxDist) or 400,
 Config.World.ItemMaxDist = math.clamp(tonumber(Config.World.ItemMaxDist) or 250, 50, 1500)
 Config.World.EnemyMaxDist = math.clamp(tonumber(Config.World.EnemyMaxDist) or 500, 50, 2000)
 Config.Players.MaxDist = math.clamp(tonumber(Config.Players.MaxDist) or 1000, 100, 3000)
+Config.Camera.Speed = math.clamp(tonumber(Config.Camera.Speed) or 120, 25, 500)
 -- REMOVED features (oak-v2): Auto Chop (crashed the client; swings go
 -- through a server-validated, self-reporting channel) and the experimental
 -- movement block (Infinite Jump / Walk Speed / Jump Power / Sprint Boost -
@@ -1340,6 +1352,107 @@ track(RunService.RenderStepped:Connect(function(dt)
     pcall(vehicleFlyStep, dt)
 end))
 
+-- ============================================================
+-- FREECAM (oak-v22) - built in, because the Cam Teleport tool needs
+-- one. RightCtrl toggles; WASD flies, mouse looks, Space/LeftCtrl
+-- up-down, LeftShift is a 3x boost. Movement keys are swallowed while
+-- it's on so the character stays put; the camera goes back the moment
+-- you toggle off.
+-- ============================================================
+local FREE_BIND = "HAVOC_OAKLANDS_FREECAM"
+local FREE = { on = false, yaw = 0, pitch = 0, pos = Vector3.zero, prevType = nil, prevMouse = nil }
+
+local function freecamStep(dt)
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    if cam.CameraType ~= Enum.CameraType.Scriptable then
+        cam.CameraType = Enum.CameraType.Scriptable
+    end
+    if UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+        UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+    end
+    local fwd    = (UserInputService:IsKeyDown(Enum.KeyCode.W) and 1 or 0) - (UserInputService:IsKeyDown(Enum.KeyCode.S) and 1 or 0)
+    local strafe = (UserInputService:IsKeyDown(Enum.KeyCode.D) and 1 or 0) - (UserInputService:IsKeyDown(Enum.KeyCode.A) and 1 or 0)
+    local lift   = (UserInputService:IsKeyDown(Enum.KeyCode.Space) and 1 or 0) - (UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) and 1 or 0)
+    local rot = CFrame.fromEulerAnglesYXZ(FREE.pitch, FREE.yaw, 0)
+    local move = Vector3.new(strafe, lift, -fwd)
+    if move.Magnitude > 0 then
+        local speed = Config.Camera.Speed
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then speed = speed * 3 end
+        FREE.pos = FREE.pos + rot:VectorToWorldSpace(move.Unit) * speed * dt
+    end
+    cam.CFrame = CFrame.new(FREE.pos) * rot
+end
+
+local function freecamOn()
+    if FREE.on then return end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    FREE.on = true
+    genv.__HAVOC_OAKLANDS_FREECAM = true
+    FREE.pos = cam.CFrame.Position
+    local rx, ry = cam.CFrame:ToEulerAnglesYXZ()
+    FREE.pitch, FREE.yaw = rx, ry
+    FREE.prevType = cam.CameraType
+    FREE.prevMouse = UserInputService.MouseBehavior
+    cam.CameraType = Enum.CameraType.Scriptable
+    UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+    RunService:BindToRenderStep(FREE_BIND, Enum.RenderPriority.Camera.Value + 10, freecamStep)
+    print("[oaklands] freecam on - WASD fly, Space/Ctrl up-down, Shift boost, RightCtrl off")
+end
+
+local function freecamOff()
+    if not FREE.on then return end
+    FREE.on = false
+    genv.__HAVOC_OAKLANDS_FREECAM = nil
+    pcall(function() RunService:UnbindFromRenderStep(FREE_BIND) end)
+    local cam = Workspace.CurrentCamera
+    if cam and cam.CameraType == Enum.CameraType.Scriptable then
+        cam.CameraType = FREE.prevType or Enum.CameraType.Custom
+        if cam.CameraType == Enum.CameraType.Scriptable then
+            cam.CameraType = Enum.CameraType.Custom
+        end
+    end
+    UserInputService.MouseBehavior = FREE.prevMouse or Enum.MouseBehavior.Default
+    print("[oaklands] freecam off")
+end
+
+local function freecamToggle()
+    if FREE.on then freecamOff() else freecamOn() end
+end
+
+track(UserInputService.InputChanged:Connect(function(input)
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    if not FREE.on then return end
+    pcall(function()
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        FREE.yaw = FREE.yaw - input.Delta.X * 0.0025
+        FREE.pitch = math.clamp(FREE.pitch - input.Delta.Y * 0.0025, -1.5, 1.5)
+    end)
+end))
+
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    pcall(function()
+        if gameProcessed then return end
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        if input.KeyCode ~= Enum.KeyCode.RightControl then return end
+        freecamToggle()
+    end)
+end))
+
+-- swallow movement keys while the freecam is on so the character stays put
+pcall(function()
+    local ContextActionService = game:GetService("ContextActionService")
+    ContextActionService:BindActionAtPriority("HAVOC_OAKLANDS_FCSINK", function(_, state)
+        if state == Enum.UserInputState.Cancel then return Enum.ContextActionResult.Pass end
+        if FREE.on then return Enum.ContextActionResult.Sink end
+        return Enum.ContextActionResult.Pass
+    end, false, 3000,
+        Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+        Enum.KeyCode.Space, Enum.KeyCode.LeftShift)
+end)
+
 -- (Ghost Vehicle removed in oak-v21 - char noclip got detected; Cam Teleport replaces it)
 
 -- Cam Teleport: press T while driving to pull the vehicle (and you,
@@ -1347,6 +1460,27 @@ end))
 -- probed clear first and the camera must be >20 studs away, so the
 -- normal chase cam can never trigger it. Same client-side teleport
 -- mechanism as the store warps (never left inside a part).
+-- the vehicle rig: Framework (body) + Rig (suspension cores) +
+-- Wheels. The wheels hang on free constraints (springs + cylinders),
+-- which makes them SEPARATE physics assemblies from the seat's own -
+-- moving just the seat's assembly left them behind and the suspension
+-- dragged the car back ("teleports half way"). Move every part of the
+-- rig now, one CFrame write per assembly, so the whole car arrives.
+local function vehicleModelOf(seat)
+    local node = seat
+    while node do
+        local p = node.Parent
+        if not p then break end
+        if p:IsA("Model") and p:FindFirstChild("Rig")
+            and (p:FindFirstChild("Wheels") or p:FindFirstChild("Framework")) then
+            return p
+        end
+        if p == Workspace then break end
+        node = p
+    end
+    return nil
+end
+
 local function cameraTeleport()
     if not Config.Vehicle.CamTP then return end
     local ch = LocalPlayer.Character
@@ -1376,12 +1510,36 @@ local function cameraTeleport()
         print("[oaklands] cam tp: landing spot is blocked - aim the freecam at open space")
         return
     end
-    local ok = pcall(function()
-        root.CFrame = CFrame.new(camPos) * (root.CFrame - root.CFrame.Position)
-    end)
-    if ok then
-        print(("[oaklands] cam tp: moved %d studs to the camera"):format(math.floor(dist)))
+    local delta = CFrame.new(camPos - root.Position)
+    local parts = {}
+    local model = vehicleModelOf(seat)
+    if model then
+        for _, p in ipairs(model:GetDescendants()) do
+            if p:IsA("BasePart") then
+                parts[#parts + 1] = p
+            end
+        end
     end
+    if ch then
+        local hrp = ch:FindFirstChild("HumanoidRootPart")
+        if hrp then parts[#parts + 1] = hrp end
+    end
+    if #parts == 0 then parts[1] = root end
+    local moved = {}
+    local count = 0
+    for _, p in ipairs(parts) do
+        local a = p.AssemblyRootPart
+        if a and not moved[a] then
+            moved[a] = true
+            pcall(function()
+                p.CFrame = delta * p.CFrame
+                p.AssemblyLinearVelocity = Vector3.zero
+                p.AssemblyAngularVelocity = Vector3.zero
+            end)
+            count = count + 1
+        end
+    end
+    print(("[oaklands] cam tp: moved %d studs to the camera (vehicle: %d parts, %d assemblies)"):format(math.floor(dist), #parts, count))
 end
 
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
@@ -1403,6 +1561,18 @@ end))
 pcall(function()
     if not Config.Vehicle.Enabled then restoreVehicleSpeed() end
 end)
+-- leftover freecam from an old build: give the camera back
+if genv.__HAVOC_OAKLANDS_FREECAM then
+    genv.__HAVOC_OAKLANDS_FREECAM = nil
+    pcall(function() RunService:UnbindFromRenderStep(FREE_BIND) end)
+    pcall(function()
+        local cam = Workspace.CurrentCamera
+        if cam and cam.CameraType == Enum.CameraType.Scriptable then
+            cam.CameraType = Enum.CameraType.Custom
+        end
+    end)
+    pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+end
 -- leftover ghost state from old builds (feature removed): restore collisions
 pcall(function()
     if type(VEH_STATE.ghost) == "table" then
@@ -1778,6 +1948,18 @@ local function buildMenu()
             Config.Vehicle.CamTP = v
             notify(v and "Cam teleport on - press T to pull the vehicle to your camera" or "Cam teleport off")
         end)
+    section(pmv, "Camera")
+    toggle(pmv, "Freecam",
+        function() return Config.Camera.Free end,
+        function(v)
+            Config.Camera.Free = v
+            if v then freecamOn() else freecamOff() end
+            notify(v and "Freecam on" or "Freecam off")
+        end)
+    slider(pmv, "Cam Speed",
+        function() return Config.Camera.Speed end,
+        function(v) Config.Camera.Speed = v end, 5, 25, 500,
+        function(v) return ("%d studs/s"):format(v) end)
     -- ---------------- Misc ----------------
     section(pmi, "Lighting")
     toggle(pmi, "Fullbright",
