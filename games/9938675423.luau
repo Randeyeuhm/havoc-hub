@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v14
+    HAVOC HUB - OAKLANDS                           oak-v15
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -99,7 +99,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v14"
+local SCRIPT_VERSION = "oak-v15"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1071,9 +1071,12 @@ local function findSettingsModule()
         for _, v in ipairs(heap) do
             if type(v) == "table" then
                 local cs = rawget(v, "CurrentSettings")
-                if type(cs) == "table" and type(rawget(cs, "DragNoCollide")) == "table" then
-                    found = v
-                    break
+                if type(cs) == "table" and next(cs) ~= nil then
+                    local mt = getmetatable(v)
+                    if type(mt) == "table" and type(rawget(mt, "GetSetting")) == "function" then
+                        found = v
+                        break
+                    end
                 end
             end
         end
@@ -1081,32 +1084,56 @@ local function findSettingsModule()
     return found
 end
 
+-- route the _G flag into the game scripts' OWN _G (via a game function's
+-- environment) - writing our executor _G may never reach them
+local function gameEnvOf(module)
+    local mt = module and getmetatable(module)
+    local fn = type(mt) == "table" and rawget(mt, "GetSetting") or nil
+    if type(fn) ~= "function" and type(mt) == "table" then
+        fn = rawget(mt, "SetSetting")
+    end
+    if type(fn) ~= "function" then return nil end
+    local ok, env = pcall(getfenv, fn)
+    if ok and type(env) == "table" then return env end
+    return nil
+end
+
 local function noCollideRestore()
     local s = NC_STATE.settings
-    if s and NC_STATE.orig ~= nil then
+    if s then
         local cs = rawget(s, "CurrentSettings")
-        local item = type(cs) == "table" and rawget(cs, "DragNoCollide") or nil
-        if type(item) == "table" then
-            pcall(function() item.Value = NC_STATE.orig end)
+        if type(cs) == "table" then
+            if NC_STATE.created then
+                pcall(function() cs.DragNoCollide = nil end)
+            else
+                local item = rawget(cs, "DragNoCollide")
+                if type(item) == "table" and NC_STATE.orig ~= nil then
+                    pcall(function() item.Value = NC_STATE.orig end)
+                end
+            end
         end
     end
     NC_STATE.patched = nil
+    NC_STATE.created = nil
+    NC_STATE.patchPrint = nil
+    pcall(function()
+        if NC_STATE.env and type(NC_STATE.env._G) == "table" then
+            NC_STATE.env._G.DragPassthrough = NC_STATE.origGP
+        end
+    end)
     pcall(function() _G.DragPassthrough = NC_STATE.origGP end)
+    pcall(function() shared.DragPassthrough = NC_STATE.origGP end)
 end
 
 local function noCollideStep()
     if not Config.Drag.NoCollide then
-        if NC_STATE.patched or NC_STATE.origGP ~= nil then
+        if NC_STATE.patched or NC_STATE.flagSet then
             noCollideRestore()
-            NC_STATE.origGP = nil
+            NC_STATE.flagSet = nil
+            NC_STATE.origGPSaved = nil
         end
         return
     end
-    if NC_STATE.origGP == nil then
-        local ok, v = pcall(function() return _G.DragPassthrough end)
-        NC_STATE.origGP = (ok and v) or false
-    end
-    pcall(function() _G.DragPassthrough = true end)
     local now = os.clock()
     if not NC_STATE.settings and now - (NC_STATE.lastScan or 0) > 5 then
         NC_STATE.lastScan = now
@@ -1115,16 +1142,61 @@ local function noCollideStep()
             print("[oaklands] drag no-collide: settings found")
         end
     end
+    if not NC_STATE.origGPSaved then
+        NC_STATE.origGPSaved = true
+        local env = gameEnvOf(NC_STATE.settings)
+        NC_STATE.env = env
+        local orig = nil
+        if env and type(env._G) == "table" then
+            orig = env._G.DragPassthrough
+        end
+        if orig == nil then
+            local ok, v = pcall(function() return _G.DragPassthrough end)
+            orig = (ok and v) or nil
+        end
+        NC_STATE.origGP = orig
+    end
+    NC_STATE.flagSet = true
+    -- write the flag everywhere that matters
+    if not NC_STATE.env then
+        NC_STATE.env = gameEnvOf(NC_STATE.settings)
+        if NC_STATE.env and type(NC_STATE.env._G) ~= "table" then
+            local g = {}
+            pcall(function() NC_STATE.env._G = g end)
+        end
+    end
+    if NC_STATE.env and type(NC_STATE.env._G) == "table" then
+        pcall(function() NC_STATE.env._G.DragPassthrough = true end)
+    end
+    pcall(function() _G.DragPassthrough = true end)
+    pcall(function() shared.DragPassthrough = true end)
+    if not NC_STATE.routePrint then
+        NC_STATE.routePrint = true
+        if NC_STATE.env and type(NC_STATE.env._G) == "table" then
+            print("[oaklands] no-collide: flag routed through the game environment")
+        else
+            print("[oaklands] no-collide: game environment not found - own _G only (will retry)")
+        end
+    end
     local s = NC_STATE.settings
     if s then
         local cs = rawget(s, "CurrentSettings")
-        local item = type(cs) == "table" and rawget(cs, "DragNoCollide") or nil
-        if type(item) == "table" then
-            if NC_STATE.orig == nil then
+        if type(cs) == "table" then
+            local item = rawget(cs, "DragNoCollide")
+            if type(item) ~= "table" then
+                item = {}
+                cs.DragNoCollide = item
+                NC_STATE.created = true
+            end
+            if NC_STATE.orig == nil and not NC_STATE.created then
                 NC_STATE.orig = tonumber(item.Value)
             end
             if item.Value ~= 1 then
                 pcall(function() item.Value = 1 end)
+                if not NC_STATE.patchPrint then
+                    NC_STATE.patchPrint = true
+                    print(("[oaklands] no-collide: DragNoCollide %s -> 1"):format(tostring(NC_STATE.orig)))
+                end
             end
             NC_STATE.patched = true
         end
@@ -1254,28 +1326,52 @@ track(RunService.RenderStepped:Connect(function(dt)
     pcall(vehicleFlyStep, dt)
 end))
 
-local function ghostSet(seat, on)
-    if on then
-        local model = seat:FindFirstAncestorWhichIsA("Model")
-        if not model then return end
-        local saved = {}
-        for _, p in ipairs(model:GetDescendants()) do
-            if p:IsA("BasePart") and p.CanCollide then
-                saved[p] = true
-                pcall(function() p.CanCollide = false end)
-            end
+local function ghostTopModel(seat)
+    local model = nil
+    local cur = seat
+    while cur and cur ~= Workspace do
+        if cur:IsA("Model") then
+            model = cur
         end
+        cur = cur.Parent
+    end
+    return model
+end
+
+local function ghostApply(seat)
+    local model = ghostTopModel(seat)
+    if not model then return 0 end
+    local saved = VEH_STATE.ghost[seat]
+    if saved == nil then
+        saved = {}
         VEH_STATE.ghost[seat] = saved
-    else
-        local saved = VEH_STATE.ghost[seat]
-        if saved then
-            for p in pairs(saved) do
-                if p.Parent then
-                    pcall(function() p.CanCollide = true end)
-                end
+    end
+    local n = 0
+    for _, p in ipairs(model:GetDescendants()) do
+        if p:IsA("BasePart") then
+            if saved[p] == nil and p.CanCollide then
+                saved[p] = true
             end
-            VEH_STATE.ghost[seat] = nil
+            if saved[p] == true then
+                if p.CanCollide then
+                    pcall(function() p.CanCollide = false end)
+                end
+                n = n + 1
+            end
         end
+    end
+    return n
+end
+
+local function ghostRestore(seat)
+    local saved = VEH_STATE.ghost[seat]
+    if saved then
+        for p in pairs(saved) do
+            if p.Parent then
+                pcall(function() p.CanCollide = true end)
+            end
+        end
+        VEH_STATE.ghost[seat] = nil
     end
 end
 
@@ -1289,14 +1385,18 @@ local function ghostStep()
     local gs = VEH_STATE.ghostSeat
     if Config.Vehicle.Ghost and seat then
         if gs ~= seat then
-            if gs then pcall(ghostSet, gs, false) end
+            if gs then pcall(ghostRestore, gs) end
             VEH_STATE.ghostSeat = seat
-            pcall(ghostSet, seat, true)
-            print("[oaklands] ghost vehicle on")
+            local n = 0
+            pcall(function() n = ghostApply(seat) end)
+            print(("[oaklands] ghost vehicle: %d parts non-colliding"):format(n))
+        else
+            pcall(ghostApply, seat)
         end
     elseif gs then
-        pcall(ghostSet, gs, false)
+        pcall(ghostRestore, gs)
         VEH_STATE.ghostSeat = nil
+        print("[oaklands] ghost vehicle off")
     end
 end
 
