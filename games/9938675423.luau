@@ -37,10 +37,12 @@
         compensated). Roll/pitch is locked so the car cannot capsize -
         pull a flip and it rights itself. Direct velocity + angular
         writes on your own vehicle - cars work best. Off by default.
-      • Freecam        - built in (oak-v22): RightCtrl toggles, WASD
-        flies, mouse looks, Space/LeftCtrl up-down, Shift is a 3x
-        boost. Movement keys are swallowed while it's on so the
-        character stays put.
+      • Freecam        - built in: toggles on a rebindable key
+        (default RightCtrl - Camera section row; the toggle shows the
+        live key chip), WASD flies, mouse looks, Space/LeftCtrl
+        up-down, Shift is a 3x boost. Movement keys are swallowed
+        while it's on so the character stays put; vehicle fly just
+        hovers instead of fighting the camera.
       • Cam Teleport   - optional: sit in a vehicle, fly the freecam
         to a spot, press T - the WHOLE vehicle (wheels included) and
         you teleport straight there. The wheels hang off the body on
@@ -111,7 +113,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v22"
+local SCRIPT_VERSION = "oak-v23"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -195,6 +197,14 @@ local DEFAULTS = {
         Free  = false,
         Speed = 120,  -- freecam fly speed (studs/s)
     },
+    Hotkeys = {
+        Freecam = "RightControl",
+        CamTP   = "T",
+    },
+    HotkeyOn = {
+        Freecam = true,
+        CamTP   = true,
+    },
     Misc = {
         Fullbright          = false,
         FullbrightIntensity = 190,
@@ -262,6 +272,17 @@ local function saveConfig()
             makefolder("havoc_hub")
         end
         writefile(CONFIG_FILE, HttpService:JSONEncode(Config))
+    end)
+end
+
+local savePending = false
+local function saveConfigDebounced()
+    if savePending then return end
+    savePending = true
+    task.delay(0.6, function()
+        savePending = false
+        if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+        saveConfig()
     end)
 end
 
@@ -344,6 +365,69 @@ if screenGui and UILib and UILib.makeToaster then
     notify = UILib.makeToaster(screenGui)
 else
     notify = function(text) print("[Havoc Hub]", tostring(text)) end
+end
+
+-- ============================================================
+-- HOTKEYS + UI WIRING (oak-v23)
+-- The library needs UILib.attachInput() for slider drags, window
+-- dragging/resize and click-away - this script never called it, which
+-- is why sliders only reacted to clicks and the resize grip did
+-- nothing. Keybinds are now rebindable in the menu (rows in the
+-- Vehicles / Camera sections); the chips on the toggles show the
+-- live key, and every key listener checks handleRebindInput first so
+-- a capture never fires an action.
+-- ============================================================
+local HOTKEYS = {
+    { Id = "Freecam", Desc = "Freecam toggle", Key = Enum.KeyCode.RightControl, Enabled = true },
+    { Id = "CamTP",   Desc = "Cam Teleport",   Key = Enum.KeyCode.T,            Enabled = true },
+}
+local HOTKEY_BY_ID = {}
+for _, entry in ipairs(HOTKEYS) do
+    HOTKEY_BY_ID[entry.Id] = entry
+end
+do
+    local keys = (type(Config.Hotkeys) == "table") and Config.Hotkeys or {}
+    local ons  = (type(Config.HotkeyOn) == "table") and Config.HotkeyOn or {}
+    for _, entry in ipairs(HOTKEYS) do
+        local name = keys[entry.Id]
+        if type(name) == "string" then
+            local okK, kc = pcall(function() return Enum.KeyCode[name] end)
+            if okK and kc then entry.Key = kc end
+        end
+        if ons[entry.Id] ~= nil then
+            entry.Enabled = ons[entry.Id] and true or false
+        end
+    end
+end
+local function saveHotkeys()
+    Config.Hotkeys = {}
+    Config.HotkeyOn = {}
+    for _, entry in ipairs(HOTKEYS) do
+        Config.Hotkeys[entry.Id] = entry.Key.Name
+        Config.HotkeyOn[entry.Id] = entry.Enabled ~= false
+    end
+    saveConfig()
+end
+local hkChipSync = {}  -- toggle handles whose chip must follow a rebind
+
+if UILib and type(UILib.init) == "function" then
+    UILib.init{
+        notify        = notify,
+        save          = saveConfig,
+        saveDebounced = saveConfigDebounced,
+        onKeybindToggled = function(_entry)
+            saveHotkeys()
+            for _, h in ipairs(hkChipSync) do pcall(h.update) end
+        end,
+        onKeybindChanged = function(entry)
+            saveHotkeys()
+            for _, h in ipairs(hkChipSync) do pcall(h.update) end
+            print(("[oaklands] rebound %s to %s"):format(entry.Desc, entry.Key.Name))
+        end,
+    }
+end
+if UILib and type(UILib.attachInput) == "function" then
+    track(UILib.attachInput())
 end
 
 -- ============================================================
@@ -1313,16 +1397,20 @@ local function vehicleFlyStep(dt)
     local look = (cam and cam.CFrame.LookVector) or seat.CFrame.LookVector
     local right = (cam and cam.CFrame.RightVector) or seat.CFrame.RightVector
     local throttle, strafe, lift = 0, 0, 0
-    pcall(function()
-        if UserInputService:IsKeyDown(Enum.KeyCode.W) then throttle = throttle + 1 end
-        if UserInputService:IsKeyDown(Enum.KeyCode.S) then throttle = throttle - 1 end
-        if UserInputService:IsKeyDown(Enum.KeyCode.D) then strafe = strafe + 1 end
-        if UserInputService:IsKeyDown(Enum.KeyCode.A) then strafe = strafe - 1 end
-        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then lift = lift + 1 end
-        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then lift = lift + 1 end
-        if UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then lift = lift + 1 end
-        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then lift = lift - 1 end
-    end)
+    -- freecam owns the keyboard while it is up: the car hovers in place
+    -- (gravity compensation + level lock keep running below)
+    if genv.__HAVOC_OAKLANDS_FREECAM ~= true then
+        pcall(function()
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then throttle = throttle + 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then throttle = throttle - 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then strafe = strafe + 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then strafe = strafe - 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then lift = lift + 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then lift = lift + 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then lift = lift + 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then lift = lift - 1 end
+        end)
+    end
     local target = look * (throttle * speed) + right * (strafe * speed) + Vector3.new(0, Workspace.Gravity * (dt or 0), 0)
     if lift > 0 then
         target = target + Vector3.new(0, speed, 0)
@@ -1434,9 +1522,12 @@ end))
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
     pcall(function()
+        if UILib and UILib.handleRebindInput and UILib.handleRebindInput(input) then return end
         if gameProcessed then return end
         if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-        if input.KeyCode ~= Enum.KeyCode.RightControl then return end
+        local hk = HOTKEY_BY_ID.Freecam
+        if hk.Enabled == false then return end
+        if input.KeyCode ~= hk.Key then return end
         freecamToggle()
     end)
 end))
@@ -1460,25 +1551,58 @@ end)
 -- probed clear first and the camera must be >20 studs away, so the
 -- normal chase cam can never trigger it. Same client-side teleport
 -- mechanism as the store warps (never left inside a part).
--- the vehicle rig: Framework (body) + Rig (suspension cores) +
--- Wheels. The wheels hang on free constraints (springs + cylinders),
--- which makes them SEPARATE physics assemblies from the seat's own -
--- moving just the seat's assembly left them behind and the suspension
--- dragged the car back ("teleports half way"). Move every part of the
--- rig now, one CFrame write per assembly, so the whole car arrives.
-local function vehicleModelOf(seat)
-    local node = seat
-    while node do
-        local p = node.Parent
-        if not p then break end
-        if p:IsA("Model") and p:FindFirstChild("Rig")
-            and (p:FindFirstChild("Wheels") or p:FindFirstChild("Framework")) then
-            return p
+-- The wheels hang on free constraints (springs + cylinders), which makes
+-- them SEPARATE physics assemblies from the seat's own - moving just the
+-- seat's assembly left them behind and the suspension dragged the car
+-- back ("teleports half way"). Instead of trusting model names, walk
+-- the JOINT GRAPH out from the seat (oak-v23): welds, weld-constraints
+-- and constraint attachments lead to every part of the rig - body,
+-- wheels, cargo, the character - whatever the live game calls them.
+local function jointNeighbors(part)
+    local out, added = {}, {}
+    local function push(p)
+        if p and p:IsA("BasePart") and not added[p] then
+            added[p] = true
+            out[#out + 1] = p
         end
-        if p == Workspace then break end
-        node = p
     end
-    return nil
+    local joints = {}
+    local okj, list = pcall(function() return part:GetJoints() end)
+    if okj and list then
+        for _, j in ipairs(list) do joints[#joints + 1] = j end
+    end
+    for _, ch in ipairs(part:GetChildren()) do
+        if ch:IsA("JointInstance") or ch:IsA("Constraint") then
+            joints[#joints + 1] = ch
+        end
+    end
+    for _, j in ipairs(joints) do
+        pcall(function()
+            push(j.Part0)
+            push(j.Part1)
+            local a0, a1 = j.Attachment0, j.Attachment1
+            if a0 and a0.Parent then push(a0.Parent) end
+            if a1 and a1.Parent then push(a1.Parent) end
+        end)
+    end
+    return out
+end
+
+local function collectVehicleParts(seat)
+    local list, seen = {}, { [seat] = true }
+    local queue, i = { seat }, 1
+    while i <= #queue and #list < 500 do
+        local p = queue[i]
+        i = i + 1
+        list[#list + 1] = p
+        for _, n in ipairs(jointNeighbors(p)) do
+            if not seen[n] then
+                seen[n] = true
+                queue[#queue + 1] = n
+            end
+        end
+    end
+    return list
 end
 
 local function cameraTeleport()
@@ -1511,43 +1635,38 @@ local function cameraTeleport()
         return
     end
     local delta = CFrame.new(camPos - root.Position)
-    local parts = {}
-    local model = vehicleModelOf(seat)
-    if model then
-        for _, p in ipairs(model:GetDescendants()) do
-            if p:IsA("BasePart") then
-                parts[#parts + 1] = p
-            end
-        end
-    end
+    local parts = collectVehicleParts(seat)
     if ch then
         local hrp = ch:FindFirstChild("HumanoidRootPart")
         if hrp then parts[#parts + 1] = hrp end
     end
     if #parts == 0 then parts[1] = root end
     local moved = {}
-    local count = 0
+    local count, fails = 0, 0
     for _, p in ipairs(parts) do
         local a = p.AssemblyRootPart
         if a and not moved[a] then
             moved[a] = true
-            pcall(function()
+            local okp = pcall(function()
                 p.CFrame = delta * p.CFrame
                 p.AssemblyLinearVelocity = Vector3.zero
                 p.AssemblyAngularVelocity = Vector3.zero
             end)
-            count = count + 1
+            if okp then count = count + 1 else fails = fails + 1 end
         end
     end
-    print(("[oaklands] cam tp: moved %d studs to the camera (vehicle: %d parts, %d assemblies)"):format(math.floor(dist), #parts, count))
+    print(("[oaklands] cam tp: moved %d studs to the camera (vehicle: %d parts, %d assemblies, %d failed)"):format(math.floor(dist), #parts, count, fails))
 end
 
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
     pcall(function()
+        if UILib and UILib.handleRebindInput and UILib.handleRebindInput(input) then return end
         if gameProcessed then return end
         if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-        if input.KeyCode ~= Enum.KeyCode.T then return end
+        local hk = HOTKEY_BY_ID.CamTP
+        if hk.Enabled == false then return end
+        if input.KeyCode ~= hk.Key then return end
         cameraTeleport()
     end)
 end))
@@ -1792,8 +1911,12 @@ local function buildMenu()
     local function section(page, text)
         guard("section " .. text, function() return UILib.makeSectionHeader(page, text) end)
     end
-    local function toggle(page, text, getter, setter)
-        guard("toggle " .. text, function() return UILib.makeToggle(page, text, getter, setter) end)
+    local function toggle(page, text, getter, setter, hkEntry)
+        guard("toggle " .. text, function()
+            local h = UILib.makeToggle(page, text, getter, setter, hkEntry)
+            if hkEntry and h then hkChipSync[#hkChipSync + 1] = h end
+            return h
+        end)
     end
     local function slider(page, text, getter, setter, step, min, max, fmt)
         guard("slider " .. text, function() return UILib.makeSlider(page, text, getter, setter, step, min, max, fmt) end)
@@ -1811,6 +1934,12 @@ local function buildMenu()
     local function multiselect(page, text, items, isOn, setOn)
         guard("multiselect " .. text, function()
             return UILib.makeMultiSelect(page, text, items, isOn, setOn, { overlayParent = win.popupLayer })
+        end)
+    end
+    local function keybindRow(page, entry)
+        if type(UILib.makeKeybindRow) ~= "function" then return end
+        guard("keybind row " .. entry.Desc, function()
+            return UILib.makeKeybindRow(page, entry)
         end)
     end
 
@@ -1946,8 +2075,9 @@ local function buildMenu()
         function() return Config.Vehicle.CamTP end,
         function(v)
             Config.Vehicle.CamTP = v
-            notify(v and "Cam teleport on - press T to pull the vehicle to your camera" or "Cam teleport off")
-        end)
+            notify(v and ("Cam teleport on - press " .. HOTKEY_BY_ID.CamTP.Key.Name .. " to pull the vehicle to your camera") or "Cam teleport off")
+        end, HOTKEY_BY_ID.CamTP)
+    keybindRow(pmv, HOTKEY_BY_ID.CamTP)
     section(pmv, "Camera")
     toggle(pmv, "Freecam",
         function() return Config.Camera.Free end,
@@ -1955,7 +2085,8 @@ local function buildMenu()
             Config.Camera.Free = v
             if v then freecamOn() else freecamOff() end
             notify(v and "Freecam on" or "Freecam off")
-        end)
+        end, HOTKEY_BY_ID.Freecam)
+    keybindRow(pmv, HOTKEY_BY_ID.Freecam)
     slider(pmv, "Cam Speed",
         function() return Config.Camera.Speed end,
         function(v) Config.Camera.Speed = v end, 5, 25, 500,
