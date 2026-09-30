@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v16
+    HAVOC HUB - OAKLANDS                           oak-v17
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -37,10 +37,15 @@
         compensated). Roll/pitch is locked so the car cannot capsize -
         pull a flip and it rights itself. Direct velocity + angular
         writes on your own vehicle - cars work best. Off by default.
-      • Ghost Vehicle  - optional: while seated, the vehicle, YOUR
-        character and the loose cargo in/on the truck all go
-        non-colliding locally - drive through fences, trees and hills
-        even with a full load. Off by default.
+      • Ghost Vehicle  - optional: while seated, the vehicle + the loose
+        cargo in/on it go non-colliding locally. The CHARACTER is never
+        ghosted - being inside a solid part is exactly what the server
+        detects (noclip = ban).
+      • Wall Phase     - optional, the ban-safe way through walls: when
+        blocked (holding W, barely moving, wall right ahead) the whole
+        car+character is teleported PAST it in one atomic step with a
+        verified-clear landing spot - nobody is ever left inside solid
+        geometry. Same mechanism the game's own store teleports use.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -100,7 +105,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v16"
+local SCRIPT_VERSION = "oak-v17"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -179,6 +184,7 @@ local DEFAULTS = {
         Fly      = false,
         FlySpeed = 150,  -- studs/s for the Vehicle Fly controller
         Ghost    = false, -- your vehicle stops colliding locally (test)
+        Phase    = false, -- wall phase: atomic teleport hops past blocked walls
     },
     Misc = {
         Fullbright          = false,
@@ -426,7 +432,19 @@ local function listPos(inst)
         if inst:IsA("BasePart") then return inst.Position end
         return inst:GetPivot().Position
     end)
-    if ok then return res end
+    if ok and res then return res end
+    -- folders (stores are Folders now): use any descendant part
+    if inst:IsA("Folder") then
+        local ok2, res2 = pcall(function()
+            for _, d in ipairs(inst:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    return d.Position
+                end
+            end
+            return nil
+        end)
+        if ok2 then return res2 end
+    end
     return nil
 end
 
@@ -1359,21 +1377,16 @@ local function ghostApply(seat)
         saved = {}
         VEH_STATE.ghost[seat] = saved
     end
-    local counts = { car = 0, char = 0, cargo = 0 }
+    local counts = { car = 0, cargo = 0 }
     for _, p in ipairs(model:GetDescendants()) do
         if p:IsA("BasePart") then
             ghostNoCollide(saved, p, counts, "car")
         end
     end
-    -- our character rides welded into the seat - its parts stop the car too
-    local ch = LocalPlayer.Character
-    if ch then
-        for _, p in ipairs(ch:GetDescendants()) do
-            if p:IsA("BasePart") then
-                ghostNoCollide(saved, p, counts, "char")
-            end
-        end
-    end
+    -- NOTE: the character is NEVER made non-colliding - being inside a
+    -- solid part is what the server detects (noclip = ban). Wall Phase is
+    -- the way through walls: it teleports the whole car+character in one
+    -- atomic step so neither is ever left inside anything.
     -- cargo: loose items sitting in/on the vehicle (logs in the bed etc)
     local world = Workspace:FindFirstChild("World")
     local loose = world and world:FindFirstChild("LooseItems")
@@ -1430,7 +1443,7 @@ local function ghostStep()
             local counts = nil
             pcall(function() counts = ghostApply(seat) end)
             if counts then
-                print(("[oaklands] ghost vehicle: car=%d char=%d cargo=%d non-colliding"):format(counts.car, counts.char, counts.cargo))
+                print(("[oaklands] ghost vehicle: car=%d cargo=%d non-colliding"):format(counts.car, counts.cargo))
             else
                 print("[oaklands] ghost vehicle: no model found")
             end
@@ -1443,6 +1456,78 @@ local function ghostStep()
         print("[oaklands] ghost vehicle off")
     end
 end
+
+local PHASE_STATE = genv.__HAVOC_OAKLANDS_PHASE
+if type(PHASE_STATE) ~= "table" then
+    PHASE_STATE = {}
+    genv.__HAVOC_OAKLANDS_PHASE = PHASE_STATE
+end
+
+local function phaseStep()
+    if not Config.Vehicle.Phase then return end
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local seat = hum and hum.SeatPart
+    if not (seat and seat:IsA("VehicleSeat")) then return end
+    local root = seat.AssemblyRootPart or seat
+    local wHeld = false
+    pcall(function() wHeld = UserInputService:IsKeyDown(Enum.KeyCode.W) end)
+    if not wHeld then return end
+    local v = root.AssemblyLinearVelocity
+    if Vector3.new(v.X, 0, v.Z).Magnitude > 4 then return end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local look = cam.CFrame.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude < 0.1 then return end
+    flat = flat.Unit
+    local exclude = { ch }
+    local model = ghostTopModel(seat)
+    if model then exclude[#exclude + 1] = model end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = exclude
+    params.RespectCanCollide = true
+    local origin = root.Position + Vector3.new(0, 2, 0)
+    local hit = Workspace:Raycast(origin, flat * 16, params)
+    if not hit or hit.Distance > 12 then return end
+    -- find a CLEAR landing spot: past the front face + 10, extended until nothing overlaps
+    local oparams = OverlapParams.new()
+    oparams.FilterType = Enum.RaycastFilterType.Exclude
+    oparams.FilterDescendantsInstances = exclude
+    oparams.RespectCanCollide = true
+    local step = hit.Distance + 10
+    local clear = false
+    for _ = 1, 6 do
+        local candidate = origin + flat * step
+        local okh, hits = pcall(function()
+            return Workspace:GetPartBoundsInRadius(candidate, 2, oparams)
+        end)
+        if okh and hits and #hits == 0 then
+            clear = true
+            break
+        end
+        step = step + 24
+    end
+    if not clear then return end
+    local ok = pcall(function()
+        root.CFrame = root.CFrame + flat * step
+    end)
+    if ok then
+        local now = os.clock()
+        if now - (PHASE_STATE.lastPrint or 0) > 1.5 then
+            PHASE_STATE.lastPrint = now
+            print(("[oaklands] wall phase: snapped %d studs"):format(math.floor(step)))
+        end
+    end
+end
+
+track(task.spawn(function()
+    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
+        task.wait(0.15)
+        pcall(phaseStep)
+    end
+end))
 
 track(task.spawn(function()
     while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
@@ -1514,7 +1599,7 @@ local function getStores()
     local stores = regions and regions:FindFirstChild("Stores")
     if stores then
         for _, s in ipairs(stores:GetChildren()) do
-            if s:IsA("Model") or s:IsA("BasePart") then
+            if s:IsA("Model") or s:IsA("BasePart") or s:IsA("Folder") then
                 out[#out + 1] = s.Name
             end
         end
@@ -1774,6 +1859,12 @@ local function buildMenu()
             Config.Vehicle.Ghost = v
             pcall(ghostStep)
             notify(v and "Ghost vehicle on - nothing collides" or "Vehicle collisions restored")
+        end)
+    toggle(pmv, "Wall Phase",
+        function() return Config.Vehicle.Phase end,
+        function(v)
+            Config.Vehicle.Phase = v
+            notify(v and "Wall phase on - hold W at a wall to blink through" or "Wall phase off")
         end)
     -- ---------------- Misc ----------------
     section(pmi, "Lighting")
