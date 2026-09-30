@@ -71,11 +71,11 @@ Built from the game's decompiled source — everything gameplay-side flows throu
 - **Loose Item ESP** — everything under the game's own `Item` tag, with name + distance
 - **Enemy ESP** and **Player ESP** — name + distance labels (players resolved from the username-named characters in the workspace)
 - **~~Auto Chop~~ (removed in oak-v2)** — live testing showed it does not work and crashes the client; its swing channel (`Backpack:InformServer`) is server-validated with client self-reporting, so the script sends nothing anymore
-- **Infinite Stamina** — refills to your baseline the instant it drains, deliberately never above baseline+50 (the exact threshold of the game's own self-reporting stamina watch)
+- **~~Infinite Stamina~~ (removed in oak-v4)** — live testing got it detected and crashed the client
 - **Enhanced Drag (optional, client-side)** — the carry mechanic is the dragger, and both of its knobs are client-live: reach (`DefaultMaxDragDistance`, vanilla 12 studs — the game range-checks every grab against it) and pull strength (multiplies the live `AlignPosition.MaxForce` / `AlignOrientation.MaxTorque` under the dragged object's `DragForce` attachment). Pure client physics of a drag the server already granted, zero packets, off by default — server checks on dragging are unknown, keep it modest
 - **~~Movement (experimental)~~ (removed in oak-v2)** — infinite jump, walk speed, jump power and sprint boost were live-tested: they work, but the server bans for them eventually. Nothing writes speed/jump state anymore
 - **Fullbright, teleports** to every store and **anti-AFK**
-- All game-side calls go through plain Luau closures only (the game's anticheat self-reports `"[C]"` callers — this never trips it), and the script is re-run safe like the rest of the hub
+- No game-framework calls at all anymore (the anticheat self-reports `"[C]"` callers and module-loader misuse — nothing here does either), and the script is re-run safe like the rest of the hub
 
 ### Universal — `games/universal.luau` (any other game)
 
@@ -100,7 +100,7 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
 | `games/3351674303.luau` | Driving Empire (vehicle performance, teleports, speedometer HUD) |
 | `games/8343259840.luau` | Criminality (recoil & spread toolkit) |
 | `games/12144402492.luau` | Deadline (weapon mods, reload speed, aimbot, ESP) |
-| `games/9938675423.luau` | Oaklands (tree / item / enemy / player ESP, infinite stamina, enhanced drag, fullbright / teleports) |
+| `games/9938675423.luau` | Oaklands (tree / item / enemy / player ESP, enhanced drag, fullbright / teleports) |
 | `games/universal.luau` | Universal aimbot / ESP / utilities fallback |
 | `uilib.luau` | Shared UI toolkit — Project Delta-style window shell (dot header, drawn-X close, searchable left-rail tabs, footer), widgets, toasts, rebind capture, popup management |
 | `esp.luau` | One-file ESP library — Project Delta based engine (corner box, name/health/distance, highlights) + two-window customizer (preview + settings) used by every script |

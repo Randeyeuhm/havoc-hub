@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v3
+    HAVOC HUB - OAKLANDS                           oak-v4
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -21,21 +21,11 @@
       • Player ESP      - name+distance labels over other players' rigs
                           (characters live in Workspace, named by username).
 
-    Chop
-      • (Auto Chop REMOVED in oak-v2 - live testing showed it does not
-        work and crashes the client; its swing channel
-        (Backpack:InformServer) is server-validated with client self-
-        reporting, so this script no longer sends anything.)
-
     Movement
-      • Infinite Stamina - refills CurrentStamina back to YOUR baseline the
-                           moment it drains. The game's own client watch
-                           (HAX code 6) fires only when stamina EXCEEDS
-                           baseline+50 - this never crosses it, so it stays
-                           quiet. Sprint forever.
-      • (Experimental movement REMOVED in oak-v2 - Infinite Jump / Walk
-        Speed / Jump Power / Sprint Boost were live-tested: they work,
-        but the server bans for them eventually.)
+      • (REMOVED - Infinite Stamina in oak-v4: live testing got it
+        detected and crashed the client. Experimental speed / jump in
+        oak-v2: the server bans for movement changes. Nothing in this
+        script writes stamina, speed or jump state anymore.)
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -59,16 +49,20 @@
       • Every gameplay action flows through ByteNetMax packets the SERVER
         validates; the interesting ones (SpawnItem etc) are dev-gated.
       • The client has self-reporting anti-cheat ("HAX" remote): it reports
-        module-loader misuse from C contexts (so all game calls here go
-        through plain Luau closures), stamina over baseline+50, and breath
-        over 150. We stay out of all three.
+        module-loader misuse from C contexts, stamina over baseline+50, and
+        breath over 150. This script no longer calls the game's client
+        framework at all - nothing here can trip those.
       • No getenv tripwire in this game (checked - zero hits).
+      • Removed so far: Auto Chop (oak-v2 - crashed + valid channel),
+        experimental movement (oak-v2 - bans), Infinite Stamina (oak-v4 -
+        detected + crashed). Nothing here sends packets or writes
+        server-checked values anymore.
 
     Re-run safe: old loops die via the genv generation token, old UI and
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v3"
+local SCRIPT_VERSION = "oak-v4"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -186,6 +180,7 @@ Config.Players.MaxDist = math.clamp(tonumber(Config.Players.MaxDist) or 1000, 10
 -- matter what the saved config says.
 Config.Chop.Range = 0
 Config.Chop.AutoChop = false
+Config.Movement.InfStamina = false
 Config.Movement.InfJump = false
 Config.Movement.WalkSpeed = 16
 Config.Movement.JumpPower = 50
@@ -286,35 +281,12 @@ else
 end
 
 -- ============================================================
--- CLIENT FRAMEWORK ACCESS
--- ------------------------------------------------------------
--- require(ReplicatedFirst.Client) returns THE live client
--- singleton (module caching) - the same object ClientInitialize
--- uses. RequestModule + InformServer are called from plain Luau
--- closures ONLY (the game's loader self-reports "[C]" callers
--- to its HAX anticheat remote - a closure caller never trips it).
+-- CLIENT FRAMEWORK ACCESS  (REMOVED in oak-v4)
 -- ============================================================
-local CLIENT = nil
-local function getClient()
-    if CLIENT then return CLIENT end
-    local ok, res = pcall(function()
-        local c = ReplicatedFirst:FindFirstChild("Client")
-        if not c then return nil end
-        return require(c)
-    end)
-    if ok and type(res) == "table" then
-        CLIENT = res
-    end
-    return CLIENT
-end
-
-local function requestModule(name)
-    local client = getClient()
-    if not client then return nil end
-    local ok, res = pcall(function() return client:RequestModule(name) end)
-    if ok then return res end
-    return nil
-end
+-- The only user was Infinite Stamina (requestModule -> RequestModule),
+-- and live testing got that detected + crashed - so the script no longer
+-- requires the client singleton or calls RequestModule at all. Nothing in
+-- this file talks to the game's client framework anymore.
 
 -- ============================================================
 -- ESP CORE  (BillboardGui labels + Highlight instances)
@@ -594,24 +566,10 @@ end
 -- the header stay for reference.
 
 -- ============================================================
--- INFINITE STAMINA  (refill to baseline - never past baseline+50,
--- the game's HAX watcher only fires ABOVE that)
+-- INFINITE STAMINA  (REMOVED in oak-v4)
 -- ============================================================
-track(task.spawn(function()
-    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
-        task.wait(0.4)
-        if Config.Movement.InfStamina then
-            local stam = requestModule("Stamina")
-            if stam then
-                local cur = tonumber(stam.CurrentStamina)
-                local base = tonumber(stam.BaselineStamina)
-                if cur and base and cur < base then
-                    stam.CurrentStamina = base
-                end
-            end
-        end
-    end
-end))
+-- Live testing: it got detected and crashed the client. The script no
+-- longer touches stamina (or any other server-watched value) at all.
 
 -- ============================================================
 -- DRAGGING  (optional client-side dragger reach + pull strength)
@@ -891,7 +849,7 @@ local function buildMenu()
         subtitle = ("PlaceId %d  ·  %s"):format(game.PlaceId, SCRIPT_VERSION),
         size = UDim2.new(0, winW, 0, winH),
         position = UDim2.new(0, 30, 0, 40),
-        tabs = { "World", "Players", "Chop", "Movement", "Misc" },
+        tabs = { "World", "Players", "Movement", "Misc" },
         controls = guiControls,
         footerHint = "RightShift - show / hide this menu",
         onClose = function()
@@ -901,9 +859,8 @@ local function buildMenu()
     }
     local pw = win.tab(1)  -- World
     local pp = win.tab(2)  -- Players
-    local pc = win.tab(3)  -- Chop
-    local pmv = win.tab(4) -- Movement
-    local pmi = win.tab(5) -- Misc
+    local pmv = win.tab(3) -- Movement
+    local pmi = win.tab(4) -- Misc
 
     local function guard(what, fn)
         local ok, e = pcall(fn)
@@ -1016,20 +973,7 @@ local function buildMenu()
         function(v) Config.Players.MaxDist = v end, 50, 100, 3000,
         function(v) return ("%dm"):format(v) end)
 
-    -- ---------------- Chop ----------------
-    section(pc, "Auto Chop")
-    note(pc, "Auto Chop was removed in oak-v2: it crashed the live client and its swing channel is server-validated with client self-reporting. Tree ESP still shows you every choppable tree.")
-
     -- ---------------- Movement ----------------
-    section(pmv, "Stamina")
-    toggle(pmv, "Infinite Stamina",
-        function() return Config.Movement.InfStamina end,
-        function(v)
-            Config.Movement.InfStamina = v
-            notify(v and "Infinite stamina on - sprint forever" or "Stamina normal")
-        end)
-    note(pmv, "Refills to your baseline instantly - stays under the game's stamina watch (it only alerts ABOVE baseline+50).")
-
     section(pmv, "Dragging")
     toggle(pmv, "Enhanced Drag",
         function() return Config.Drag.Enhanced end,
@@ -1047,7 +991,7 @@ local function buildMenu()
         function(v) return v <= 1.001 and "1.00x (vanilla)" or ("%.2fx"):format(v) end)
     note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force on the object. Server checks on dragging are unknown - keep it modest.")
 
-    note(pmv, "Speed / jump features were removed in oak-v2 - live testing showed the server bans for them eventually. Infinite Stamina stays: it never crosses the game's own self-report threshold.")
+    note(pmv, "Removed: speed / jump (oak-v2 - server bans) and Infinite Stamina (oak-v4 - it got detected and crashed the client). Everything left in this tab is client-side only.")
 
     -- ---------------- Misc ----------------
     section(pmi, "Lighting")
