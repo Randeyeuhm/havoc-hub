@@ -61,9 +61,10 @@
       • Wood Lock      - automatic cargo lock: while you are seated in a
         vehicle, loose wood (logs / planks / lumber) on or in it is
         glued to the chassis by re-applying its car-relative offset
-        every frame (+ massless), so it cannot slide off, fall out or
-        tip the truck. No welds - the car's own physics is never
-        touched. Releases when you hop out or a piece is taken away.
+        (massless + non-colliding while held), so it cannot slide off,
+        fall out or tip the truck. No welds - the car's own physics is
+        never touched. Releases when you hop out or a piece is taken
+        away.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -126,7 +127,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v34"
+local SCRIPT_VERSION = "oak-v35"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -2040,8 +2041,9 @@ if type(WOODLOCK) == "table" then
         if type(WOODLOCK.items) == "table" then
             for p, st in pairs(WOODLOCK.items) do
                 pcall(function()
-                    if p.Parent and st and st.massless ~= nil then
-                        p.Massless = st.massless
+                    if p.Parent and st then
+                        if st.massless ~= nil then p.Massless = st.massless end
+                        if st.collide ~= nil then p.CanCollide = st.collide end
                     end
                 end)
             end
@@ -2057,8 +2059,9 @@ local function woodUnlockAll()
         WOODLOCK.items[p] = nil
         count = count + 1
         pcall(function()
-            if p.Parent and st and st.massless ~= nil then
-                p.Massless = st.massless
+            if p.Parent and st then
+                if st.massless ~= nil then p.Massless = st.massless end
+                if st.collide ~= nil then p.CanCollide = st.collide end
             end
         end)
     end
@@ -2098,15 +2101,27 @@ local function woodLockStep()
         if drop then
             WOODLOCK.items[p] = nil
             pcall(function()
-                if p.Parent and st and st.massless ~= nil then
-                    p.Massless = st.massless
+                if p.Parent and st then
+                    if st.massless ~= nil then p.Massless = st.massless end
+                    if st.collide ~= nil then p.CanCollide = st.collide end
                 end
             end)
         end
     end
-    -- find new wood on / in the rig (soft-locked by offset, not welded)
-    local vparts = collectVehicleParts(seat)
-    local scope = commonVehicleModel(seat, vparts, ch) or seat:FindFirstAncestorOfClass("Model")
+    -- find new wood on / in the rig (soft-locked by offset, not welded).
+    -- The rig model is cached per seat - the BFS + ancestor walk only
+    -- re-runs when the seat changes or the cached model goes away.
+    local scope = nil
+    local cached = WOODLOCK.scope
+    if cached and cached.seat == seat and cached.model and cached.model.Parent then
+        scope = cached.model
+    else
+        local vparts = collectVehicleParts(seat)
+        scope = commonVehicleModel(seat, vparts, ch) or seat:FindFirstAncestorOfClass("Model")
+        if scope then
+            WOODLOCK.scope = { seat = seat, model = scope }
+        end
+    end
     if not scope then return end
     local ok, descs = pcall(function() return scope:GetDescendants() end)
     if not ok or not descs then return end
@@ -2121,8 +2136,10 @@ local function woodLockStep()
                 WOODLOCK.items[p] = {
                     off = root.CFrame:Inverse() * p.CFrame,
                     massless = p.Massless,
+                    collide = p.CanCollide,
                 }
                 p.Massless = true
+                p.CanCollide = false   -- held cargo: no contacts = no solver spikes
             end)
             if okL then added = added + 1 end
         end
@@ -2147,7 +2164,13 @@ track(RunService.RenderStepped:Connect(function()
         local root = seat.AssemblyRootPart or seat
         for p, st in pairs(WOODLOCK.items) do
             if p.Parent then
-                p.CFrame = root.CFrame * st.off
+                local want = root.CFrame * st.off
+                -- only write when it actually drifted (parked car = zero
+                -- writes); massless + no-collide cargo makes each write
+                -- cheap and contact-free
+                if (p.Position - want.Position).Magnitude > 0.02 then
+                    p.CFrame = want
+                end
             end
         end
     end)
