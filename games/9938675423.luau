@@ -61,8 +61,10 @@
         ground (raycasted - no sky-drop, no tipping); the camera must
         be >20 studs away so the chase cam can never trigger it. A beat
         after landing the freecam drops so you SEE where it landed.
-        Console prints parts / assemblies / wheels + a settle line.
-        Same class of teleport as the store warps.
+        Console prints parts / assemblies / wheels + jump ms + a settle
+        line; settle re-asserts re-pin the car only, so cargo (glued by
+        the wood lock) no longer stutters the jump. Same class of
+        teleport as the store warps.
       • Wood Lock      - automatic cargo lock: while you are seated in a
         vehicle, loose wood (logs / planks / lumber) on or in it is
         glued to the chassis by re-applying its car-relative offset
@@ -132,7 +134,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v38"
+local SCRIPT_VERSION = "oak-v39"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1988,8 +1990,10 @@ local function cameraTeleport()
         print("[oaklands] cam tp: landing spot is blocked - aim the freecam at open space")
         return
     end
+    local t0 = os.clock()
     local parts, seenParts = collectVehicleParts(seat)
     local rigged = augmentVehicleParts(parts, seenParts, seat, ch)
+    local collectMs = math.floor((os.clock() - t0) * 1000)
     if ch then
         local hrp = ch:FindFirstChild("HumanoidRootPart")
         if hrp and not seenParts[hrp] then
@@ -2082,17 +2086,48 @@ local function cameraTeleport()
         end
         return cnt, fls
     end
+    -- settle re-assert (oak-v39): only the car + wheels get re-pinned -
+    -- cargo follows on the wood-lock glue, everything else rides its
+    -- constraints. Re-teleporting the whole parts list at 10/s was the
+    -- "teleport with wood lags for ages" stutter: every log was one
+    -- more assembly teleport per re-assert.
+    local reassertAnchors = { root }
+    for _, p in ipairs(wheelParts) do
+        reassertAnchors[#reassertAnchors + 1] = p
+    end
+    local function tpReassert()
+        local shift = landPos - root.Position
+        if shift.Magnitude < 0.5 then return 0 end
+        local moved, cnt = {}, 0
+        for _, p in ipairs(reassertAnchors) do
+            local a = p.AssemblyRootPart
+            if a and a.Parent and not moved[a] then
+                moved[a] = true
+                local okp = pcall(function()
+                    a.AssemblyLinearVelocity = Vector3.zero
+                    a.AssemblyAngularVelocity = Vector3.zero
+                    a.CFrame = CFrame.new(shift) * a.CFrame
+                end)
+                if okp then cnt = cnt + 1 end
+            end
+        end
+        return cnt
+    end
+    local t1 = os.clock()
     local count, fails = tpApply()
+    local jumpMs = math.floor((os.clock() - t1) * 1000)
     local extra = {}
     if fails > 0 then extra[#extra + 1] = ("%d failed"):format(fails) end
     if rigged > 0 then extra[#extra + 1] = ("+%d rigged"):format(rigged) end
     if #wheelParts > 0 then extra[#extra + 1] = ("%d wheels"):format(#wheelParts) end
     local suffix = #extra > 0 and (" [" .. table.concat(extra, ", ") .. "]") or ""
-    print(("[oaklands] cam tp: moved %d studs (vehicle: %d parts, %d assemblies)%s"):format(math.floor(dist), #parts, count, suffix))
+    print(("[oaklands] cam tp: moved %d studs (vehicle: %d parts, %d assemblies)%s [collect %dms, jump %dms]"):format(math.floor(dist), #parts, count, suffix, collectMs, jumpMs))
     -- pin the car where it landed for a moment in case anything (server
     -- replication, physics wake-up, streaming) tries to drag it back;
-    -- the settle line is the evidence when something persistent fights
-    TP_JOB = { root = root, landPos = landPos, apply = tpApply, wheels = wheelState, nextAt = 0, doneAt = os.clock() + 0.4, hardDoneAt = os.clock() + 1.0, applies = 1 }
+    -- the settle line is the evidence when something persistent fights.
+    -- oak-v39: re-asserts use tpReassert (car + wheels only) - cargo
+    -- rides the wood-lock glue instead of a full parts re-teleport
+    TP_JOB = { root = root, landPos = landPos, apply = tpReassert, wheels = wheelState, nextAt = 0, doneAt = os.clock() + 0.4, hardDoneAt = os.clock() + 1.0, applies = 1 }
     if FREE.on then
         pcall(freecamOff)  -- camera back on you, so you SEE where it landed
         pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
