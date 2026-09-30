@@ -42,8 +42,8 @@
         live key chip), WASD flies, mouse looks, Space/LeftCtrl
         up-down, Shift is a 3x boost. Movement keys are swallowed
         while it's on so the character stays put; vehicle fly just
-        hovers instead of fighting the camera; and dying/respawning
-        drops the freecam so the mouse never stays locked.
+        hovers instead of fighting the camera; every exit path (toggle
+        off, death, cam teleport) hands the mouse back unlocked.
       • Cam Teleport   - optional: sit in a vehicle, fly the freecam
         to a spot, press T - the WHOLE vehicle (wheels included) and
         you teleport straight there. Collection walks the joint graph,
@@ -120,7 +120,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v28"
+local SCRIPT_VERSION = "oak-v29"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1508,7 +1508,11 @@ local function freecamOff()
             cam.CameraType = Enum.CameraType.Custom
         end
     end
-    UserInputService.MouseBehavior = FREE.prevMouse or Enum.MouseBehavior.Default
+    -- always hand the mouse back UNLOCKED: restoring a stale LockCenter
+    -- (captured before freecam) used to trap the cursor - reported after
+    -- freecam + cam teleport. If the game wants a locked mouse for first
+    -- person it re-locks on its own.
+    UserInputService.MouseBehavior = Enum.MouseBehavior.Default
     print("[oaklands] freecam off")
 end
 
@@ -1931,7 +1935,10 @@ local function cameraTeleport()
     -- replication, physics wake-up, streaming) tries to drag it back;
     -- the settle line is the evidence when something persistent fights
     TP_JOB = { root = root, landPos = landPos, apply = tpApply, wheels = wheelState, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.6, applies = 1 }
-    if FREE.on then pcall(freecamOff) end  -- camera back on you, so you SEE where it landed
+    if FREE.on then
+        pcall(freecamOff)  -- camera back on you, so you SEE where it landed
+        pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+    end
 end
 
 -- settle watch: re-assert the car at the landing spot while the world
