@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v15
+    HAVOC HUB - OAKLANDS                           oak-v16
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -37,9 +37,10 @@
         compensated). Roll/pitch is locked so the car cannot capsize -
         pull a flip and it rights itself. Direct velocity + angular
         writes on your own vehicle - cars work best. Off by default.
-      • Ghost Vehicle  - optional, test-tier: while seated, your
-        vehicle's parts go non-colliding locally (client-owned assembly)
-        - drive through fences, trees, hills. Off by default.
+      • Ghost Vehicle  - optional: while seated, the vehicle, YOUR
+        character and the loose cargo in/on the truck all go
+        non-colliding locally - drive through fences, trees and hills
+        even with a full load. Off by default.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -99,7 +100,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v15"
+local SCRIPT_VERSION = "oak-v16"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1338,29 +1339,68 @@ local function ghostTopModel(seat)
     return model
 end
 
+local function ghostNoCollide(saved, part, counts, key)
+    if saved[part] == nil and part.CanCollide then
+        saved[part] = true
+    end
+    if saved[part] == true then
+        if part.CanCollide then
+            pcall(function() part.CanCollide = false end)
+        end
+        counts[key] = (counts[key] or 0) + 1
+    end
+end
+
 local function ghostApply(seat)
     local model = ghostTopModel(seat)
-    if not model then return 0 end
+    if not model then return nil end
     local saved = VEH_STATE.ghost[seat]
     if saved == nil then
         saved = {}
         VEH_STATE.ghost[seat] = saved
     end
-    local n = 0
+    local counts = { car = 0, char = 0, cargo = 0 }
     for _, p in ipairs(model:GetDescendants()) do
         if p:IsA("BasePart") then
-            if saved[p] == nil and p.CanCollide then
-                saved[p] = true
-            end
-            if saved[p] == true then
-                if p.CanCollide then
-                    pcall(function() p.CanCollide = false end)
-                end
-                n = n + 1
+            ghostNoCollide(saved, p, counts, "car")
+        end
+    end
+    -- our character rides welded into the seat - its parts stop the car too
+    local ch = LocalPlayer.Character
+    if ch then
+        for _, p in ipairs(ch:GetDescendants()) do
+            if p:IsA("BasePart") then
+                ghostNoCollide(saved, p, counts, "char")
             end
         end
     end
-    return n
+    -- cargo: loose items sitting in/on the vehicle (logs in the bed etc)
+    local world = Workspace:FindFirstChild("World")
+    local loose = world and world:FindFirstChild("LooseItems")
+    if loose then
+        local ex = model:GetExtentsSize()
+        local radius = math.max(ex.X, ex.Y, ex.Z) * 0.6 + 10
+        local okq, hits = pcall(function()
+            local params = OverlapParams.new()
+            params.FilterType = Enum.RaycastFilterType.Include
+            params.FilterDescendantsInstances = { loose }
+            params.MaxParts = 80
+            return Workspace:GetPartBoundsInRadius(model:GetPivot().Position, radius, params)
+        end)
+        if okq and hits then
+            for _, p in ipairs(hits) do
+                if p:IsA("BasePart") then
+                    ghostNoCollide(saved, p, counts, "cargo")
+                    for _, d in ipairs(p:GetDescendants()) do
+                        if d:IsA("BasePart") then
+                            ghostNoCollide(saved, d, counts, "cargo")
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return counts
 end
 
 local function ghostRestore(seat)
@@ -1387,9 +1427,13 @@ local function ghostStep()
         if gs ~= seat then
             if gs then pcall(ghostRestore, gs) end
             VEH_STATE.ghostSeat = seat
-            local n = 0
-            pcall(function() n = ghostApply(seat) end)
-            print(("[oaklands] ghost vehicle: %d parts non-colliding"):format(n))
+            local counts = nil
+            pcall(function() counts = ghostApply(seat) end)
+            if counts then
+                print(("[oaklands] ghost vehicle: car=%d char=%d cargo=%d non-colliding"):format(counts.car, counts.char, counts.cargo))
+            else
+                print("[oaklands] ghost vehicle: no model found")
+            end
         else
             pcall(ghostApply, seat)
         end
