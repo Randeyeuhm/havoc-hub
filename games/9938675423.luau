@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v20
+    HAVOC HUB - OAKLANDS                           oak-v21
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -37,17 +37,11 @@
         compensated). Roll/pitch is locked so the car cannot capsize -
         pull a flip and it rights itself. Direct velocity + angular
         writes on your own vehicle - cars work best. Off by default.
-      • Ghost Vehicle  - optional: while seated, the vehicle + the loose
-        cargo in/on it go non-colliding locally. The CHARACTER is never
-        ghosted - being inside a solid part is exactly what the server
-        detects (noclip = ban).
-      • Wall Phase     - optional, the ban-safe way through walls, works
-        in a vehicle OR on foot: W into a wall face -> teleported PAST
-        it (chains hops in one tick for thick objects, only lands on
-        verified-clear spots with ground below). The camera snaps to
-        face forward after each phase so you always see where you land.
-        Never left inside solid geometry - same mechanism the game's
-        own store teleports use.
+      • Cam Teleport   - optional: sit in a vehicle, fly your freecam to
+        a spot, press T - the vehicle (and you, welded in) teleports
+        straight there. The landing is probed clear first and the camera
+        must be >20 studs away, so the normal chase cam can never
+        trigger it. Same client-side mechanism as the store teleports.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -110,7 +104,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v20"
+local SCRIPT_VERSION = "oak-v21"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -188,8 +182,7 @@ local DEFAULTS = {
         Mult    = 3,     -- multiplier on VehicleSeat MaxSpeed + Torque
         Fly      = false,
         FlySpeed = 150,  -- studs/s for the Vehicle Fly controller
-        Ghost    = false, -- your vehicle stops colliding locally (test)
-        Phase    = false, -- wall phase: atomic teleport hops past blocked walls
+        CamTP    = false, -- press T while driving: teleport to the camera (freecam)
     },
     Misc = {
         Fullbright          = false,
@@ -1253,9 +1246,6 @@ end
 if type(VEH_STATE.saved) ~= "table" then
     VEH_STATE.saved = setmetatable({}, { __mode = "k" })
 end
-if type(VEH_STATE.ghost) ~= "table" then
-    VEH_STATE.ghost = setmetatable({}, { __mode = "k" })
-end
 
 local function restoreVehicleSpeed()
     for seat, orig in pairs(VEH_STATE.saved) do
@@ -1350,283 +1340,82 @@ track(RunService.RenderStepped:Connect(function(dt)
     pcall(vehicleFlyStep, dt)
 end))
 
-local function ghostTopModel(seat)
-    local model = nil
-    local cur = seat
-    while cur and cur ~= Workspace do
-        if cur:IsA("Model") then
-            model = cur
-        end
-        cur = cur.Parent
-    end
-    return model
-end
+-- (Ghost Vehicle removed in oak-v21 - char noclip got detected; Cam Teleport replaces it)
 
-local function ghostNoCollide(saved, part, counts, key)
-    if saved[part] == nil and part.CanCollide then
-        saved[part] = true
-    end
-    if saved[part] == true then
-        if part.CanCollide then
-            pcall(function() part.CanCollide = false end)
-        end
-        counts[key] = (counts[key] or 0) + 1
-    end
-end
-
-local function ghostApply(seat)
-    local model = ghostTopModel(seat)
-    if not model then return nil end
-    local saved = VEH_STATE.ghost[seat]
-    if saved == nil then
-        saved = {}
-        VEH_STATE.ghost[seat] = saved
-    end
-    local counts = { car = 0, cargo = 0 }
-    for _, p in ipairs(model:GetDescendants()) do
-        if p:IsA("BasePart") then
-            ghostNoCollide(saved, p, counts, "car")
-        end
-    end
-    -- NOTE: the character is NEVER made non-colliding - being inside a
-    -- solid part is what the server detects (noclip = ban). Wall Phase is
-    -- the way through walls: it teleports the whole car+character in one
-    -- atomic step so neither is ever left inside anything.
-    -- cargo: loose items sitting in/on the vehicle (logs in the bed etc)
-    local world = Workspace:FindFirstChild("World")
-    local loose = world and world:FindFirstChild("LooseItems")
-    if loose then
-        local ex = model:GetExtentsSize()
-        local radius = math.max(ex.X, ex.Y, ex.Z) * 0.6 + 10
-        local okq, hits = pcall(function()
-            local params = OverlapParams.new()
-            params.FilterType = Enum.RaycastFilterType.Include
-            params.FilterDescendantsInstances = { loose }
-            params.MaxParts = 80
-            return Workspace:GetPartBoundsInRadius(model:GetPivot().Position, radius, params)
-        end)
-        if okq and hits then
-            for _, p in ipairs(hits) do
-                if p:IsA("BasePart") then
-                    ghostNoCollide(saved, p, counts, "cargo")
-                    for _, d in ipairs(p:GetDescendants()) do
-                        if d:IsA("BasePart") then
-                            ghostNoCollide(saved, d, counts, "cargo")
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return counts
-end
-
-local function ghostRestore(seat)
-    local saved = VEH_STATE.ghost[seat]
-    if saved then
-        for p in pairs(saved) do
-            if p.Parent then
-                pcall(function() p.CanCollide = true end)
-            end
-        end
-        VEH_STATE.ghost[seat] = nil
-    end
-end
-
-local function ghostStep()
+-- Cam Teleport: press T while driving to pull the vehicle (and you,
+-- welded in) to your camera position - made for freecam. The landing is
+-- probed clear first and the camera must be >20 studs away, so the
+-- normal chase cam can never trigger it. Same client-side teleport
+-- mechanism as the store warps (never left inside a part).
+local function cameraTeleport()
+    if not Config.Vehicle.CamTP then return end
     local ch = LocalPlayer.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
     if not (seat and seat:IsA("VehicleSeat")) then
-        seat = nil
+        print("[oaklands] cam tp: sit in a vehicle first")
+        return
     end
-    local gs = VEH_STATE.ghostSeat
-    if Config.Vehicle.Ghost and seat then
-        if gs ~= seat then
-            if gs then pcall(ghostRestore, gs) end
-            VEH_STATE.ghostSeat = seat
-            local counts = nil
-            pcall(function() counts = ghostApply(seat) end)
-            if counts then
-                print(("[oaklands] ghost vehicle: car=%d cargo=%d non-colliding"):format(counts.car, counts.cargo))
-            else
-                print("[oaklands] ghost vehicle: no model found")
-            end
-        else
-            pcall(ghostApply, seat)
-        end
-    elseif gs then
-        pcall(ghostRestore, gs)
-        VEH_STATE.ghostSeat = nil
-        print("[oaklands] ghost vehicle off")
+    local root = seat.AssemblyRootPart or seat
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local camPos = cam.CFrame.Position
+    local dist = (camPos - root.Position).Magnitude
+    if dist < 20 then
+        print("[oaklands] cam tp: camera too close - fly the freecam further out first")
+        return
     end
-end
-
-local PHASE_STATE = genv.__HAVOC_OAKLANDS_PHASE
-if type(PHASE_STATE) ~= "table" then
-    PHASE_STATE = {}
-    genv.__HAVOC_OAKLANDS_PHASE = PHASE_STATE
-end
-
-local function phaseTryHop(origin, flat, exclude, hit, probeRadius, margin, extend)
     local oparams = OverlapParams.new()
     oparams.FilterType = Enum.RaycastFilterType.Exclude
-    oparams.FilterDescendantsInstances = exclude
+    oparams.FilterDescendantsInstances = { ch }
     oparams.RespectCanCollide = true
-    local fparams = RaycastParams.new()
-    fparams.FilterType = Enum.RaycastFilterType.Exclude
-    fparams.FilterDescendantsInstances = exclude
-    fparams.RespectCanCollide = true
-    local step = hit.Distance + margin
-    for _ = 1, 10 do
-        if step > 140 then return nil end
-        local candidate = origin + flat * step
-        local okh, hits = pcall(function()
-            return Workspace:GetPartBoundsInRadius(candidate, probeRadius, oparams)
-        end)
-        if okh and hits and #hits == 0 then
-            -- landing must also have ground below (no random drops into voids)
-            local okf, flo = pcall(function()
-                return Workspace:Raycast(candidate + Vector3.new(0, 4, 0), Vector3.new(0, -40, 0), fparams)
-            end)
-            if okf and flo and flo.Distance <= 30 then
-                return step
-            end
-        end
-        step = step + extend
+    local okh, hits = pcall(function()
+        return Workspace:GetPartBoundsInRadius(camPos, 3, oparams)
+    end)
+    if not okh or not hits or #hits > 0 then
+        print("[oaklands] cam tp: landing spot is blocked - aim the freecam at open space")
+        return
     end
-    return nil
-end
-
-local function phasePrint(mode, step)
-    local now = os.clock()
-    if now - (PHASE_STATE.lastPrint or 0) > 1.5 then
-        PHASE_STATE.lastPrint = now
-        print(("[oaklands] wall phase (%s): snapped %d studs"):format(mode, math.floor(step)))
+    local ok = pcall(function()
+        root.CFrame = CFrame.new(camPos) * (root.CFrame - root.CFrame.Position)
+    end)
+    if ok then
+        print(("[oaklands] cam tp: moved %d studs to the camera"):format(math.floor(dist)))
     end
 end
 
-local function phaseCar()
-    local ch = LocalPlayer.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local seat = hum and hum.SeatPart
-    if not (seat and seat:IsA("VehicleSeat")) then return end
-    local wHeld = false
-    pcall(function() wHeld = UserInputService:IsKeyDown(Enum.KeyCode.W) end)
-    if not wHeld then return end
-    local root = seat.AssemblyRootPart or seat
-    local v = root.AssemblyLinearVelocity
-    if Vector3.new(v.X, 0, v.Z).Magnitude > 6 then return end
-    local cam = Workspace.CurrentCamera
-    if not cam then return end
-    local look = cam.CFrame.LookVector
-    local flat = Vector3.new(look.X, 0, look.Z)
-    if flat.Magnitude < 0.1 then return end
-    flat = flat.Unit
-    local exclude = { ch }
-    local model = ghostTopModel(seat)
-    if model then exclude[#exclude + 1] = model end
-    local half = 8
-    if model then
-        local okex, ex = pcall(function() return model:GetExtentsSize() end)
-        if okex and ex then
-            half = math.max(ex.X, ex.Z) * 0.5
-        end
-    end
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = exclude
-    params.RespectCanCollide = true
-    local total = 0
-    for _ = 1, 4 do
-        local origin = root.Position + Vector3.new(0, 2, 0)
-        local reach = half + 8
-        local hit = Workspace:Raycast(origin, flat * (reach + 8), params)
-        if not hit or hit.Distance > reach or hit.Normal.Y > 0.6 or hit.Normal:Dot(flat) > -0.2 then break end
-        local step = phaseTryHop(origin, flat, exclude, hit, 3, half + 6, 10)
-        if not step then break end
-        local ok = pcall(function()
-            root.CFrame = root.CFrame + flat * step
-        end)
-        if not ok then break end
-        total = total + step
-    end
-    if total > 0 then
-        phasePrint("car", total)
-        pcall(function()
-            local p = root.Position
-            cam.CFrame = CFrame.lookAt(p - flat * (half + 12) + Vector3.new(0, 8, 0), p + Vector3.new(0, 2, 0))
-        end)
-    end
-end
-
-local function phaseFoot()
-    local ch = LocalPlayer.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    if not hum or not ch then return end
-    if hum.SeatPart then return end
-    local hrp = ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart
-    if not hrp then return end
-    local wHeld = false
-    pcall(function() wHeld = UserInputService:IsKeyDown(Enum.KeyCode.W) end)
-    if not wHeld then return end
-    local cam = Workspace.CurrentCamera
-    if not cam then return end
-    local look = cam.CFrame.LookVector
-    local flat = Vector3.new(look.X, 0, look.Z)
-    if flat.Magnitude < 0.1 then return end
-    flat = flat.Unit
-    local exclude = { ch }
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = exclude
-    params.RespectCanCollide = true
-    local total = 0
-    for _ = 1, 4 do
-        local origin = hrp.Position
-        local hit = Workspace:Raycast(origin, flat * 7, params)
-        if not hit or hit.Distance > 5.5 or hit.Normal.Y > 0.6 or hit.Normal:Dot(flat) > -0.2 then break end
-        local step = phaseTryHop(origin, flat, exclude, hit, 2.5, 3, 6)
-        if not step then break end
-        local ok = pcall(function()
-            hrp.CFrame = hrp.CFrame + flat * step
-        end)
-        if not ok then break end
-        total = total + step
-    end
-    if total > 0 then
-        phasePrint("foot", total)
-        pcall(function()
-            local p = hrp.Position
-            cam.CFrame = CFrame.lookAt(p - flat * 13 + Vector3.new(0, 6, 0), p + Vector3.new(0, 2, 0))
-        end)
-    end
-end
-
-local function phaseStep()
-    if not Config.Vehicle.Phase then return end
-    pcall(phaseCar)
-    pcall(phaseFoot)
-end
-
-track(task.spawn(function()
-    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
-        task.wait(0.05)
-        pcall(phaseStep)
-    end
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    pcall(function()
+        if gameProcessed then return end
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        if input.KeyCode ~= Enum.KeyCode.T then return end
+        cameraTeleport()
+    end)
 end))
 
 track(task.spawn(function()
     while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
         task.wait(0.5)
         pcall(vehicleStep)
-        pcall(ghostStep)
     end
 end))
 pcall(function()
     if not Config.Vehicle.Enabled then restoreVehicleSpeed() end
 end)
-pcall(ghostStep)
+-- leftover ghost state from old builds (feature removed): restore collisions
+pcall(function()
+    if type(VEH_STATE.ghost) == "table" then
+        for seat, saved in pairs(VEH_STATE.ghost) do
+            for p in pairs(saved) do
+                if p.Parent then
+                    pcall(function() p.CanCollide = true end)
+                end
+            end
+            VEH_STATE.ghost[seat] = nil
+        end
+    end
+end)
 
 -- ============================================================
 -- MOVEMENT  (experimental block REMOVED in oak-v2)
@@ -1983,18 +1772,11 @@ local function buildMenu()
         function() return Config.Vehicle.FlySpeed end,
         function(v) Config.Vehicle.FlySpeed = v end, 5, 25, 500,
         function(v) return ("%d studs/s"):format(v) end)
-    toggle(pmv, "Ghost Vehicle",
-        function() return Config.Vehicle.Ghost end,
+    toggle(pmv, "Cam Teleport",
+        function() return Config.Vehicle.CamTP end,
         function(v)
-            Config.Vehicle.Ghost = v
-            pcall(ghostStep)
-            notify(v and "Ghost vehicle on - nothing collides" or "Vehicle collisions restored")
-        end)
-    toggle(pmv, "Wall Phase",
-        function() return Config.Vehicle.Phase end,
-        function(v)
-            Config.Vehicle.Phase = v
-            notify(v and "Wall phase on - hold W at a wall to blink through" or "Wall phase off")
+            Config.Vehicle.CamTP = v
+            notify(v and "Cam teleport on - press T to pull the vehicle to your camera" or "Cam teleport off")
         end)
     -- ---------------- Misc ----------------
     section(pmi, "Lighting")
