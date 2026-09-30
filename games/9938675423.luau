@@ -70,9 +70,13 @@
         vehicle, loose wood (logs / planks / lumber) on or in it is
         glued to the chassis by re-applying its car-relative offset
         (massless + non-colliding while held), so it cannot slide off,
-        fall out or tip the truck. No welds - the car's own physics is
-        never touched. Releases when you hop out or a piece is taken
-        away.
+        fall out or tip the truck. ONLY completely free pieces are
+        locked - anything with any joint/constraint (rack rails, a
+        trailer, a piece you are carrying) is skipped: gluing a rigged
+        piece makes it fight the car every frame (that was the "car
+        wobbles + fly loses speed" bug). No welds - the car's own
+        physics is never touched. Releases when you hop out or a piece
+        is taken away.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -135,7 +139,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v44"
+local SCRIPT_VERSION = "oak-v45"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -2442,6 +2446,11 @@ end))
 -- flip the car's network ownership to the server when the game
 -- re-owned the merged assembly, which left the car acting anchored /
 -- un-drivable. This one never touches the car's own physics.
+-- oak-v45: ONLY completely free pieces get locked (no joints, no
+-- constraints, not being carried) - gluing a rigged piece made it
+-- fight the car through its own attachment every frame = the car
+-- wobbled and lost ~55% of its speed per frame while flying with a
+-- load (fly stuck at ~110 of 500 studs/s in the live diag).
 -- Releases on dismount, re-exec, or when a piece is taken away.
 -- ============================================================
 local WOODLOCK = genv.__HAVOC_OAKLANDS_WOODLOCK
@@ -2501,6 +2510,32 @@ local function isWoodName(nm)
         or string.find(nm, "lumber", 1, true) ~= nil
 end
 
+-- oak-v45: a piece is "rigged" if ANY joint or constraint touches it:
+-- welds/motors on the part, constraint attachments (hinges, springs,
+-- ball sockets - the game racks/hitches, or the dragger holding it).
+-- Locking a rigged piece glues it while its own attachment pulls on
+-- the car every frame - the car wobbles and the fly loses huge chunks
+-- of speed. Only completely free pieces are ever locked.
+local function pieceIsJointed(p)
+    local okj, joints = pcall(function() return p:GetJoints() end)
+    if okj and joints and #joints > 0 then return true end
+    for _, c in ipairs(p:GetChildren()) do
+        if c:IsA("JointInstance") or c:IsA("Constraint") or c:IsA("WeldConstraint") then
+            return true
+        end
+    end
+    local okD, descs = pcall(function() return p:GetDescendants() end)
+    if okD and descs then
+        for _, d in ipairs(descs) do
+            if d:IsA("Attachment") then
+                local okP, c = pcall(function() return d.ParentConstraint end)
+                if okP and c then return true end
+            end
+        end
+    end
+    return false
+end
+
 local function woodLockStep()
     local ch = LocalPlayer.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -2521,6 +2556,9 @@ local function woodLockStep()
                 drop = true
             end
         end
+        if not drop and pieceIsJointed(p) then
+            drop = true  -- rigged mid-hold (grabbed, strapped...): not our cargo
+        end
         if drop then
             WOODLOCK.items[p] = nil
             pcall(function()
@@ -2532,6 +2570,9 @@ local function woodLockStep()
         end
     end
     -- find new wood on / in the rig (soft-locked by offset, not welded).
+    -- oak-v45: only completely FREE pieces (no joint/constraint, not
+    -- being carried) - a rigged piece that gets glued fights the car
+    -- through its own attachment (the wobble + speed loss with a load).
     -- The rig model is cached per seat - the BFS + ancestor walk only
     -- re-runs when the seat changes or the cached model goes away.
     local scope = nil
@@ -2548,27 +2589,37 @@ local function woodLockStep()
     if not scope then return end
     local ok, descs = pcall(function() return scope:GetDescendants() end)
     if not ok or not descs then return end
-    local added = 0
+    local added, skipped = 0, 0
     for _, p in ipairs(descs) do
         if p:IsA("BasePart") and not p.Anchored
             and not (ch and p:IsDescendantOf(ch))
             and not WOODLOCK.items[p]
             and p.AssemblyRootPart ~= root
             and isWoodName(string.lower(p.Name)) then
-            local okL = pcall(function()
-                WOODLOCK.items[p] = {
-                    off = root.CFrame:Inverse() * p.CFrame,
-                    massless = p.Massless,
-                    collide = p.CanCollide,
-                }
-                p.Massless = true
-                p.CanCollide = false   -- held cargo: no contacts = no solver spikes
-            end)
-            if okL then added = added + 1 end
+            if pieceIsJointed(p) then
+                skipped = skipped + 1
+            else
+                local okL = pcall(function()
+                    WOODLOCK.items[p] = {
+                        off = root.CFrame:Inverse() * p.CFrame,
+                        massless = p.Massless,
+                        collide = p.CanCollide,
+                    }
+                    p.Massless = true
+                    p.CanCollide = false   -- held cargo: no contacts = no solver spikes
+                end)
+                if okL then added = added + 1 end
+            end
         end
     end
     if added > 0 then
         print(("[oaklands] wood lock: %d piece(s) locked to the vehicle"):format(added))
+    end
+    if skipped > 0 and WOODLOCK.lastSkipped ~= skipped then
+        WOODLOCK.lastSkipped = skipped
+        print(("[oaklands] wood lock: skipped %d attached piece(s) - only completely free cargo is locked"):format(skipped))
+    elseif skipped == 0 then
+        WOODLOCK.lastSkipped = nil
     end
 end
 
