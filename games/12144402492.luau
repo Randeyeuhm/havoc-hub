@@ -206,6 +206,14 @@
           prints only when a shot fails to tilt, and never triggers a
           walk itself). The viewmodel barrel list self-refreshes on a
           miss (cheap instance walk) so weapon switches stay seamless.
+          dl-v46: Bullet Velocity actually applies in match - the boost
+          used to paint ammo through the lobby controller cache (which
+          never matches match-mode objects), so the slider did nothing
+          in game. It now paints the ammo of the cached match weapon
+          tables (build_result.ammunition - the exact table every shot
+          reads), refreshing via the shared scan only when the cache is
+          empty (rate-limited) plus a respawn rescan, so every loadout
+          gun is covered without per-frame heap walks.
 
     Why this works (from the structure dump recon):
       * the game is roblox-ts - everything weapon-related runs CLIENT-side in
@@ -268,7 +276,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v45"
+local SCRIPT_VERSION = "dl-v46"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -748,7 +756,7 @@ end
 --   * the canary capability check rides along instead of re-scanning,
 --   * big heaps are walked in chunks (yield every 8192 entries) so a scan
 --     never blocks a single frame for long.
-local SCAN = { list = {}, weapons = {}, t = -math.huge, gcOK = nil, busy = false }
+local SCAN = { list = {}, weapons = {}, weaponCache = nil, t = -math.huge, gcOK = nil, busy = false }
 local SCAN_REUSE = 0.75
 
 local function scanControllers()
@@ -826,6 +834,23 @@ end
 -- cached read only - the telemetry report must NEVER trigger a heap walk
 local function weaponDiagCached()
     return SCAN.weaponDiag or {}
+end
+
+-- MAINTAINED MATCH WEAPON CACHE - the one source both the aim interception
+-- (barrel position match) and the Bullet Velocity feature read. Only
+-- refreshWeaponCache runs the shared heap walk; everything else is free.
+local function weaponTablesCached()
+    return SCAN.weaponCache or {}
+end
+
+local function refreshWeaponCache()
+    local list = findWeaponTables()
+    if type(list) == "table" and #list > 0 then
+        SCAN.weaponCache = list
+    elseif SCAN.weaponCache == nil then
+        SCAN.weaponCache = {}
+    end
+    return SCAN.weaponCache
 end
 
 -- Cached capability answer (the old version ran its own getgc per call).
@@ -1263,12 +1288,29 @@ local function ballisticsRestore()
     end
 end
 
+local ballScanAt = 0
 local function ballisticsStep()
     local mult = tonumber(Config.Weapons.BulletVelocity) or 1
     if mult <= 1 then
         if next(BALL_STATE.saved) ~= nil then pcall(ballisticsRestore) end
         return
     end
+    -- primary: the match weapon tables from the shared scan (the lobby
+    -- controller cache below never matches match-mode objects - that is
+    -- exactly why this used to do nothing in game)
+    local weapons = weaponTablesCached()
+    if #weapons == 0 then
+        local now = os.clock()
+        if now - ballScanAt > 4 then
+            ballScanAt = now
+            pcall(refreshWeaponCache)
+            weapons = weaponTablesCached()
+        end
+    end
+    for _, weapon in ipairs(weapons) do
+        paintAmmo(ammoFromWeapon(weapon), mult)
+    end
+    -- legacy path: lobby-style controllers (harmless when empty)
     for controller in pairs(CTRL_STATE.tracked) do
         if type(controller) == "table" then
             local cd = rawget(controller, "char_data")
@@ -1867,7 +1909,7 @@ end
 -- whose barrel sits exactly at the shot origin. The per-shot validation
 -- doubles as the cache check, so weapon switches self-heal.
 local function findLiveWeapon(pos)
-    local list = ZA_STATE.weaponCache
+    local list = weaponTablesCached()
     local bestD, bestW, bestB = nil, nil, nil
     if type(list) == "table" then
         for _, w in ipairs(list) do
@@ -1886,14 +1928,8 @@ local function findLiveWeapon(pos)
     return nil, nil, bestD
 end
 
-local function refreshWeaponCache()
-    local list = findWeaponTables()
-    if type(list) == "table" and #list > 0 then
-        ZA_STATE.weaponCache = list
-    elseif ZA_STATE.weaponCache == nil then
-        ZA_STATE.weaponCache = list or {}
-    end
-end
+-- (refreshWeaponCache now lives in the scan section - one canonical
+-- cache shared by the aim interception and the ballistics velocity boost)
 
 -- called from the masked wrapper right before each shot's origin write
 local function zeroedOnOriginWrite(vec)
@@ -1928,7 +1964,7 @@ local function zeroedOnOriginWrite(vec)
         if vbarrel then
             barrel = vbarrel
             weapon = nil
-            local cache = ZA_STATE.weaponCache
+            local cache = weaponTablesCached()
             if type(cache) == "table" then
                 for _, w in ipairs(cache) do
                     if ammoFromWeapon(w) then
@@ -2185,15 +2221,16 @@ track(RunService.RenderStepped:Connect(function()
     end
 end))
 
--- Respawn = fresh controller: rescan shortly after (only while the feature
--- is on) so the new weapon's barrel is in the cache by first contact.
+-- Respawn = fresh weapon/controller: rescan shortly after (only while a
+-- weapon feature is on) so the new gun is cached by first use
 track(LocalPlayer.CharacterAdded:Connect(function()
-    if not compensationActive() then return end
+    if not compensationActive() and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1 then return end
     task.spawn(function()
         for _, d in ipairs({ 1.5, 4 }) do
             task.wait(d)
             if genv.__HAVOC_DEADLINE_GEN ~= MY_GEN then return end
-            if not compensationActive() then return end
+            if not compensationActive() and (tonumber(Config.Weapons.BulletVelocity) or 1) <= 1 then return end
+            pcall(refreshWeaponCache)
             pcall(refreshControllerCache)
         end
     end)
@@ -2216,11 +2253,11 @@ track(RunService.RenderStepped:Connect(function()
     zaWarm = zaWarm + 1
     if zaWarm >= 300 then
         zaWarm = 0
-        local haveWeapons = ZA_STATE.weaponCache and #ZA_STATE.weaponCache > 0
+        local haveWeapons = #weaponTablesCached() > 0
         if ZA_STATE.wantScan or not haveWeapons then
             ZA_STATE.wantScan = nil
             pcall(refreshWeaponCache)
-            haveWeapons = ZA_STATE.weaponCache and #ZA_STATE.weaponCache > 0
+            haveWeapons = #weaponTablesCached() > 0
         end
         -- the expensive fallback caches (full heap walks) only matter when
         -- the weapon-table route is dead - healthy play stays walk-free
@@ -2247,7 +2284,7 @@ track(RunService.RenderStepped:Connect(function()
         return
     end
     local armed = ZA_STATE.mod and tostring(ZA_STATE.foundVia or "?") or "no"
-    local cache = ZA_STATE.weaponCache
+    local cache = weaponTablesCached()
     local cands = (type(cache) == "table" and #cache) or 0
     local barrelsN = 0
     if type(cache) == "table" then
