@@ -35,13 +35,8 @@
       • Vehicle Fly    - hovercar mode: W/S fly along the camera, A/D
         strafe, Space/Shift up, LeftCtrl down, neutral hovers (gravity
         compensated). Roll/pitch is locked so the car cannot capsize -
-        pull a flip and it rights itself. While flying the wheels are
-        held off the car (nocollide + massless + glued, chassis joints
-        cut; they stay visible) AND the seat's drive is muted
-        (throttle/steer neutral, MaxSpeed/Torque zeroed - seat.Disabled
-        is never touched, it ejects the driver). All restored when fly
-        ends. Direct velocity + angular writes on your own vehicle -
-        cars work best. Off by default.
+        pull a flip and it rights itself. Direct velocity + angular
+        writes on your own vehicle - cars work best. Off by default.
       • Freecam        - built in: toggles on a rebindable key
         (default RightCtrl - Camera section row; the toggle shows the
         live key chip), WASD flies, mouse looks, Space/LeftCtrl
@@ -51,19 +46,18 @@
         off, death, cam teleport) hands the mouse back unlocked.
       • Cam Teleport   - optional: sit in a vehicle, fly the freecam
         to a spot, press T - the WHOLE vehicle (wheels included) and
-        you teleport straight there. Collection walks
-        the joint graph,
+        you teleport straight there. Collection walks the joint graph,
         sweeps the rig model + attachment reverse-lookups, and picks
         wheels up by NAME (FL/FR/BL/BR corner names + anything called
         wheel, tire or tyre - the live car hides them from every joint
         scan); during the jump the wheels go nocollide + weightless so
         nothing catches on them, then their physics comes back. The
-        landing nudges up over obstacles, then sits the car on the
-        ground (raycasted - no sky-drop, no tipping); the camera must
-        be >20 studs away so the chase cam can never trigger it. A beat
-        after landing the freecam drops so you SEE where it landed.
-        Console prints parts / assemblies / wheels + jump ms + a settle
-        line. Same class of teleport as the store warps.
+        landing nudges up over obstacles; the camera must be >20 studs
+        away so the chase cam can never trigger it. The car is pinned
+        at the landing spot for a moment (beats physics / server
+        drag), then the freecam drops so you SEE where it landed.
+        Console prints parts / assemblies / wheels + a settle line.
+        Same class of teleport as the store warps.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -126,7 +120,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v46"
+local SCRIPT_VERSION = "oak-v29"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1398,123 +1392,13 @@ end
 -- Direct AssemblyLinearVelocity writes on the assembly root = the same
 -- channel the game itself uses to drive barrows - client-simulated, so
 -- it just moves. Cars (wheel-driven) respond cleanest.
--- forward: assigned in the Cam Teleport section (the wheel scan lives
--- there); the fly step only runs at frame time so the assignment has
--- always happened by then
-local flyWheelApply = nil
-local flyWheelRestoreAll = nil
-local flySeatKill = nil
-local flySeatRestore = nil
--- fly diag (oak-v42/44): the last velocity we wrote - the gap to the
--- next frame's velocity is what physics (or something else) did behind
--- our back. Gravity baseline shows as ~-gravity*dt on Y.
-local flyLastV, flyLastAV, flyDiagAt, flyIdleT, flyStickAt = nil, nil, 0, 0, 0
-
--- Vehicle Fly drivetrain mute (oak-v42, fixed v43): the car caught
--- weird forces because the game itself keeps driving - your WASD
--- reaches the seat, and the seat engine plus the game's own vehicle
--- module react to it under the hover. While flying: throttle/steer
--- pinned neutral + MaxSpeed/Torque zeroed (the game computes wheel
--- speed from MaxSpeed * throttle, the seat motor uses Torque). NEVER
--- seat.Disabled - a disabled seat EJECTS its occupant ("cant even stay
--- seated", oak-v42 bug). The fly keys are read straight from
--- UserInputService, so flying still works. Restored when fly ends.
-local FLY_SEAT_SAVED = VEH_STATE.seatKill
-if type(FLY_SEAT_SAVED) ~= "table" then
-    FLY_SEAT_SAVED = setmetatable({}, { __mode = "k" })
-    VEH_STATE.seatKill = FLY_SEAT_SAVED
-end
-flySeatKill = function(seat)
-    local rec = FLY_SEAT_SAVED[seat]
-    if not rec then
-        rec = {}
-        pcall(function()
-            rec.disabled = seat.Disabled
-            rec.tf = seat.ThrottleFloat
-            rec.sf = seat.SteerFloat
-            rec.ms = seat.MaxSpeed
-            rec.tq = seat.Torque
-        end)
-        FLY_SEAT_SAVED[seat] = rec
-        print("[oaklands] fly: drivetrain muted (throttle/steer neutral, MaxSpeed/Torque zeroed)")
-    end
-    pcall(function()
-        if seat.ThrottleFloat ~= 0 then seat.ThrottleFloat = 0 end
-        if seat.SteerFloat ~= 0 then seat.SteerFloat = 0 end
-        if seat.MaxSpeed ~= 0 then seat.MaxSpeed = 0 end
-        if seat.Torque ~= 0 then seat.Torque = 0 end
-    end)
-end
-flySeatRestore = function()
-    local n = 0
-    for seat, rec in pairs(FLY_SEAT_SAVED) do
-        FLY_SEAT_SAVED[seat] = nil
-        n = n + 1
-        pcall(function()
-            if seat.Parent then
-                seat.Disabled = rec.disabled
-                seat.ThrottleFloat = rec.tf
-                seat.SteerFloat = rec.sf
-                if rec.ms ~= nil then seat.MaxSpeed = rec.ms end
-                if rec.tq ~= nil then seat.Torque = rec.tq end
-            end
-        end)
-    end
-    if n > 0 then
-        print(("[oaklands] fly: drivetrain restored (%d)"):format(n))
-    end
-end
-
 local function vehicleFlyStep(dt)
-    if not Config.Vehicle.Fly then
-        flyLastV, flyLastAV, flyIdleT = nil, nil, 0
-        if flyWheelRestoreAll then pcall(flyWheelRestoreAll) end
-        if flySeatRestore then pcall(flySeatRestore) end
-        return
-    end
+    if not Config.Vehicle.Fly then return end
     local ch = LocalPlayer.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
-    if not seat or not seat:IsA("VehicleSeat") then
-        flyLastV, flyLastAV, flyIdleT = nil, nil, 0
-        if flyWheelRestoreAll then pcall(flyWheelRestoreAll) end
-        if flySeatRestore then pcall(flySeatRestore) end
-        return
-    end
-    -- wheels held off the car + the seat's own drive muted while flying,
-    -- so nothing - wheels or engine - can push the car under the hover
-    if flySeatKill then pcall(flySeatKill, seat) end
-    if flyWheelApply then pcall(flyWheelApply, seat) end
+    if not seat or not seat:IsA("VehicleSeat") then return end
     local root = seat.AssemblyRootPart or seat
-    -- diag v44: what did physics do to the car between frames, who owns
-    -- the sim, and how the wheel joints ended up. dv = this frame's
-    -- velocity minus the one we wrote last frame - gravity shows as
-    -- ~-gravity*dt on Y, anything bigger is an outside force. "(idle)"
-    -- means no keys + slow: a force that still prints there is constant,
-    -- not part of flying.
-    local preV = root.AssemblyLinearVelocity
-    if flyLastV and os.clock() >= flyDiagAt then
-        local dv = preV - flyLastV
-        if dv.Magnitude > Workspace.Gravity * (dt or 0) * 2 + 4 then
-            flyDiagAt = os.clock() + 1
-            local touch = 0
-            pcall(function() touch = #root:GetTouchingParts() end)
-            local own = "?"
-            pcall(function()
-                local o = root:GetNetworkOwner()
-                own = o and (o == LocalPlayer and "you" or tostring(o.Name)) or "server"
-            end)
-            local job = VEH_STATE.flyWheelJob
-            local cuts, rigid = 0, 0
-            if job then
-                if type(job.cons) == "table" then cuts = #job.cons end
-                rigid = tonumber(job.rigid) or 0
-            end
-            local idleTag = ((flyIdleT or 0) > 1.2) and " (idle)" or ""
-            print(("[oaklands] fly diag%s: dv (%.1f, %.1f, %.1f) | wrote (%.1f, %.1f, %.1f) | own %s | joints %d rigid %d | touching %d"):format(
-                idleTag, dv.X, dv.Y, dv.Z, flyLastV.X, flyLastV.Y, flyLastV.Z, own, cuts, rigid, touch))
-        end
-    end
     local speed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
     local cam = Workspace.CurrentCamera
     local look = (cam and cam.CFrame.LookVector) or seat.CFrame.LookVector
@@ -1541,16 +1425,7 @@ local function vehicleFlyStep(dt)
         target = target - Vector3.new(0, speed, 0)
     end
     local v = root.AssemblyLinearVelocity
-    local idleNow = (throttle == 0 and strafe == 0 and lift == 0 and v.Magnitude < 30)
-    flyIdleT = idleNow and ((flyIdleT or 0) + (dt or 0)) or 0
-    local wv = v + (target - v) * 0.35
-    root.AssemblyLinearVelocity = wv
-    -- stick check: does the engine give back what we just set?
-    local rb = root.AssemblyLinearVelocity
-    if (rb - wv).Magnitude > 0.5 and os.clock() >= (flyStickAt or 0) then
-        flyStickAt = os.clock() + 1
-        print(("[oaklands] fly diag: velocity write did not stick - asked (%.1f, %.1f, %.1f), read back (%.1f, %.1f, %.1f)"):format(wv.X, wv.Y, wv.Z, rb.X, rb.Y, rb.Z))
-    end
+    root.AssemblyLinearVelocity = v + (target - v) * 0.35
     -- level lock: kill roll/pitch tumble, right the car if it flipped
     local up = root.CFrame.UpVector
     local d = math.clamp(up:Dot(Vector3.new(0, 1, 0)), -1, 1)
@@ -1565,9 +1440,6 @@ local function vehicleFlyStep(dt)
     local corr = math.min(math.acos(d) * 6, 12)
     local av = root.AssemblyAngularVelocity
     root.AssemblyAngularVelocity = Vector3.new(0, av.Y * 0.7, 0) + axis * corr
-    -- remember what we wrote so next frame's diag can spot outside forces
-    flyLastV = root.AssemblyLinearVelocity
-    flyLastAV = root.AssemblyAngularVelocity
 end
 
 track(RunService.RenderStepped:Connect(function(dt)
@@ -1729,7 +1601,7 @@ end))
 -- back ("teleports half way"). Instead of trusting model names, walk
 -- the JOINT GRAPH out from the seat (oak-v23): welds, weld-constraints
 -- and constraint attachments lead to every part of the rig - body,
--- wheels - whatever the live game calls them.
+-- wheels, cargo, the character - whatever the live game calls them.
 local function jointNeighbors(part)
     local out, added = {}, {}
     local function push(p)
@@ -1914,267 +1786,6 @@ end
 -- which is why the name sweep found nothing.
 local WHEEL_SLOTS = { fl = true, fr = true, bl = true, br = true, ml = true, mr = true, rl = true, rr = true }
 
-local function findWheelParts(scope)
-    local wheelParts, seenW = {}, {}
-    if not scope then return wheelParts end
-    local okW, descsW = pcall(function() return scope:GetDescendants() end)
-    if okW and descsW then
-        for _, p in ipairs(descsW) do
-            if p:IsA("BasePart") then
-                local nm = string.lower(p.Name)
-                local wheelish = WHEEL_SLOTS[nm] == true
-                    or string.find(nm, "wheel", 1, true) ~= nil
-                    or string.find(nm, "tyre", 1, true) ~= nil
-                    or string.find(nm, "tire", 1, true) ~= nil
-                if not wheelish then
-                    local anc = p.Parent
-                    while anc and anc ~= scope do
-                        if string.find(string.lower(anc.Name), "wheel", 1, true) then
-                            wheelish = true
-                            break
-                        end
-                        anc = anc.Parent
-                    end
-                end
-                if wheelish and not seenW[p] and #wheelParts < 60 then
-                    seenW[p] = true
-                    wheelParts[#wheelParts + 1] = p
-                end
-            end
-        end
-    end
-    return wheelParts
-end
-
--- Vehicle Fly wheel hold (oak-v41, visible again in v43): while
--- flying, every matched wheel part plus its BasePart children (the
--- cylinder pieces) goes nocollide + massless, glued rigid to the car,
--- and every joint that crosses between a wheel and the chassis is cut.
--- A joint fully inside a wheel stays (it keeps the wheel pieces
--- together). Wheels still rigid-welded INTO the car's assembly can't
--- be toggled (a weld has no off switch) - the console counts any such
--- rigid link. v41-v42 also hid the wheels; that is reverted (they stay
--- VISIBLE) - hidden leftovers from an old build still restore
--- correctly through the tr/kids records. History: glued wheels with
--- live joints fed velocity into the body ("the wheels give the body
--- velocity when i fly") - the joint solver resolves glued-vs-joint
--- contradictions with impulses on BOTH sides, one of them being your
--- car. Everything is restored the moment fly ends or you dismount.
-flyWheelRestoreAll = function()
-    local job = VEH_STATE.flyWheelJob
-    if not job then return end
-    VEH_STATE.flyWheelJob = nil
-    -- joints back first (oak-v40), then the wheel physics + looks (v41)
-    if type(job.cons) == "table" then
-        for _, rec in ipairs(job.cons) do
-            pcall(function()
-                if rec and rec.c and rec.c.Parent and rec.was then
-                    rec.c.Enabled = true
-                end
-            end)
-        end
-    end
-    for p, st in pairs(job.state) do
-        pcall(function()
-            if p.Parent then
-                p.CanCollide = st.cc
-                p.Massless = st.ml
-                if st.tr ~= nil then p.Transparency = st.tr end
-            end
-        end)
-        if type(st.kids) == "table" then
-            for _, k in ipairs(st.kids) do
-                pcall(function()
-                    if k.c and k.c.Parent then
-                        if k.tr ~= nil then k.c.Transparency = k.tr end
-                        if k.en ~= nil then k.c.Enabled = k.en end
-                    end
-                end)
-            end
-        end
-    end
-    if (job.count or 0) > 0 then
-        print(("[oaklands] fly: wheels restored (%d)"):format(job.count))
-    end
-end
-
-flyWheelApply = function(seat)
-    local job = VEH_STATE.flyWheelJob
-    if job and job.seat == seat and job.model and job.model.Parent and job.root and job.root.Parent then
-        -- keep them removed every frame: nocollide + massless, glue
-        -- anchors pinned to the car, cut joints stay cut
-        local rc = job.root.CFrame
-        for p, st in pairs(job.state) do
-            if p.Parent and not p.Anchored then
-                if p.CanCollide then
-                    pcall(function()
-                        p.CanCollide = false
-                        p.Massless = true
-                    end)
-                end
-                if st.glue and p.AssemblyRootPart ~= job.root then
-                    if not st.off then
-                        st.off = rc:Inverse() * p.CFrame
-                    end
-                    local want = rc * st.off
-                    local dpos = (p.Position - want.Position).Magnitude
-                    local dlook = (p.CFrame.LookVector - want.LookVector).Magnitude
-                    if dpos > 0.02 or dlook > 0.02 then
-                        pcall(function()
-                            p.CFrame = want
-                            p.AssemblyLinearVelocity = Vector3.zero
-                            p.AssemblyAngularVelocity = Vector3.zero
-                        end)
-                    end
-                end
-            end
-        end
-        -- if anything re-enabled a cut wheel joint, cut it again
-        if type(job.cons) == "table" then
-            for _, rec in ipairs(job.cons) do
-                local c = rec and rec.c
-                if c and c.Parent then
-                    local okE, en = pcall(function() return c.Enabled end)
-                    if okE and en == true then
-                        pcall(function() c.Enabled = false end)
-                    end
-                end
-            end
-        end
-        return
-    end
-    if job then
-        flyWheelRestoreAll()
-    end
-    local ch = LocalPlayer.Character
-    local scope = nil
-    local okScope = pcall(function()
-        local list, seen = collectVehicleParts(seat)
-        augmentVehicleParts(list, seen, seat, ch)
-        scope = commonVehicleModel(seat, list, ch)
-    end)
-    if not okScope or not scope then
-        scope = seat:FindFirstAncestorOfClass("Model")
-    end
-    local wheels = findWheelParts(scope)
-    if #wheels == 0 then return end
-    local root = seat.AssemblyRootPart or seat
-    -- expand to whole wheel subtrees: a wheel part can carry child
-    -- BaseParts (cylinder pieces) that still collide on their own
-    local wheelSet, wheelList, seenW = {}, {}, {}
-    for _, p in ipairs(wheels) do
-        if not seenW[p] then
-            seenW[p] = true
-            wheelSet[p] = true
-            wheelList[#wheelList + 1] = p
-        end
-        local okD, descs = pcall(function() return p:GetDescendants() end)
-        if okD and descs then
-            for _, d in ipairs(descs) do
-                if d:IsA("BasePart") and not seenW[d] then
-                    seenW[d] = true
-                    wheelSet[d] = true
-                    wheelList[#wheelList + 1] = d
-                end
-            end
-        end
-    end
-    -- neutralize every wheel part (nocollide + massless; no hiding -
-    -- v43 keeps them visible). Separate-assembly wheels also get a
-    -- glue anchor below.
-    local state, count = {}, 0
-    for _, p in ipairs(wheelList) do
-        local ok = pcall(function()
-            state[p] = { cc = p.CanCollide, ml = p.Massless }
-            p.CanCollide = false
-            p.Massless = true
-        end)
-        if ok then count = count + 1 end
-    end
-    if count == 0 then return end
-    -- one glue anchor per wheel assembly (setting one part moves its
-    -- whole rigid assembly); velocities pinned at zero on the anchor
-    local glueSeen = {}
-    for _, p in ipairs(wheelList) do
-        local st = state[p]
-        if st and not p.Anchored and p.AssemblyRootPart ~= root then
-            local a = p.AssemblyRootPart
-            if a and not glueSeen[a] then
-                glueSeen[a] = true
-                pcall(function()
-                    st.glue = true
-                    st.off = root.CFrame:Inverse() * p.CFrame
-                    p.AssemblyLinearVelocity = Vector3.zero
-                    p.AssemblyAngularVelocity = Vector3.zero
-                end)
-            end
-        end
-    end
-    -- cut every joint that crosses between a wheel and the rest: while
-    -- a wheel is glued, a live joint solves the disagreement by shoving
-    -- the CAR around - feeding velocity into the hover. A joint fully
-    -- inside a wheel stays (it keeps the wheel pieces together); a
-    -- joint to the car/world gets disabled. Constraints hang off
-    -- attachments even when the instance lives in a rig folder; legacy
-    -- joints come from GetJoints (no Enabled = rigid weld, can't be
-    -- toggled - counted for the console).
-    local cons, seenC, rigidLeft = {}, {}, 0
-    local function sideParts(j)
-        local sides = {}
-        pcall(function() sides[#sides + 1] = j.Part0 end)
-        pcall(function() sides[#sides + 1] = j.Part1 end)
-        pcall(function() local a = j.Attachment0; if a then sides[#sides + 1] = a.Parent end end)
-        pcall(function() local a = j.Attachment1; if a then sides[#sides + 1] = a.Parent end end)
-        return sides
-    end
-    local function crossesWheels(j)
-        local inW, outW, total = false, false, 0
-        for _, s in ipairs(sideParts(j)) do
-            if s and s:IsA("BasePart") then
-                total = total + 1
-                if wheelSet[s] then inW = true else outW = true end
-            end
-        end
-        if not inW then return false end
-        if outW then return true end
-        return total < 2
-    end
-    local function considerCut(j)
-        if seenC[j] then return end
-        seenC[j] = true
-        if not crossesWheels(j) then return end
-        local okE, en = pcall(function() return j.Enabled end)
-        if okE and type(en) == "boolean" then
-            if en then
-                pcall(function() j.Enabled = false end)
-                cons[#cons + 1] = { c = j, was = true }
-            end
-        else
-            rigidLeft = rigidLeft + 1
-        end
-    end
-    for _, p in ipairs(wheelList) do
-        local okD, descs = pcall(function() return p:GetDescendants() end)
-        if okD and descs then
-            for _, d in ipairs(descs) do
-                if d:IsA("Attachment") then
-                    local c = d.ParentConstraint
-                    if c then considerCut(c) end
-                end
-            end
-        end
-        local okJ, joints = pcall(function() return p:GetJoints() end)
-        if okJ and joints then
-            for _, j in ipairs(joints) do
-                considerCut(j)
-            end
-        end
-    end
-    VEH_STATE.flyWheelJob = { seat = seat, model = scope, root = root, state = state, count = count, cons = cons, rigid = rigidLeft }
-    local rigidNote = rigidLeft > 0 and (", " .. rigidLeft .. " rigid weld(s) left") or ""
-    print(("[oaklands] fly: wheels held off the car (%d parts, %d joints cut%s) - nocollide + massless + glued until you stop flying"):format(count, #cons, rigidNote))
-end
-
 local function cameraTeleport()
     if not Config.Vehicle.CamTP then
         print("[oaklands] cam tp: toggle is off (Movement > Vehicles > Cam Teleport)")
@@ -2220,10 +1831,8 @@ local function cameraTeleport()
         print("[oaklands] cam tp: landing spot is blocked - aim the freecam at open space")
         return
     end
-    local t0 = os.clock()
     local parts, seenParts = collectVehicleParts(seat)
     local rigged = augmentVehicleParts(parts, seenParts, seat, ch)
-    local collectMs = math.floor((os.clock() - t0) * 1000)
     if ch then
         local hrp = ch:FindFirstChild("HumanoidRootPart")
         if hrp and not seenParts[hrp] then
@@ -2246,7 +1855,38 @@ local function cameraTeleport()
     local wheelParts = {}
     do
         local scope = commonVehicleModel(seat, parts, ch) or seat:FindFirstAncestorOfClass("Model")
-        wheelParts = findWheelParts(scope)
+        local seenW = {}
+        local function addWheel(p)
+            if p and p:IsA("BasePart") and not seenW[p] and #wheelParts < 60 then
+                seenW[p] = true
+                wheelParts[#wheelParts + 1] = p
+            end
+        end
+        if scope then
+            local okW, descsW = pcall(function() return scope:GetDescendants() end)
+            if okW and descsW then
+                for _, p in ipairs(descsW) do
+                    if p:IsA("BasePart") then
+                        local nm = string.lower(p.Name)
+                        local wheelish = WHEEL_SLOTS[nm] == true
+                            or string.find(nm, "wheel", 1, true) ~= nil
+                            or string.find(nm, "tyre", 1, true) ~= nil
+                            or string.find(nm, "tire", 1, true) ~= nil
+                        if not wheelish then
+                            local anc = p.Parent
+                            while anc and anc ~= scope do
+                                if string.find(string.lower(anc.Name), "wheel", 1, true) then
+                                    wheelish = true
+                                    break
+                                end
+                                anc = anc.Parent
+                            end
+                        end
+                        if wheelish then addWheel(p) end
+                    end
+                end
+            end
+        end
         for _, p in ipairs(wheelParts) do
             if not seenParts[p] then
                 seenParts[p] = true
@@ -2264,38 +1904,8 @@ local function cameraTeleport()
         end)
     end
     if #parts == 0 then parts[1] = root end
-    -- land ON the ground, not floating at camera height (oak-v36): find
-    -- what is under the target point and slide it up so the car rests
-    -- just above it. The old sky-drop could tip the car on landing.
-    do
-        local minY = nil
-        for _, p in ipairs(parts) do
-            if p:IsA("BasePart") and not (ch and p:IsDescendantOf(ch)) then
-                local okB, bottom = pcall(function()
-                    return p.Position.Y - p.Size.Y * 0.5
-                end)
-                if okB and bottom and (minY == nil or bottom < minY) then
-                    minY = bottom
-                end
-            end
-        end
-        if minY ~= nil then
-            local dropBelow = root.Position.Y - minY
-            local rparams = RaycastParams.new()
-            rparams.FilterType = Enum.RaycastFilterType.Exclude
-            rparams.FilterDescendantsInstances = { ch }
-            rparams.IgnoreWater = true
-            local hit = Workspace:Raycast(landPos, Vector3.new(0, -300, 0), rparams)
-            if hit then
-                local wantedY = hit.Position.Y + dropBelow + 1.5
-                if landPos.Y > wantedY then
-                    landPos = Vector3.new(landPos.X, wantedY, landPos.Z)
-                end
-            end
-        end
-    end
     -- one CFrame write per unique assembly (setting one part moves its
-    -- whole rigid assembly - a second write would double-move it).
+    -- whole rigid assembly - a second write would double-move it)
     local function tpApply()
         local shift = landPos - root.Position
         if shift.Magnitude < 0.5 then return 0, 0 end
@@ -2314,47 +1924,17 @@ local function cameraTeleport()
         end
         return cnt, fls
     end
-    -- settle re-assert (oak-v39): only the car + wheels get re-pinned -
-    -- everything else rides its constraints. Re-teleporting the whole
-    -- parts list at 10/s was the "long lag after a big jump" stutter:
-    -- every extra assembly was one more teleport per re-assert.
-    local reassertAnchors = { root }
-    for _, p in ipairs(wheelParts) do
-        reassertAnchors[#reassertAnchors + 1] = p
-    end
-    local function tpReassert()
-        local shift = landPos - root.Position
-        if shift.Magnitude < 0.5 then return 0 end
-        local moved, cnt = {}, 0
-        for _, p in ipairs(reassertAnchors) do
-            local a = p.AssemblyRootPart
-            if a and a.Parent and not moved[a] then
-                moved[a] = true
-                local okp = pcall(function()
-                    a.AssemblyLinearVelocity = Vector3.zero
-                    a.AssemblyAngularVelocity = Vector3.zero
-                    a.CFrame = CFrame.new(shift) * a.CFrame
-                end)
-                if okp then cnt = cnt + 1 end
-            end
-        end
-        return cnt
-    end
-    local t1 = os.clock()
     local count, fails = tpApply()
-    local jumpMs = math.floor((os.clock() - t1) * 1000)
     local extra = {}
     if fails > 0 then extra[#extra + 1] = ("%d failed"):format(fails) end
     if rigged > 0 then extra[#extra + 1] = ("+%d rigged"):format(rigged) end
     if #wheelParts > 0 then extra[#extra + 1] = ("%d wheels"):format(#wheelParts) end
     local suffix = #extra > 0 and (" [" .. table.concat(extra, ", ") .. "]") or ""
-    print(("[oaklands] cam tp: moved %d studs (vehicle: %d parts, %d assemblies)%s [collect %dms, jump %dms]"):format(math.floor(dist), #parts, count, suffix, collectMs, jumpMs))
+    print(("[oaklands] cam tp: moved %d studs (vehicle: %d parts, %d assemblies)%s"):format(math.floor(dist), #parts, count, suffix))
     -- pin the car where it landed for a moment in case anything (server
     -- replication, physics wake-up, streaming) tries to drag it back;
-    -- the settle line is the evidence when something persistent fights.
-    -- oak-v39: re-asserts use tpReassert (car + wheels only) instead
-    -- of a full parts re-teleport
-    TP_JOB = { root = root, landPos = landPos, apply = tpReassert, wheels = wheelState, nextAt = 0, doneAt = os.clock() + 0.4, hardDoneAt = os.clock() + 1.0, applies = 1 }
+    -- the settle line is the evidence when something persistent fights
+    TP_JOB = { root = root, landPos = landPos, apply = tpApply, wheels = wheelState, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.6, applies = 1 }
     if FREE.on then
         pcall(freecamOff)  -- camera back on you, so you SEE where it landed
         pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
@@ -2378,7 +1958,7 @@ track(RunService.Heartbeat:Connect(function()
         local d = job.landPos - root.Position
         local drift = Vector3.new(d.X, 0, d.Z).Magnitude  -- horizontal only: gravity may drop it on landing, that's fine
         if os.clock() > job.doneAt then
-            if drift > 8 and os.clock() < job.hardDoneAt and job.applies < 30 then
+            if drift > 8 and os.clock() < job.hardDoneAt and job.applies < 90 then
                 job.doneAt = os.clock() + 0.25
             else
                 local note = drift > 8 and " - something keeps dragging it back" or ""
@@ -2387,13 +1967,9 @@ track(RunService.Heartbeat:Connect(function()
                 return
             end
         end
-        -- re-asserts are throttled to 10/s: enough to beat physics
-        -- settling without burning the solver every frame (that WAS
-        -- the teleport lag)
-        if drift > 6 and job.applies < 30 and os.clock() >= (job.nextAt or 0) then
+        if drift > 6 and job.applies < 90 then
             job.apply()
             job.applies = job.applies + 1
-            job.nextAt = os.clock() + 0.1
         end
     end)
 end))
@@ -2410,50 +1986,6 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         cameraTeleport()
     end)
 end))
-
--- ============================================================
--- WOOD LOCK - REMOVED (oak-v46, per request: back to plain car
--- teleporting - no cargo / trunk-item handling anymore). The cargo
--- lock could fight a rigged piece on some rigs (wobble + speed loss
--- while flying), so the whole feature is gone.
--- ============================================================
--- one-time cleanup: pieces locked by an older build still sit at
--- Massless / no-collide - give their physics back
-pcall(function()
-    local oldWL = genv.__HAVOC_OAKLANDS_WOODLOCK
-    if type(oldWL) == "table" then
-        if type(oldWL.items) == "table" then
-            for p, st in pairs(oldWL.items) do
-                pcall(function()
-                    if p.Parent and st then
-                        if st.massless ~= nil then p.Massless = st.massless end
-                        if st.collide ~= nil then p.CanCollide = st.collide end
-                    end
-                end)
-            end
-        end
-        if type(oldWL.welds) == "table" then
-            for _, w in ipairs(oldWL.welds) do
-                pcall(function()
-                    if w and w.Parent then
-                        local p = w.Part0
-                        if p and type(oldWL.mass) == "table" and oldWL.mass[p] ~= nil then
-                            p.Massless = oldWL.mass[p]
-                        end
-                        w:Destroy()
-                    end
-                end)
-            end
-        end
-        genv.__HAVOC_OAKLANDS_WOODLOCK = nil
-    end
-end)
-
-
-
-
-
-
 
 track(task.spawn(function()
     while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
@@ -2487,18 +2019,6 @@ pcall(function()
             end
             VEH_STATE.ghost[seat] = nil
         end
-    end
-end)
--- leftover fly wheel lock from an old build: give the wheels back
-pcall(function()
-    if VEH_STATE.flyWheelJob and flyWheelRestoreAll then
-        flyWheelRestoreAll()
-    end
-end)
--- leftover fly drivetrain mute from an old build: give the seat back
-pcall(function()
-    if type(VEH_STATE.seatKill) == "table" and flySeatRestore then
-        flySeatRestore()
     end
 end)
 
