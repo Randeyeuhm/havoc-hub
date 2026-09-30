@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v17
+    HAVOC HUB - OAKLANDS                           oak-v18
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -41,11 +41,12 @@
         cargo in/on it go non-colliding locally. The CHARACTER is never
         ghosted - being inside a solid part is exactly what the server
         detects (noclip = ban).
-      • Wall Phase     - optional, the ban-safe way through walls: when
-        blocked (holding W, barely moving, wall right ahead) the whole
-        car+character is teleported PAST it in one atomic step with a
-        verified-clear landing spot - nobody is ever left inside solid
-        geometry. Same mechanism the game's own store teleports use.
+      • Wall Phase     - optional, the ban-safe way through walls, works
+        in a vehicle OR on foot: blocked (holding W, barely moving, wall
+        right ahead) -> teleported PAST it in one atomic step with a
+        verified-clear landing spot - never left inside solid geometry.
+        Same mechanism the game's own store teleports use. Car hops
+        scale with vehicle size (semis clear thick walls in one go).
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -85,7 +86,10 @@
     Misc
       • Fullbright       - grey ambient + no fog, re-applied every second
                            (the game's weather system likes to fight back).
-      • Teleports        - every store in World.Regions.Stores.
+      • Teleports        - full static location list (ReplicatedFirst.
+                           MapInfo.Locations - includes stores that are
+                           not streamed in yet) merged with whatever is
+                           loaded.
       • Anti-AFK.
 
     Notes from recon (why no damage/speed/inventory hacks):
@@ -105,7 +109,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v17"
+local SCRIPT_VERSION = "oak-v18"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1463,18 +1467,44 @@ if type(PHASE_STATE) ~= "table" then
     genv.__HAVOC_OAKLANDS_PHASE = PHASE_STATE
 end
 
-local function phaseStep()
-    if not Config.Vehicle.Phase then return end
+local function phaseLanding(origin, flat, hit, exclude, probeRadius, margin, extend)
+    local oparams = OverlapParams.new()
+    oparams.FilterType = Enum.RaycastFilterType.Exclude
+    oparams.FilterDescendantsInstances = exclude
+    oparams.RespectCanCollide = true
+    local step = hit.Distance + margin
+    for _ = 1, 8 do
+        local candidate = origin + flat * step
+        local okh, hits = pcall(function()
+            return Workspace:GetPartBoundsInRadius(candidate, probeRadius, oparams)
+        end)
+        if okh and hits and #hits == 0 then
+            return step
+        end
+        step = step + extend
+    end
+    return nil
+end
+
+local function phasePrint(mode, step)
+    local now = os.clock()
+    if now - (PHASE_STATE.lastPrint or 0) > 1.5 then
+        PHASE_STATE.lastPrint = now
+        print(("[oaklands] wall phase (%s): snapped %d studs"):format(mode, math.floor(step)))
+    end
+end
+
+local function phaseCar()
     local ch = LocalPlayer.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
     if not (seat and seat:IsA("VehicleSeat")) then return end
-    local root = seat.AssemblyRootPart or seat
     local wHeld = false
     pcall(function() wHeld = UserInputService:IsKeyDown(Enum.KeyCode.W) end)
     if not wHeld then return end
+    local root = seat.AssemblyRootPart or seat
     local v = root.AssemblyLinearVelocity
-    if Vector3.new(v.X, 0, v.Z).Magnitude > 4 then return end
+    if Vector3.new(v.X, 0, v.Z).Magnitude > 6 then return end
     local cam = Workspace.CurrentCamera
     if not cam then return end
     local look = cam.CFrame.LookVector
@@ -1489,37 +1519,68 @@ local function phaseStep()
     params.FilterDescendantsInstances = exclude
     params.RespectCanCollide = true
     local origin = root.Position + Vector3.new(0, 2, 0)
-    local hit = Workspace:Raycast(origin, flat * 16, params)
-    if not hit or hit.Distance > 12 then return end
-    -- find a CLEAR landing spot: past the front face + 10, extended until nothing overlaps
-    local oparams = OverlapParams.new()
-    oparams.FilterType = Enum.RaycastFilterType.Exclude
-    oparams.FilterDescendantsInstances = exclude
-    oparams.RespectCanCollide = true
-    local step = hit.Distance + 10
-    local clear = false
-    for _ = 1, 6 do
-        local candidate = origin + flat * step
-        local okh, hits = pcall(function()
-            return Workspace:GetPartBoundsInRadius(candidate, 2, oparams)
-        end)
-        if okh and hits and #hits == 0 then
-            clear = true
-            break
+    local half = 8
+    if model then
+        local okex, ex = pcall(function() return model:GetExtentsSize() end)
+        if okex and ex then
+            half = math.max(ex.X, ex.Z) * 0.5
         end
-        step = step + 24
     end
-    if not clear then return end
+    local reach = half + 8
+    local hit = Workspace:Raycast(origin, flat * (reach + 8), params)
+    if not hit or hit.Distance > reach then return end
+    if hit.Normal.Y > 0.6 then return end
+    local step = phaseLanding(origin, flat, hit, exclude, 3, half + 6, 10)
+    if not step then return end
     local ok = pcall(function()
         root.CFrame = root.CFrame + flat * step
     end)
     if ok then
-        local now = os.clock()
-        if now - (PHASE_STATE.lastPrint or 0) > 1.5 then
-            PHASE_STATE.lastPrint = now
-            print(("[oaklands] wall phase: snapped %d studs"):format(math.floor(step)))
-        end
+        phasePrint("car", step)
     end
+end
+
+local function phaseFoot()
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if not hum or not ch then return end
+    if hum.SeatPart then return end
+    local hrp = ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart
+    if not hrp then return end
+    local wHeld = false
+    pcall(function() wHeld = UserInputService:IsKeyDown(Enum.KeyCode.W) end)
+    if not wHeld then return end
+    local v = hrp.AssemblyLinearVelocity
+    if Vector3.new(v.X, 0, v.Z).Magnitude > 3 then return end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local look = cam.CFrame.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude < 0.1 then return end
+    flat = flat.Unit
+    local exclude = { ch }
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = exclude
+    params.RespectCanCollide = true
+    local origin = hrp.Position
+    local hit = Workspace:Raycast(origin, flat * 7, params)
+    if not hit or hit.Distance > 4.5 then return end
+    if hit.Normal.Y > 0.6 then return end
+    local step = phaseLanding(origin, flat, hit, exclude, 2.5, 3, 6)
+    if not step then return end
+    local ok = pcall(function()
+        hrp.CFrame = hrp.CFrame + flat * step
+    end)
+    if ok then
+        phasePrint("foot", step)
+    end
+end
+
+local function phaseStep()
+    if not Config.Vehicle.Phase then return end
+    pcall(phaseCar)
+    pcall(phaseFoot)
 end
 
 track(task.spawn(function()
@@ -1592,20 +1653,71 @@ end))
 -- ============================================================
 -- TELEPORTS
 -- ============================================================
-local function getStores()
+local STATIC_LOCS = nil
+
+local function staticLocations()
+    if STATIC_LOCS then return STATIC_LOCS end
     local out = {}
+    pcall(function()
+        local mapInfo = ReplicatedFirst:FindFirstChild("MapInfo")
+        local locs = mapInfo and mapInfo:FindFirstChild("Locations")
+        if not locs then return end
+        for _, region in ipairs(locs:GetChildren()) do
+            if region:IsA("Folder") and not string.find(region.Name, "Disabled") then
+                for _, loc in ipairs(region:GetChildren()) do
+                    if loc:IsA("BasePart") then
+                        out[#out + 1] = { name = loc.Name, pos = loc.Position }
+                    end
+                end
+            end
+        end
+    end)
+    if #out > 0 then
+        STATIC_LOCS = out
+    end
+    return out
+end
+
+local function getStores()
+    local seen, out = {}, {}
     local world = Workspace:FindFirstChild("World")
     local regions = world and world:FindFirstChild("Regions")
     local stores = regions and regions:FindFirstChild("Stores")
     if stores then
         for _, s in ipairs(stores:GetChildren()) do
             if s:IsA("Model") or s:IsA("BasePart") or s:IsA("Folder") then
-                out[#out + 1] = s.Name
+                if not seen[s.Name] then
+                    seen[s.Name] = true
+                    out[#out + 1] = s.Name
+                end
             end
+        end
+    end
+    for _, loc in ipairs(staticLocations()) do
+        if not seen[loc.name] then
+            seen[loc.name] = true
+            out[#out + 1] = loc.name
         end
     end
     table.sort(out)
     return out
+end
+
+local function storePos(name)
+    local world = Workspace:FindFirstChild("World")
+    local regions = world and world:FindFirstChild("Regions")
+    local stores = regions and regions:FindFirstChild("Stores")
+    local store = stores and stores:FindFirstChild(name)
+    if store then
+        local pos = listPos(store)
+        if pos then return pos end
+    end
+    for _, loc in ipairs(staticLocations()) do
+        if loc.name == name then
+            return loc.pos
+        end
+    end
+    return nil
 end
 
 local function teleportTo(name)
@@ -1613,22 +1725,14 @@ local function teleportTo(name)
         notify("Pick a location first")
         return
     end
-    local world = Workspace:FindFirstChild("World")
-    local regions = world and world:FindFirstChild("Regions")
-    local stores = regions and regions:FindFirstChild("Stores")
-    local store = stores and stores:FindFirstChild(name)
-    if not store then
+    local pos = storePos(name)
+    if not pos then
         notify("Location not found: " .. name)
         return
     end
     local char = LocalPlayer.Character
     if not char then
         notify("No character")
-        return
-    end
-    local pos = listPos(store)
-    if not pos then
-        notify("Could not read that location's position")
         return
     end
     local ok = pcall(function()
