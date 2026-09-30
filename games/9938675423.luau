@@ -135,7 +135,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v43"
+local SCRIPT_VERSION = "oak-v44"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1414,10 +1414,10 @@ local flyWheelApply = nil
 local flyWheelRestoreAll = nil
 local flySeatKill = nil
 local flySeatRestore = nil
--- fly diag (oak-v42): the last velocity we wrote - the gap to the next
--- frame's velocity is what physics (or something else) did behind our
--- back. Gravity baseline shows as ~-gravity*dt on Y.
-local flyLastV, flyLastAV, flyDiagAt = nil, nil, 0
+-- fly diag (oak-v42/44): the last velocity we wrote - the gap to the
+-- next frame's velocity is what physics (or something else) did behind
+-- our back. Gravity baseline shows as ~-gravity*dt on Y.
+local flyLastV, flyLastAV, flyDiagAt, flyIdleT, flyStickAt = nil, nil, 0, 0, 0
 
 -- Vehicle Fly drivetrain mute (oak-v42, fixed v43): the car caught
 -- weird forces because the game itself keeps driving - your WASD
@@ -1476,7 +1476,7 @@ end
 
 local function vehicleFlyStep(dt)
     if not Config.Vehicle.Fly then
-        flyLastV, flyLastAV = nil, nil
+        flyLastV, flyLastAV, flyIdleT = nil, nil, 0
         if flyWheelRestoreAll then pcall(flyWheelRestoreAll) end
         if flySeatRestore then pcall(flySeatRestore) end
         return
@@ -1485,7 +1485,7 @@ local function vehicleFlyStep(dt)
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
     if not seat or not seat:IsA("VehicleSeat") then
-        flyLastV, flyLastAV = nil, nil
+        flyLastV, flyLastAV, flyIdleT = nil, nil, 0
         if flyWheelRestoreAll then pcall(flyWheelRestoreAll) end
         if flySeatRestore then pcall(flySeatRestore) end
         return
@@ -1495,19 +1495,33 @@ local function vehicleFlyStep(dt)
     if flySeatKill then pcall(flySeatKill, seat) end
     if flyWheelApply then pcall(flyWheelApply, seat) end
     local root = seat.AssemblyRootPart or seat
-    -- diag: what did physics do to the car between frames? (dv = this
-    -- frame's velocity minus the one we wrote last frame; gravity shows
-    -- as ~-gravity*dt on Y, anything bigger is an outside force)
+    -- diag v44: what did physics do to the car between frames, who owns
+    -- the sim, and how the wheel joints ended up. dv = this frame's
+    -- velocity minus the one we wrote last frame - gravity shows as
+    -- ~-gravity*dt on Y, anything bigger is an outside force. "(idle)"
+    -- means no keys + slow: a force that still prints there is constant,
+    -- not part of flying.
     local preV = root.AssemblyLinearVelocity
-    local preAV = root.AssemblyAngularVelocity
     if flyLastV and os.clock() >= flyDiagAt then
         local dv = preV - flyLastV
-        local dav = preAV - flyLastAV
-        if dv.Magnitude > Workspace.Gravity * (dt or 0) * 2 + 4 or dav.Magnitude > 4 then
+        if dv.Magnitude > Workspace.Gravity * (dt or 0) * 2 + 4 then
             flyDiagAt = os.clock() + 1
             local touch = 0
             pcall(function() touch = #root:GetTouchingParts() end)
-            print(("[oaklands] fly diag: unexplained dv/frame (%.1f, %.1f, %.1f) | av (%.1f, %.1f, %.1f) | touching %d"):format(dv.X, dv.Y, dv.Z, dav.X, dav.Y, dav.Z, touch))
+            local own = "?"
+            pcall(function()
+                local o = root:GetNetworkOwner()
+                own = o and (o == LocalPlayer and "you" or tostring(o.Name)) or "server"
+            end)
+            local job = VEH_STATE.flyWheelJob
+            local cuts, rigid = 0, 0
+            if job then
+                if type(job.cons) == "table" then cuts = #job.cons end
+                rigid = tonumber(job.rigid) or 0
+            end
+            local idleTag = ((flyIdleT or 0) > 1.2) and " (idle)" or ""
+            print(("[oaklands] fly diag%s: dv (%.1f, %.1f, %.1f) | wrote (%.1f, %.1f, %.1f) | own %s | joints %d rigid %d | touching %d"):format(
+                idleTag, dv.X, dv.Y, dv.Z, flyLastV.X, flyLastV.Y, flyLastV.Z, own, cuts, rigid, touch))
         end
     end
     local speed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
@@ -1536,7 +1550,16 @@ local function vehicleFlyStep(dt)
         target = target - Vector3.new(0, speed, 0)
     end
     local v = root.AssemblyLinearVelocity
-    root.AssemblyLinearVelocity = v + (target - v) * 0.35
+    local idleNow = (throttle == 0 and strafe == 0 and lift == 0 and v.Magnitude < 30)
+    flyIdleT = idleNow and ((flyIdleT or 0) + (dt or 0)) or 0
+    local wv = v + (target - v) * 0.35
+    root.AssemblyLinearVelocity = wv
+    -- stick check: does the engine give back what we just set?
+    local rb = root.AssemblyLinearVelocity
+    if (rb - wv).Magnitude > 0.5 and os.clock() >= (flyStickAt or 0) then
+        flyStickAt = os.clock() + 1
+        print(("[oaklands] fly diag: velocity write did not stick - asked (%.1f, %.1f, %.1f), read back (%.1f, %.1f, %.1f)"):format(wv.X, wv.Y, wv.Z, rb.X, rb.Y, rb.Z))
+    end
     -- level lock: kill roll/pitch tumble, right the car if it flipped
     local up = root.CFrame.UpVector
     local d = math.clamp(up:Dot(Vector3.new(0, 1, 0)), -1, 1)
@@ -2166,7 +2189,7 @@ flyWheelApply = function(seat)
             end
         end
     end
-    VEH_STATE.flyWheelJob = { seat = seat, model = scope, root = root, state = state, count = count, cons = cons }
+    VEH_STATE.flyWheelJob = { seat = seat, model = scope, root = root, state = state, count = count, cons = cons, rigid = rigidLeft }
     local rigidNote = rigidLeft > 0 and (", " .. rigidLeft .. " rigid weld(s) left") or ""
     print(("[oaklands] fly: wheels held off the car (%d parts, %d joints cut%s) - nocollide + massless + glued until you stop flying"):format(count, #cons, rigidNote))
 end
