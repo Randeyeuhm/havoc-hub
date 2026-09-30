@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v1
+    HAVOC HUB - OAKLANDS                           oak-v2
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -22,17 +22,10 @@
                           (characters live in Workspace, named by username).
 
     Chop
-      • Auto Chop       - walks up nowhere: it swings your equipped axe at
-                          the nearest tree IN RANGE through the game's own
-                          channels. It sends exactly what the axe client
-                          sends (Backpack:InformServer "SwingStartAttempt"
-                          + "AttemptChop" {HitPart, HitPosition}) using the
-                          game's own Backpack module instance - the server
-                          validates every swing like a human's, and the
-                          timing mirrors the tool's MaxSwingTime (read live
-                          from the tool behavior), so swings look legit.
-                          Requires an axe in hand; power requirements from
-                          INFO are respected so reject-spam stays low.
+      • (Auto Chop REMOVED in oak-v2 - live testing showed it does not
+        work and crashes the client; its swing channel
+        (Backpack:InformServer) is server-validated with client self-
+        reporting, so this script no longer sends anything.)
 
     Movement
       • Infinite Stamina - refills CurrentStamina back to YOUR baseline the
@@ -40,9 +33,9 @@
                            (HAX code 6) fires only when stamina EXCEEDS
                            baseline+50 - this never crosses it, so it stays
                            quiet. Sprint forever.
-      • Experimental (client-side, but server-side checks are untested -
-        keep it subtle or use an alt): Infinite Jump, Walk Speed,
-        Jump Power, Sprint Boost (the game's own SpeedMultiplier attribute).
+      • (Experimental movement REMOVED in oak-v2 - Infinite Jump / Walk
+        Speed / Jump Power / Sprint Boost were live-tested: they work,
+        but the server bans for them eventually.)
 
     Misc
       • Fullbright       - grey ambient + no fog, re-applied every second
@@ -63,7 +56,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v1"
+local SCRIPT_VERSION = "oak-v2"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -169,10 +162,17 @@ Config.World.TreeMaxDist = math.clamp(tonumber(Config.World.TreeMaxDist) or 400,
 Config.World.ItemMaxDist = math.clamp(tonumber(Config.World.ItemMaxDist) or 250, 50, 1500)
 Config.World.EnemyMaxDist = math.clamp(tonumber(Config.World.EnemyMaxDist) or 500, 50, 2000)
 Config.Players.MaxDist = math.clamp(tonumber(Config.Players.MaxDist) or 1000, 100, 3000)
-Config.Chop.Range = math.clamp(tonumber(Config.Chop.Range) or 0, 0, 25)
-Config.Movement.WalkSpeed = math.clamp(tonumber(Config.Movement.WalkSpeed) or 16, 16, 100)
-Config.Movement.JumpPower = math.clamp(tonumber(Config.Movement.JumpPower) or 50, 50, 200)
-Config.Movement.SprintBoost = math.clamp(tonumber(Config.Movement.SprintBoost) or 1, 1, 2)
+-- REMOVED features (oak-v2): Auto Chop (crashed the client; swings go
+-- through a server-validated, self-reporting channel) and the experimental
+-- movement block (Infinite Jump / Walk Speed / Jump Power / Sprint Boost -
+-- live-tested: they work but the server bans for them). Force vanilla no
+-- matter what the saved config says.
+Config.Chop.Range = 0
+Config.Chop.AutoChop = false
+Config.Movement.InfJump = false
+Config.Movement.WalkSpeed = 16
+Config.Movement.JumpPower = 50
+Config.Movement.SprintBoost = 1
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
 
 local function saveConfig()
@@ -569,130 +569,10 @@ end
 -- ============================================================
 -- AUTO CHOP  (the game's own channel: Backpack:InformServer)
 -- ============================================================
-local chopStatusLabel = nil
-local chopStatusText = ""
-local function setChopStatus(text)
-    if text == chopStatusText then return end
-    chopStatusText = text
-    if chopStatusLabel then
-        pcall(function() chopStatusLabel.Text = "Auto chop: " .. text end)
-    end
-end
-
-local function powerOK(species, behavior)
-    if not species then return true end
-    local info = ReplicatedStorage:FindFirstChild("INFO")
-    local node = info and info:FindFirstChild(species)
-    if not node then return true end
-    local typ = node:GetAttribute("PowerRequirementType")
-    local minP = tonumber(node:GetAttribute("PowerRequirementMin")) or 0
-    local maxP = tonumber(node:GetAttribute("PowerRequirementMax")) or math.huge
-    local power = behavior and tonumber(behavior.AxePower)
-    if not power or not typ then return true end
-    if typ == "Range" then
-        return not (power < minP or maxP < power)
-    elseif typ == "Exact" then
-        return power == minP
-    end
-    -- "Axe" type compares tool names - let the server decide
-    return true
-end
-
-do
-    local phase, swingUntil, coolUntil = "idle", 0, 0
-    local nextScan = 0
-    track(task.spawn(function()
-        while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
-            task.wait(0.12)
-            if not Config.Chop.AutoChop then
-                phase = "idle"
-                setChopStatus("off")
-                continue
-            end
-
-            local now = os.clock()
-            -- refresh the tree list on the chop loop's own timer
-            if now >= nextScan then
-                nextScan = now + 5
-                scanTrees(treeList)
-            end
-
-            local backpack = requestModule("Backpack")
-            local equipped = backpack and backpack.EquippedTool
-            local behavior = equipped and equipped.Class
-            local swingTime = behavior and tonumber(behavior.MaxSwingTime)
-            if not swingTime then
-                phase = "idle"
-                setChopStatus("equip an axe to start")
-                continue
-            end
-
-            local char = LocalPlayer.Character
-            local root = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
-            if not root then
-                phase = "idle"
-                setChopStatus("no character")
-                continue
-            end
-
-            local range = tonumber(Config.Chop.Range) or 0
-            if range <= 0 then
-                range = tonumber(behavior.MaxSwingDistance) or 12
-            end
-
-            -- nearest in-range tree that passes the power check
-            local target, best, bestText = nil, math.huge, nil
-            for _, t in ipairs(treeList) do
-                local pos = listPos(t.target)
-                if pos then
-                    t.pos = pos
-                    local d = (pos - root.Position).Magnitude
-                    if d <= range and d < best then
-                        if powerOK(t.species, behavior) then
-                            target, best, bestText = t.target, d, t.text
-                        end
-                    end
-                end
-            end
-
-            if not target then
-                phase = "idle"
-                setChopStatus(("no tree within %d studs"):format(math.floor(range)))
-                continue
-            end
-
-            if phase == "idle" then
-                local ok = pcall(function() backpack:InformServer("SwingStartAttempt", {}) end)
-                if ok then
-                    swingUntil = now + swingTime * (0.95 + math.random() * 0.1)
-                    phase = "swing"
-                    setChopStatus(("swinging at %s (%dm)"):format(tostring(bestText), math.floor(best)))
-                else
-                    setChopStatus("swing attempt failed")
-                end
-            elseif phase == "swing" and now >= swingUntil then
-                if target.Parent then
-                    local part = nil
-                    if target:IsA("BasePart") then
-                        part = target
-                    else
-                        part = target:FindFirstChildWhichIsA("BasePart") or target:FindFirstChildWhichIsA("BasePart", true)
-                    end
-                    if part then
-                        local pos = part.Position
-                        pcall(function()
-                            backpack:InformServer("AttemptChop", { HitPart = part, HitPosition = pos })
-                        end)
-                    end
-                end
-                phase = "cool"
-                coolUntil = now + 0.25 + math.random() * 0.35
-            elseif phase == "cool" and now >= coolUntil then
-                phase = "idle"
-            end
-        end
-    end))
-end
+-- AUTO CHOP REMOVED (oak-v2): it crashed the live client and its swing
+-- channel (Backpack:InformServer) is server-validated with client self-
+-- reporting - this script no longer sends anything. The recon notes in
+-- the header stay for reference.
 
 -- ============================================================
 -- INFINITE STAMINA  (refill to baseline - never past baseline+50,
@@ -715,48 +595,12 @@ track(task.spawn(function()
 end))
 
 -- ============================================================
--- MOVEMENT  (experimental - server-side validation untested)
+-- MOVEMENT  (experimental block REMOVED in oak-v2)
 -- ============================================================
-local function currentHumanoid()
-    local char = LocalPlayer.Character
-    if not char then return nil end
-    return char:FindFirstChildOfClass("Humanoid")
-end
-
-track(RunService.Heartbeat:Connect(function()
-    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
-    local walkV = tonumber(Config.Movement.WalkSpeed) or 16
-    local jumpV = tonumber(Config.Movement.JumpPower) or 50
-    if walkV == 16 and jumpV == 50 then return end
-    local hum = currentHumanoid()
-    if not hum or hum.Sit or hum.Health <= 0 then return end
-    if walkV ~= 16 then
-        hum.WalkSpeed = walkV
-    end
-    if jumpV ~= 50 then
-        pcall(function()
-            hum.UseJumpPower = true
-            hum.JumpPower = jumpV
-        end)
-    end
-end))
-
-track(UserInputService.JumpRequest:Connect(function()
-    if not Config.Movement.InfJump then return end
-    local hum = currentHumanoid()
-    if hum and hum.Health > 0 and not hum.Sit then
-        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
-    end
-end))
-
-local function applySprint()
-    local v = tonumber(Config.Movement.SprintBoost) or 1
-    if v <= 1.001 then
-        pcall(function() LocalPlayer:SetAttribute("SpeedMultiplier", nil) end)
-    else
-        pcall(function() LocalPlayer:SetAttribute("SpeedMultiplier", v) end)
-    end
-end
+-- Infinite Jump / Walk Speed / Jump Power / Sprint Boost were live-tested:
+-- they work, but the server bans for them eventually. Nothing here writes
+-- humanoid speed, jump power or the SpeedMultiplier attribute anymore -
+-- vanilla is forced at load and the controls are gone from the menu.
 
 -- ============================================================
 -- FULLBRIGHT
@@ -1014,18 +858,7 @@ local function buildMenu()
 
     -- ---------------- Chop ----------------
     section(pc, "Auto Chop")
-    toggle(pc, "Auto Chop",
-        function() return Config.Chop.AutoChop end,
-        function(v)
-            Config.Chop.AutoChop = v
-            notify(v and "Auto chop on - hold an axe" or "Auto chop off")
-        end)
-    slider(pc, "Chop Range",
-        function() return Config.Chop.Range end,
-        function(v) Config.Chop.Range = v end, 1, 0, 25,
-        function(v) return v <= 0 and "tool default" or ("%dm"):format(v) end)
-    chopStatusLabel = note(pc, "Auto chop: off")
-    note(pc, "Swings your axe through the game's own signals - the server still validates range, power and timing like a player's.")
+    note(pc, "Auto Chop was removed in oak-v2: it crashed the live client and its swing channel is server-validated with client self-reporting. Tree ESP still shows you every choppable tree.")
 
     -- ---------------- Movement ----------------
     section(pmv, "Stamina")
@@ -1037,25 +870,7 @@ local function buildMenu()
         end)
     note(pmv, "Refills to your baseline instantly - stays under the game's stamina watch (it only alerts ABOVE baseline+50).")
 
-    section(pmv, "Experimental - server checks untested, keep it subtle")
-    toggle(pmv, "Infinite Jump",
-        function() return Config.Movement.InfJump end,
-        function(v) Config.Movement.InfJump = v end)
-    slider(pmv, "Walk Speed",
-        function() return Config.Movement.WalkSpeed end,
-        function(v) Config.Movement.WalkSpeed = v end, 1, 16, 100,
-        function(v) return v == 16 and "16 (vanilla)" or ("%d"):format(v) end)
-    slider(pmv, "Jump Power",
-        function() return Config.Movement.JumpPower end,
-        function(v) Config.Movement.JumpPower = v end, 5, 50, 200,
-        function(v) return v == 50 and "50 (vanilla)" or ("%d"):format(v) end)
-    slider(pmv, "Sprint Boost",
-        function() return Config.Movement.SprintBoost end,
-        function(v)
-            Config.Movement.SprintBoost = v
-            applySprint()
-        end, 0.05, 1, 2,
-        function(v) return v <= 1.001 and "1.00x (vanilla)" or ("%.2fx"):format(v) end)
+    note(pmv, "Speed / jump features were removed in oak-v2 - live testing showed the server bans for them eventually. Infinite Stamina stays: it never crosses the game's own self-report threshold.")
 
     -- ---------------- Misc ----------------
     section(pmi, "Lighting")
@@ -1116,7 +931,6 @@ end
 -- ============================================================
 -- BOOT
 -- ============================================================
-pcall(applySprint)
 pcall(function()
     if Config.Misc.Fullbright then applyFullbright(true) end
 end)
