@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v19
+    HAVOC HUB - OAKLANDS                           oak-v20
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -42,11 +42,12 @@
         ghosted - being inside a solid part is exactly what the server
         detects (noclip = ban).
       • Wall Phase     - optional, the ban-safe way through walls, works
-        in a vehicle OR on foot: blocked (holding W, barely moving, wall
-        right ahead) -> teleported PAST it - chains several hops in one
-        tick for thick objects and only lands on verified-clear spots
-        with ground below (no random drops). Never left inside solid
-        geometry - same mechanism the game's own store teleports use.
+        in a vehicle OR on foot: W into a wall face -> teleported PAST
+        it (chains hops in one tick for thick objects, only lands on
+        verified-clear spots with ground below). The camera snaps to
+        face forward after each phase so you always see where you land.
+        Never left inside solid geometry - same mechanism the game's
+        own store teleports use.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -109,7 +110,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v19"
+local SCRIPT_VERSION = "oak-v20"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1541,7 +1542,7 @@ local function phaseCar()
         local origin = root.Position + Vector3.new(0, 2, 0)
         local reach = half + 8
         local hit = Workspace:Raycast(origin, flat * (reach + 8), params)
-        if not hit or hit.Distance > reach or hit.Normal.Y > 0.6 then break end
+        if not hit or hit.Distance > reach or hit.Normal.Y > 0.6 or hit.Normal:Dot(flat) > -0.2 then break end
         local step = phaseTryHop(origin, flat, exclude, hit, 3, half + 6, 10)
         if not step then break end
         local ok = pcall(function()
@@ -1552,6 +1553,10 @@ local function phaseCar()
     end
     if total > 0 then
         phasePrint("car", total)
+        pcall(function()
+            local p = root.Position
+            cam.CFrame = CFrame.lookAt(p - flat * (half + 12) + Vector3.new(0, 8, 0), p + Vector3.new(0, 2, 0))
+        end)
     end
 end
 
@@ -1565,8 +1570,6 @@ local function phaseFoot()
     local wHeld = false
     pcall(function() wHeld = UserInputService:IsKeyDown(Enum.KeyCode.W) end)
     if not wHeld then return end
-    local v = hrp.AssemblyLinearVelocity
-    if Vector3.new(v.X, 0, v.Z).Magnitude > 3 then return end
     local cam = Workspace.CurrentCamera
     if not cam then return end
     local look = cam.CFrame.LookVector
@@ -1582,7 +1585,7 @@ local function phaseFoot()
     for _ = 1, 4 do
         local origin = hrp.Position
         local hit = Workspace:Raycast(origin, flat * 7, params)
-        if not hit or hit.Distance > 5.5 or hit.Normal.Y > 0.6 then break end
+        if not hit or hit.Distance > 5.5 or hit.Normal.Y > 0.6 or hit.Normal:Dot(flat) > -0.2 then break end
         local step = phaseTryHop(origin, flat, exclude, hit, 2.5, 3, 6)
         if not step then break end
         local ok = pcall(function()
@@ -1593,6 +1596,10 @@ local function phaseFoot()
     end
     if total > 0 then
         phasePrint("foot", total)
+        pcall(function()
+            local p = hrp.Position
+            cam.CFrame = CFrame.lookAt(p - flat * 13 + Vector3.new(0, 6, 0), p + Vector3.new(0, 2, 0))
+        end)
     end
 end
 
