@@ -36,10 +36,11 @@
         strafe, Space/Shift up, LeftCtrl down, neutral hovers (gravity
         compensated). Roll/pitch is locked so the car cannot capsize -
         pull a flip and it rights itself. While flying the wheels are
-        switched off (nocollide + massless, the same treatment the
-        teleport uses) so they never fight the hover physics or glitch
-        after a jump. Direct velocity + angular writes on your own
-        vehicle - cars work best. Off by default.
+        locked rigid to the car (nocollide + massless + frame-glued,
+        velocities pinned) so the game's own wheel drive can't spin or
+        knock them and they never fight the hover or glitch after a
+        jump. Direct velocity + angular writes on your own vehicle -
+        cars work best. Off by default.
       • Freecam        - built in: toggles on a rebindable key
         (default RightCtrl - Camera section row; the toggle shows the
         live key chip), WASD flies, mouse looks, Space/LeftCtrl
@@ -131,7 +132,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v37"
+local SCRIPT_VERSION = "oak-v38"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1421,8 +1422,8 @@ local function vehicleFlyStep(dt)
         if flyWheelRestoreAll then pcall(flyWheelRestoreAll) end
         return
     end
-    -- wheels off while flying - same treatment as the teleport, so they
-    -- never fight the hover physics or glitch after a jump
+    -- wheels locked rigid to the car while flying - nocollide + massless
+    -- + glued, so the game's own wheel drive cannot spin or knock them
     if flyWheelApply then pcall(flyWheelApply, seat) end
     local root = seat.AssemblyRootPart or seat
     local speed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
@@ -1854,22 +1855,12 @@ local function findWheelParts(scope)
     return wheelParts
 end
 
--- Vehicle Fly wheel freeze (oak-v37): while flying, the wheels get the
--- exact treatment the teleport uses - nocollide + massless - so they
--- never fight the hover physics or glitch after a jump. Restored the
--- moment fly ends or you dismount.
-local function flyWheelTopModel(seat)
-    local top = seat
-    local cur = seat.Parent
-    while cur and cur ~= Workspace do
-        if cur:IsA("Model") then
-            top = cur
-        end
-        cur = cur.Parent
-    end
-    return top
-end
-
+-- Vehicle Fly wheel lock (oak-v38): while flying, the wheels get glued
+-- rigid to the car - nocollide + massless + frame-snapped to the offset
+-- captured when fly started, velocities pinned at zero - so nothing
+-- (not even the game's own wheel drive) can spin, bounce or rubber-band
+-- them while the car hovers. Restored the moment fly ends or you
+-- dismount.
 flyWheelRestoreAll = function()
     local job = VEH_STATE.flyWheelJob
     if not job then return end
@@ -1889,13 +1880,31 @@ end
 
 flyWheelApply = function(seat)
     local job = VEH_STATE.flyWheelJob
-    if job and job.seat == seat and job.model and job.model.Parent then
-        for p in pairs(job.state) do
-            if p.Parent and p.CanCollide then
-                pcall(function()
-                    p.CanCollide = false
-                    p.Massless = true
-                end)
+    if job and job.seat == seat and job.model and job.model.Parent and job.root and job.root.Parent then
+        -- keep them locked every frame: nocollide + massless, glued to
+        -- the car, velocities pinned at zero
+        local rc = job.root.CFrame
+        for p, st in pairs(job.state) do
+            if p.Parent and not p.Anchored and p.AssemblyRootPart ~= job.root then
+                if p.CanCollide then
+                    pcall(function()
+                        p.CanCollide = false
+                        p.Massless = true
+                    end)
+                end
+                if not st.off then
+                    st.off = rc:Inverse() * p.CFrame
+                end
+                local want = rc * st.off
+                local dpos = (p.Position - want.Position).Magnitude
+                local dlook = (p.CFrame.LookVector - want.LookVector).Magnitude
+                if dpos > 0.02 or dlook > 0.02 then
+                    pcall(function()
+                        p.CFrame = want
+                        p.AssemblyLinearVelocity = Vector3.zero
+                        p.AssemblyAngularVelocity = Vector3.zero
+                    end)
+                end
             end
         end
         return
@@ -1903,22 +1912,35 @@ flyWheelApply = function(seat)
     if job then
         flyWheelRestoreAll()
     end
-    local scope = flyWheelTopModel(seat)
+    local ch = LocalPlayer.Character
+    local scope = nil
+    local okScope = pcall(function()
+        local list, seen = collectVehicleParts(seat)
+        augmentVehicleParts(list, seen, seat, ch)
+        scope = commonVehicleModel(seat, list, ch)
+    end)
+    if not okScope or not scope then
+        scope = seat:FindFirstAncestorOfClass("Model")
+    end
     local wheels = findWheelParts(scope)
     if #wheels == 0 then return end
+    local root = seat.AssemblyRootPart or seat
     local state, count = {}, 0
     for _, p in ipairs(wheels) do
-        local ok = pcall(function()
-            state[p] = { cc = p.CanCollide, ml = p.Massless }
-            p.CanCollide = false
-            p.Massless = true
-        end)
-        if ok then count = count + 1 end
+        if not p.Anchored and p.AssemblyRootPart ~= root then
+            local ok = pcall(function()
+                state[p] = { cc = p.CanCollide, ml = p.Massless, off = root.CFrame:Inverse() * p.CFrame }
+                p.CanCollide = false
+                p.Massless = true
+                p.AssemblyLinearVelocity = Vector3.zero
+                p.AssemblyAngularVelocity = Vector3.zero
+            end)
+            if ok then count = count + 1 end
+        end
     end
-    VEH_STATE.flyWheelJob = { seat = seat, model = scope, state = state, count = count }
-    if count > 0 then
-        print(("[oaklands] fly: wheels disabled (%d) - nocollide + massless until you stop flying"):format(count))
-    end
+    if count == 0 then return end
+    VEH_STATE.flyWheelJob = { seat = seat, model = scope, root = root, state = state, count = count }
+    print(("[oaklands] fly: wheels locked (%d) - nocollide + massless + glued until you stop flying"):format(count))
 end
 
 local function cameraTeleport()
@@ -2334,7 +2356,7 @@ pcall(function()
         end
     end
 end)
--- leftover fly wheel freeze from an old build: give the wheels back
+-- leftover fly wheel lock from an old build: give the wheels back
 pcall(function()
     if VEH_STATE.flyWheelJob and flyWheelRestoreAll then
         flyWheelRestoreAll()
