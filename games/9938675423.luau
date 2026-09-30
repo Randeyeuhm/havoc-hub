@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v10
+    HAVOC HUB - OAKLANDS                           oak-v11
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -26,6 +26,12 @@
         detected and crashed the client. Experimental speed / jump in
         oak-v2: the server bans for movement changes. Nothing in this
         script writes stamina, speed or jump state anymore.)
+      • Vehicle Speed  - the DRIVER's client simulates cars (the game's
+        own wheel code reads Seat.MaxSpeed * throttle live), so this
+        multiplies the seat's MaxSpeed + Torque locally: cars, barrows
+        and planes go faster. Slider 1-25x, off by default. Character
+        movement untouched; server vehicle checks unknown - throwaway
+        mindset.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -79,7 +85,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v10"
+local SCRIPT_VERSION = "oak-v11"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -151,6 +157,10 @@ local DEFAULTS = {
         Strength = 1,    -- multiplier on the live drag forces
         Throw    = 1,    -- multiplier on the classic dragger's G-throw impulse
     },
+    Vehicle = {
+        Enabled = false,
+        Mult    = 3,     -- multiplier on VehicleSeat MaxSpeed + Torque
+    },
     Misc = {
         Fullbright          = false,
         FullbrightIntensity = 190,
@@ -206,6 +216,7 @@ Config.Movement.SprintBoost = 1
 Config.Drag.Reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
 Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 100000)
 Config.Drag.Throw = math.clamp(tonumber(Config.Drag.Throw) or 1, 1, 100000)
+Config.Vehicle.Mult = math.clamp(tonumber(Config.Vehicle.Mult) or 3, 1, 25)
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
 
 local function saveConfig()
@@ -1016,6 +1027,71 @@ track(task.spawn(function()
 end))
 
 -- ============================================================
+-- VEHICLE SPEED  (client-side; the DRIVER simulates the vehicle)
+-- ============================================================
+-- The game's own driver module (/ReplicatedFirst/Client/GUI/Vehicle)
+-- computes every wheel from  Seat.MaxSpeed * CurrentThrottle * SpeedMultiplier
+-- (barrows: direct AssemblyLinearVelocity on the same formula; airplane:
+-- (Seat.MaxSpeed * SpeedMultiplier) * 3) - all read LIVE off the
+-- VehicleSeat instance. So a local (never-replicated) write to the seat we
+-- are sitting in is the speed knob; Torque goes up with it so the car can
+-- actually reach the new top speed. Character movement is untouched.
+local VEH_STATE = genv.__HAVOC_OAKLANDS_VEH
+if type(VEH_STATE) ~= "table" then
+    VEH_STATE = {}
+    genv.__HAVOC_OAKLANDS_VEH = VEH_STATE
+end
+if type(VEH_STATE.saved) ~= "table" then
+    VEH_STATE.saved = setmetatable({}, { __mode = "k" })
+end
+
+local function restoreVehicleSpeed()
+    for seat, orig in pairs(VEH_STATE.saved) do
+        if seat.Parent then
+            pcall(function()
+                seat.MaxSpeed = orig.MaxSpeed
+                seat.Torque = orig.Torque
+            end)
+        end
+        VEH_STATE.saved[seat] = nil
+    end
+end
+
+local function vehicleStep()
+    if not Config.Vehicle.Enabled then
+        if next(VEH_STATE.saved) ~= nil then
+            restoreVehicleSpeed()
+        end
+        return
+    end
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local seat = hum and hum.SeatPart
+    if not seat or not seat:IsA("VehicleSeat") then return end
+    local saved = VEH_STATE.saved[seat]
+    if saved == nil then
+        saved = { MaxSpeed = tonumber(seat.MaxSpeed) or 0, Torque = tonumber(seat.Torque) or 0 }
+        VEH_STATE.saved[seat] = saved
+        print(("[oaklands] vehicle captured: MaxSpeed %d / Torque %d"):format(math.floor(saved.MaxSpeed), math.floor(saved.Torque)))
+    end
+    local mult = math.clamp(tonumber(Config.Vehicle.Mult) or 1, 1, 25)
+    pcall(function()
+        seat.MaxSpeed = saved.MaxSpeed * mult
+        seat.Torque = saved.Torque * mult
+    end)
+end
+
+track(task.spawn(function()
+    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
+        task.wait(0.5)
+        pcall(vehicleStep)
+    end
+end))
+pcall(function()
+    if not Config.Vehicle.Enabled then restoreVehicleSpeed() end
+end)
+
+-- ============================================================
 -- MOVEMENT  (experimental block REMOVED in oak-v2)
 -- ============================================================
 -- Infinite Jump / Walk Speed / Jump Power / Sprint Boost were live-tested:
@@ -1298,6 +1374,18 @@ local function buildMenu()
             if v >= 100 then return ("%dx"):format(math.floor(v + 0.5)) end
             return ("%.2fx"):format(v)
         end)
+    section(pmv, "Vehicles")
+    toggle(pmv, "Vehicle Speed",
+        function() return Config.Vehicle.Enabled end,
+        function(v)
+            Config.Vehicle.Enabled = v
+            if not v then restoreVehicleSpeed() end
+            notify(v and "Vehicle speed on" or "Vehicles back to vanilla")
+        end)
+    slider(pmv, "Speed Multiplier",
+        function() return Config.Vehicle.Mult end,
+        function(v) Config.Vehicle.Mult = v end, 0.5, 1, 25,
+        function(v) return v <= 1.001 and "1.00x (vanilla)" or ("%.1fx"):format(v) end)
     -- ---------------- Misc ----------------
     section(pmi, "Lighting")
     toggle(pmi, "Fullbright",
