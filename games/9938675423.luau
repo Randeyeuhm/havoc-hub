@@ -36,12 +36,12 @@
         strafe, Space/Shift up, LeftCtrl down, neutral hovers (gravity
         compensated). Roll/pitch is locked so the car cannot capsize -
         pull a flip and it rights itself. While flying the wheels are
-        fully removed (hidden, nocollide + massless + glued, chassis
-        joints cut) AND the seat's own drive is muted (seat disabled,
-        throttle/steer pinned neutral) - with no drivetrain left,
-        nothing can push the car under the hover. All restored when
-        fly ends. Direct velocity + angular writes on your own
-        vehicle - cars work best. Off by default.
+        held off the car (nocollide + massless + glued, chassis joints
+        cut; they stay visible) AND the seat's drive is muted
+        (throttle/steer neutral, MaxSpeed/Torque zeroed - seat.Disabled
+        is never touched, it ejects the driver). All restored when fly
+        ends. Direct velocity + angular writes on your own vehicle -
+        cars work best. Off by default.
       • Freecam        - built in: toggles on a rebindable key
         (default RightCtrl - Camera section row; the toggle shows the
         live key chip), WASD flies, mouse looks, Space/LeftCtrl
@@ -135,7 +135,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v42"
+local SCRIPT_VERSION = "oak-v43"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1419,13 +1419,15 @@ local flySeatRestore = nil
 -- back. Gravity baseline shows as ~-gravity*dt on Y.
 local flyLastV, flyLastAV, flyDiagAt = nil, nil, 0
 
--- Vehicle Fly drivetrain mute (oak-v42): with the wheels fully removed
--- the car STILL caught weird forces - the driver left is the game
--- itself. Your WASD reaches the seat too, and the seat engine plus the
--- game's own vehicle module keep reacting to it, pushing the chassis
--- around under the hover. While flying the seat goes Disabled and
--- throttle / steer stay pinned neutral (the fly keys are read straight
--- from UserInputService, so flying still works). Restored when fly ends.
+-- Vehicle Fly drivetrain mute (oak-v42, fixed v43): the car caught
+-- weird forces because the game itself keeps driving - your WASD
+-- reaches the seat, and the seat engine plus the game's own vehicle
+-- module react to it under the hover. While flying: throttle/steer
+-- pinned neutral + MaxSpeed/Torque zeroed (the game computes wheel
+-- speed from MaxSpeed * throttle, the seat motor uses Torque). NEVER
+-- seat.Disabled - a disabled seat EJECTS its occupant ("cant even stay
+-- seated", oak-v42 bug). The fly keys are read straight from
+-- UserInputService, so flying still works. Restored when fly ends.
 local FLY_SEAT_SAVED = VEH_STATE.seatKill
 if type(FLY_SEAT_SAVED) ~= "table" then
     FLY_SEAT_SAVED = setmetatable({}, { __mode = "k" })
@@ -1439,16 +1441,17 @@ flySeatKill = function(seat)
             rec.disabled = seat.Disabled
             rec.tf = seat.ThrottleFloat
             rec.sf = seat.SteerFloat
+            rec.ms = seat.MaxSpeed
+            rec.tq = seat.Torque
         end)
         FLY_SEAT_SAVED[seat] = rec
-        print("[oaklands] fly: drivetrain muted (seat disabled, throttle/steer pinned neutral)")
-    end
-    if seat.Disabled ~= true then
-        pcall(function() seat.Disabled = true end)
+        print("[oaklands] fly: drivetrain muted (throttle/steer neutral, MaxSpeed/Torque zeroed)")
     end
     pcall(function()
         if seat.ThrottleFloat ~= 0 then seat.ThrottleFloat = 0 end
         if seat.SteerFloat ~= 0 then seat.SteerFloat = 0 end
+        if seat.MaxSpeed ~= 0 then seat.MaxSpeed = 0 end
+        if seat.Torque ~= 0 then seat.Torque = 0 end
     end)
 end
 flySeatRestore = function()
@@ -1461,6 +1464,8 @@ flySeatRestore = function()
                 seat.Disabled = rec.disabled
                 seat.ThrottleFloat = rec.tf
                 seat.SteerFloat = rec.sf
+                if rec.ms ~= nil then seat.MaxSpeed = rec.ms end
+                if rec.tq ~= nil then seat.Torque = rec.tq end
             end
         end)
     end
@@ -1485,8 +1490,8 @@ local function vehicleFlyStep(dt)
         if flySeatRestore then pcall(flySeatRestore) end
         return
     end
-    -- wheels fully removed + the seat's own drive muted while flying, so
-    -- nothing - wheels or engine - can push the car under the hover
+    -- wheels held off the car + the seat's own drive muted while flying,
+    -- so nothing - wheels or engine - can push the car under the hover
     if flySeatKill then pcall(flySeatKill, seat) end
     if flyWheelApply then pcall(flyWheelApply, seat) end
     local root = seat.AssemblyRootPart or seat
@@ -1937,20 +1942,20 @@ local function findWheelParts(scope)
     return wheelParts
 end
 
--- Vehicle Fly wheel removal (oak-v41): while flying, the wheels are
--- GONE - every matched wheel part plus its BasePart children (the
--- cylinder pieces) is hidden (Transparency 1, decals/textures hidden,
--- wheel emitters off), nocollide + massless, glued rigid to the car,
+-- Vehicle Fly wheel hold (oak-v41, visible again in v43): while
+-- flying, every matched wheel part plus its BasePart children (the
+-- cylinder pieces) goes nocollide + massless, glued rigid to the car,
 -- and every joint that crosses between a wheel and the chassis is cut.
 -- A joint fully inside a wheel stays (it keeps the wheel pieces
 -- together). Wheels still rigid-welded INTO the car's assembly can't
 -- be toggled (a weld has no off switch) - the console counts any such
--- rigid link so we know if one remains. Everything is restored the
--- moment fly ends or you dismount. History: glued wheels alone still
--- fed velocity into the body through live joints ("the wheels give
--- the body velocity when i fly") - the joint solver resolves
--- glued-vs-joint contradictions with impulses on BOTH sides, one of
--- them being your car.
+-- rigid link. v41-v42 also hid the wheels; that is reverted (they stay
+-- VISIBLE) - hidden leftovers from an old build still restore
+-- correctly through the tr/kids records. History: glued wheels with
+-- live joints fed velocity into the body ("the wheels give the body
+-- velocity when i fly") - the joint solver resolves glued-vs-joint
+-- contradictions with impulses on BOTH sides, one of them being your
+-- car. Everything is restored the moment fly ends or you dismount.
 flyWheelRestoreAll = function()
     local job = VEH_STATE.flyWheelJob
     if not job then return end
@@ -2070,30 +2075,15 @@ flyWheelApply = function(seat)
             end
         end
     end
-    -- hide + neutralize every wheel part (oak-v41 "full remove":
-    -- the part, its decals/textures and wheel emitters all go away;
-    -- nocollide + massless on top). Separate-assembly wheels also get
-    -- a glue anchor below.
+    -- neutralize every wheel part (nocollide + massless; no hiding -
+    -- v43 keeps them visible). Separate-assembly wheels also get a
+    -- glue anchor below.
     local state, count = {}, 0
     for _, p in ipairs(wheelList) do
         local ok = pcall(function()
-            state[p] = { cc = p.CanCollide, ml = p.Massless, tr = p.Transparency }
+            state[p] = { cc = p.CanCollide, ml = p.Massless }
             p.CanCollide = false
             p.Massless = true
-            p.Transparency = 1
-            local kids = nil
-            for _, c in ipairs(p:GetChildren()) do
-                if c:IsA("Decal") or c:IsA("Texture") then
-                    kids = kids or {}
-                    kids[#kids + 1] = { c = c, tr = c.Transparency }
-                    c.Transparency = 1
-                elseif c:IsA("ParticleEmitter") or c:IsA("Fire") or c:IsA("Smoke") then
-                    kids = kids or {}
-                    kids[#kids + 1] = { c = c, en = c.Enabled }
-                    c.Enabled = false
-                end
-            end
-            if kids then state[p].kids = kids end
         end)
         if ok then count = count + 1 end
     end
@@ -2178,7 +2168,7 @@ flyWheelApply = function(seat)
     end
     VEH_STATE.flyWheelJob = { seat = seat, model = scope, root = root, state = state, count = count, cons = cons }
     local rigidNote = rigidLeft > 0 and (", " .. rigidLeft .. " rigid weld(s) left") or ""
-    print(("[oaklands] fly: wheels removed (%d parts, %d joints cut%s) - hidden + glued until you stop flying"):format(count, #cons, rigidNote))
+    print(("[oaklands] fly: wheels held off the car (%d parts, %d joints cut%s) - nocollide + massless + glued until you stop flying"):format(count, #cons, rigidNote))
 end
 
 local function cameraTeleport()
