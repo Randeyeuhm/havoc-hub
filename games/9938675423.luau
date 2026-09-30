@@ -50,8 +50,8 @@
         hovers instead of fighting the camera; every exit path (toggle
         off, death, cam teleport) hands the mouse back unlocked.
       • Cam Teleport   - optional: sit in a vehicle, fly the freecam
-        to a spot, press T - the WHOLE vehicle (wheels and cargo
-        included) and you teleport straight there. Collection walks
+        to a spot, press T - the WHOLE vehicle (wheels included) and
+        you teleport straight there. Collection walks
         the joint graph,
         sweeps the rig model + attachment reverse-lookups, and picks
         wheels up by NAME (FL/FR/BL/BR corner names + anything called
@@ -63,20 +63,7 @@
         be >20 studs away so the chase cam can never trigger it. A beat
         after landing the freecam drops so you SEE where it landed.
         Console prints parts / assemblies / wheels + jump ms + a settle
-        line; settle re-asserts re-pin the car only, so cargo (glued by
-        the wood lock) no longer stutters the jump. Same class of
-        teleport as the store warps.
-      • Wood Lock      - automatic cargo lock: while you are seated in a
-        vehicle, loose wood (logs / planks / lumber) on or in it is
-        glued to the chassis by re-applying its car-relative offset
-        (massless + non-colliding while held), so it cannot slide off,
-        fall out or tip the truck. ONLY completely free pieces are
-        locked - anything with any joint/constraint (rack rails, a
-        trailer, a piece you are carrying) is skipped: gluing a rigged
-        piece makes it fight the car every frame (that was the "car
-        wobbles + fly loses speed" bug). No welds - the car's own
-        physics is never touched. Releases when you hop out or a piece
-        is taken away.
+        line. Same class of teleport as the store warps.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -139,7 +126,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v45"
+local SCRIPT_VERSION = "oak-v46"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1742,7 +1729,7 @@ end))
 -- back ("teleports half way"). Instead of trusting model names, walk
 -- the JOINT GRAPH out from the seat (oak-v23): welds, weld-constraints
 -- and constraint attachments lead to every part of the rig - body,
--- wheels, cargo, the character - whatever the live game calls them.
+-- wheels - whatever the live game calls them.
 local function jointNeighbors(part)
     local out, added = {}, {}
     local function push(p)
@@ -1894,16 +1881,6 @@ local function augmentVehicleParts(list, seen, seat, ch)
         if ok and descs then
             for _ = 1, 4 do
                 if not sweepPass(descs) then break end
-            end
-            -- cargo catch-all: every part inside the rig model comes
-            -- along - wood loaded in a truck bed is parented to the
-            -- vehicle but NOT jointed to it, so only the model boundary
-            -- can catch it (reported live: trunk wood stayed behind)
-            for _, p in ipairs(descs) do
-                if p:IsA("BasePart") and not seen[p]
-                    and not (ch and p:IsDescendantOf(ch)) then
-                    add(p)
-                end
             end
         end
     end
@@ -2289,8 +2266,7 @@ local function cameraTeleport()
     if #parts == 0 then parts[1] = root end
     -- land ON the ground, not floating at camera height (oak-v36): find
     -- what is under the target point and slide it up so the car rests
-    -- just above it. The old sky-drop was why teleports with cargo could
-    -- tip the car on landing.
+    -- just above it. The old sky-drop could tip the car on landing.
     do
         local minY = nil
         for _, p in ipairs(parts) do
@@ -2320,7 +2296,6 @@ local function cameraTeleport()
     end
     -- one CFrame write per unique assembly (setting one part moves its
     -- whole rigid assembly - a second write would double-move it).
-    -- Locked wood rides along with the rest.
     local function tpApply()
         local shift = landPos - root.Position
         if shift.Magnitude < 0.5 then return 0, 0 end
@@ -2340,10 +2315,9 @@ local function cameraTeleport()
         return cnt, fls
     end
     -- settle re-assert (oak-v39): only the car + wheels get re-pinned -
-    -- cargo follows on the wood-lock glue, everything else rides its
-    -- constraints. Re-teleporting the whole parts list at 10/s was the
-    -- "teleport with wood lags for ages" stutter: every log was one
-    -- more assembly teleport per re-assert.
+    -- everything else rides its constraints. Re-teleporting the whole
+    -- parts list at 10/s was the "long lag after a big jump" stutter:
+    -- every extra assembly was one more teleport per re-assert.
     local reassertAnchors = { root }
     for _, p in ipairs(wheelParts) do
         reassertAnchors[#reassertAnchors + 1] = p
@@ -2378,8 +2352,8 @@ local function cameraTeleport()
     -- pin the car where it landed for a moment in case anything (server
     -- replication, physics wake-up, streaming) tries to drag it back;
     -- the settle line is the evidence when something persistent fights.
-    -- oak-v39: re-asserts use tpReassert (car + wheels only) - cargo
-    -- rides the wood-lock glue instead of a full parts re-teleport
+    -- oak-v39: re-asserts use tpReassert (car + wheels only) instead
+    -- of a full parts re-teleport
     TP_JOB = { root = root, landPos = landPos, apply = tpReassert, wheels = wheelState, nextAt = 0, doneAt = os.clock() + 0.4, hardDoneAt = os.clock() + 1.0, applies = 1 }
     if FREE.on then
         pcall(freecamOff)  -- camera back on you, so you SEE where it landed
@@ -2415,7 +2389,7 @@ track(RunService.Heartbeat:Connect(function()
         end
         -- re-asserts are throttled to 10/s: enough to beat physics
         -- settling without burning the solver every frame (that WAS
-        -- the cargo teleport lag)
+        -- the teleport lag)
         if drift > 6 and job.applies < 30 and os.clock() >= (job.nextAt or 0) then
             job.apply()
             job.applies = job.applies + 1
@@ -2438,40 +2412,18 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end))
 
 -- ============================================================
--- WOOD LOCK (oak-v34) - while you are seated in a vehicle, loose wood
--- (logs / planks / lumber) on or in it is glued to the chassis: its
--- car-relative offset is measured once and re-applied every frame
--- (plus massless), so cargo can't slide off, fall out or tip the
--- truck. NO welds and NO assembly merges - the v33 weld version could
--- flip the car's network ownership to the server when the game
--- re-owned the merged assembly, which left the car acting anchored /
--- un-drivable. This one never touches the car's own physics.
--- oak-v45: ONLY completely free pieces get locked (no joints, no
--- constraints, not being carried) - gluing a rigged piece made it
--- fight the car through its own attachment every frame = the car
--- wobbled and lost ~55% of its speed per frame while flying with a
--- load (fly stuck at ~110 of 500 studs/s in the live diag).
--- Releases on dismount, re-exec, or when a piece is taken away.
+-- WOOD LOCK - REMOVED (oak-v46, per request: back to plain car
+-- teleporting - no cargo / trunk-item handling anymore). The cargo
+-- lock could fight a rigged piece on some rigs (wobble + speed loss
+-- while flying), so the whole feature is gone.
 -- ============================================================
-local WOODLOCK = genv.__HAVOC_OAKLANDS_WOODLOCK
-if type(WOODLOCK) == "table" then
-    -- clean leftovers from an older run (weld builds / stale items)
-    pcall(function()
-        if type(WOODLOCK.welds) == "table" then
-            for _, w in ipairs(WOODLOCK.welds) do
-                pcall(function()
-                    if w and w.Parent then
-                        local p = w.Part0
-                        if p and type(WOODLOCK.mass) == "table" and WOODLOCK.mass[p] ~= nil then
-                            p.Massless = WOODLOCK.mass[p]
-                        end
-                        w:Destroy()
-                    end
-                end)
-            end
-        end
-        if type(WOODLOCK.items) == "table" then
-            for p, st in pairs(WOODLOCK.items) do
+-- one-time cleanup: pieces locked by an older build still sit at
+-- Massless / no-collide - give their physics back
+pcall(function()
+    local oldWL = genv.__HAVOC_OAKLANDS_WOODLOCK
+    if type(oldWL) == "table" then
+        if type(oldWL.items) == "table" then
+            for p, st in pairs(oldWL.items) do
                 pcall(function()
                     if p.Parent and st then
                         if st.massless ~= nil then p.Massless = st.massless end
@@ -2480,182 +2432,28 @@ if type(WOODLOCK) == "table" then
                 end)
             end
         end
-    end)
-end
-WOODLOCK = { items = setmetatable({}, { __mode = "k" }) }
-genv.__HAVOC_OAKLANDS_WOODLOCK = WOODLOCK
-
-local function woodUnlockAll()
-    local count = 0
-    for p, st in pairs(WOODLOCK.items) do
-        WOODLOCK.items[p] = nil
-        count = count + 1
-        pcall(function()
-            if p.Parent and st then
-                if st.massless ~= nil then p.Massless = st.massless end
-                if st.collide ~= nil then p.CanCollide = st.collide end
-            end
-        end)
-    end
-    if count > 0 then
-        print(("[oaklands] wood lock: released %d piece(s)"):format(count))
-    end
-end
-
-local function isWoodName(nm)
-    return string.find(nm, "log", 1, true) ~= nil
-        or string.find(nm, "wood", 1, true) ~= nil
-        or string.find(nm, "timber", 1, true) ~= nil
-        or string.find(nm, "plank", 1, true) ~= nil
-        or string.find(nm, "lumber", 1, true) ~= nil
-end
-
--- oak-v45: a piece is "rigged" if ANY joint or constraint touches it:
--- welds/motors on the part, constraint attachments (hinges, springs,
--- ball sockets - the game racks/hitches, or the dragger holding it).
--- Locking a rigged piece glues it while its own attachment pulls on
--- the car every frame - the car wobbles and the fly loses huge chunks
--- of speed. Only completely free pieces are ever locked.
-local function pieceIsJointed(p)
-    local okj, joints = pcall(function() return p:GetJoints() end)
-    if okj and joints and #joints > 0 then return true end
-    for _, c in ipairs(p:GetChildren()) do
-        if c:IsA("JointInstance") or c:IsA("Constraint") or c:IsA("WeldConstraint") then
-            return true
-        end
-    end
-    local okD, descs = pcall(function() return p:GetDescendants() end)
-    if okD and descs then
-        for _, d in ipairs(descs) do
-            if d:IsA("Attachment") then
-                local okP, c = pcall(function() return d.ParentConstraint end)
-                if okP and c then return true end
-            end
-        end
-    end
-    return false
-end
-
-local function woodLockStep()
-    local ch = LocalPlayer.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local seat = hum and hum.SeatPart
-    if not (seat and seat:IsA("VehicleSeat")) then
-        woodUnlockAll()
-        return
-    end
-    local root = seat.AssemblyRootPart or seat
-    -- release pieces that are gone or being taken away by the game
-    for p, st in pairs(WOODLOCK.items) do
-        local drop = not p.Parent
-        if not drop then
-            local okD, want = pcall(function()
-                return (root.CFrame * st.off).Position
-            end)
-            if not okD or (p.Position - want).Magnitude > 15 then
-                drop = true
-            end
-        end
-        if not drop and pieceIsJointed(p) then
-            drop = true  -- rigged mid-hold (grabbed, strapped...): not our cargo
-        end
-        if drop then
-            WOODLOCK.items[p] = nil
-            pcall(function()
-                if p.Parent and st then
-                    if st.massless ~= nil then p.Massless = st.massless end
-                    if st.collide ~= nil then p.CanCollide = st.collide end
-                end
-            end)
-        end
-    end
-    -- find new wood on / in the rig (soft-locked by offset, not welded).
-    -- oak-v45: only completely FREE pieces (no joint/constraint, not
-    -- being carried) - a rigged piece that gets glued fights the car
-    -- through its own attachment (the wobble + speed loss with a load).
-    -- The rig model is cached per seat - the BFS + ancestor walk only
-    -- re-runs when the seat changes or the cached model goes away.
-    local scope = nil
-    local cached = WOODLOCK.scope
-    if cached and cached.seat == seat and cached.model and cached.model.Parent then
-        scope = cached.model
-    else
-        local vparts = collectVehicleParts(seat)
-        scope = commonVehicleModel(seat, vparts, ch) or seat:FindFirstAncestorOfClass("Model")
-        if scope then
-            WOODLOCK.scope = { seat = seat, model = scope }
-        end
-    end
-    if not scope then return end
-    local ok, descs = pcall(function() return scope:GetDescendants() end)
-    if not ok or not descs then return end
-    local added, skipped = 0, 0
-    for _, p in ipairs(descs) do
-        if p:IsA("BasePart") and not p.Anchored
-            and not (ch and p:IsDescendantOf(ch))
-            and not WOODLOCK.items[p]
-            and p.AssemblyRootPart ~= root
-            and isWoodName(string.lower(p.Name)) then
-            if pieceIsJointed(p) then
-                skipped = skipped + 1
-            else
-                local okL = pcall(function()
-                    WOODLOCK.items[p] = {
-                        off = root.CFrame:Inverse() * p.CFrame,
-                        massless = p.Massless,
-                        collide = p.CanCollide,
-                    }
-                    p.Massless = true
-                    p.CanCollide = false   -- held cargo: no contacts = no solver spikes
+        if type(oldWL.welds) == "table" then
+            for _, w in ipairs(oldWL.welds) do
+                pcall(function()
+                    if w and w.Parent then
+                        local p = w.Part0
+                        if p and type(oldWL.mass) == "table" and oldWL.mass[p] ~= nil then
+                            p.Massless = oldWL.mass[p]
+                        end
+                        w:Destroy()
+                    end
                 end)
-                if okL then added = added + 1 end
             end
         end
+        genv.__HAVOC_OAKLANDS_WOODLOCK = nil
     end
-    if added > 0 then
-        print(("[oaklands] wood lock: %d piece(s) locked to the vehicle"):format(added))
-    end
-    if skipped > 0 and WOODLOCK.lastSkipped ~= skipped then
-        WOODLOCK.lastSkipped = skipped
-        print(("[oaklands] wood lock: skipped %d attached piece(s) - only completely free cargo is locked"):format(skipped))
-    elseif skipped == 0 then
-        WOODLOCK.lastSkipped = nil
-    end
-end
+end)
 
--- hold the locked wood on the car every frame (cheap - only touches wood)
-track(RunService.RenderStepped:Connect(function()
-    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
-    if next(WOODLOCK.items) == nil then return end
-    pcall(function()
-        local ch = LocalPlayer.Character
-        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-        local seat = hum and hum.SeatPart
-        if not (seat and seat:IsA("VehicleSeat")) then
-            woodUnlockAll()
-            return
-        end
-        local root = seat.AssemblyRootPart or seat
-        for p, st in pairs(WOODLOCK.items) do
-            if p.Parent then
-                local want = root.CFrame * st.off
-                -- only write when it actually drifted (parked car = zero
-                -- writes); massless + no-collide cargo makes each write
-                -- cheap and contact-free
-                if (p.Position - want.Position).Magnitude > 0.02 then
-                    p.CFrame = want
-                end
-            end
-        end
-    end)
-end))
 
-track(task.spawn(function()
-    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
-        task.wait(1)
-        pcall(woodLockStep)
-    end
-end))
+
+
+
+
 
 track(task.spawn(function()
     while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
