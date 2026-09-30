@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - OAKLANDS                           oak-v7
+    HAVOC HUB - OAKLANDS                           oak-v8
     ============================================================
 
     PlaceId 9938675423  ·  GameId 3666294218  ·  loader hands this in
@@ -43,6 +43,12 @@
                               module reuses ONE pair for every drag; the
                               strength slider multiplies it up to 1000x,
                               final force clamped at 1e9 to stay sane)
+                            * throw - extra impulse on the G-throw equal
+                              to (multiplier-1) x the game's own impulse,
+                              applied at the same spot/direction one
+                              frame after release (the throw is an
+                              inlined closure - it can't be scaled from
+                              inside). Needs Enhanced Drag on.
                           Console prints a scan line on toggle. Pure client
                           physics of a drag the server already granted - no
                           packets. Server checks on dragging are unknown:
@@ -71,7 +77,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v7"
+local SCRIPT_VERSION = "oak-v8"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -141,6 +147,7 @@ local DEFAULTS = {
         Enhanced = false,
         Reach    = 12,   -- studs (vanilla 12 = DefaultMaxDragDistance)
         Strength = 1,    -- multiplier on the live drag forces
+        Throw    = 1,    -- multiplier on the classic dragger's G-throw impulse
     },
     Misc = {
         Fullbright          = false,
@@ -196,6 +203,7 @@ Config.Movement.JumpPower = 50
 Config.Movement.SprintBoost = 1
 Config.Drag.Reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
 Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 1000)
+Config.Drag.Throw = math.clamp(tonumber(Config.Drag.Throw) or 1, 1, 1000)
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
 
 local function saveConfig()
@@ -843,6 +851,169 @@ track(task.spawn(function()
 end))
 
 -- ============================================================
+-- THROW BOOST  (multiplies the classic dragger's G-throw)
+-- ============================================================
+-- Holding G (or ButtonY) while dragging charges a throw; on release the
+-- module applies an impulse of
+--   u2 * 700 * (max(modelMass, 30) / 75)
+-- in the (object - player) direction (u2 = charge, clamped to 0.5s).
+-- That throw is an inlined closure inside the module - it cannot be
+-- scaled from outside. So we watch the same inputs (our own UIS hooks +
+-- a 50ms poll of the module's ThrowStart / CurrentlyDragging) and after
+-- a REAL throw (ThrowStart cleared while the drag stopped - not a
+-- short-tap cancel, not a drop) add (multiplier - 1) x the game's own
+-- impulse at the same spot and direction, one frame later. Needs
+-- Enhanced Drag on (that is what finds the module).
+local THROW_KEYS = { [Enum.KeyCode.G] = true, [Enum.KeyCode.ButtonY] = true }
+local THROW_STATE = { pending = nil, uisOk = false, lastPrint = 0 }
+
+local function throwDuration(pending)
+    local ok, tv = pcall(function() return tick() end)
+    if ok and typeof(tv) == "number" and typeof(pending.tstart) == "number" then
+        return tv - pending.tstart
+    end
+    return os.clock() - pending.clock
+end
+
+local function modelMass(m)
+    local ok, mass = pcall(function() return m:GetMass() end)
+    if ok and typeof(mass) == "number" and mass > 0 then return mass end
+    local total = 0
+    for _, p in ipairs(m:GetDescendants()) do
+        if p:IsA("BasePart") then
+            local ok2, mp = pcall(function() return p:GetMass() end)
+            if ok2 and typeof(mp) == "number" then total = total + mp end
+        end
+    end
+    return total
+end
+
+local function applyThrowBoost(pending, dur)
+    local part, root = pending.part, pending.root
+    if not part or not part.Parent or not root then return end
+    local objPos, charPos = pending.objPos, pending.charPos
+    if not objPos or not charPos then return end
+    local dir = objPos - charPos
+    if dir.Magnitude < 0.01 then return end
+    dir = dir.Unit
+    local u2 = math.clamp(dur, 0, 0.5) / 0.5
+    local u3 = math.max(modelMass(root), 30)
+    local mult = tonumber(Config.Drag.Throw) or 1
+    local extra = (mult - 1) * u2 * 700 * (u3 / 75)
+    if extra <= 0 then return end
+    if extra > 1e9 then extra = 1e9 end
+    pcall(function() part:ApplyImpulseAtPosition(dir * extra, objPos) end)
+    local nowc = os.clock()
+    if nowc - (THROW_STATE.lastPrint or 0) > 1.5 then
+        THROW_STATE.lastPrint = nowc
+        print(("[oaklands] throw boost x%s applied (charge %.2f, impulse %d)"):format(tostring(mult), u2, math.floor(extra)))
+    end
+end
+
+local function finishThrow(pending)
+    if not pending or pending.done then return end
+    pending.done = true
+    if THROW_STATE.pending == pending then THROW_STATE.pending = nil end
+    if not (Config.Drag.Enhanced and (tonumber(Config.Drag.Throw) or 1) > 1.001) then return end
+    local mod = pending.mod
+    if rawget(mod, "CurrentlyDragging") == true then return end
+    if not pending.tstartLastSeenAt or (os.clock() - pending.tstartLastSeenAt) > 0.2 then return end
+    local dur = throwDuration(pending)
+    if dur < 0.1 then return end
+    applyThrowBoost(pending, dur)
+end
+
+local function armThrow()
+    if not Config.Drag.Enhanced then return end
+    if (tonumber(Config.Drag.Throw) or 1) <= 1.001 then return end
+    local mod = nil
+    if type(DRAG_STATE.draggers) == "table" then
+        for _, d in ipairs(DRAG_STATE.draggers) do
+            if type(d) == "table" and d.kind == "classic" then
+                mod = d.mod
+                break
+            end
+        end
+    end
+    if not mod or rawget(mod, "CurrentlyDragging") ~= true then return end
+    local pending = { mod = mod, clock = os.clock(), done = false }
+    local ado = rawget(mod, "ActiveDragObject")
+    pending.part = type(ado) == "table" and (rawget(ado, "PartInstance") or ado.PartInstance) or nil
+    pending.root = type(ado) == "table" and (rawget(ado, "RootObject") or ado.RootObject) or nil
+    if pending.part then pcall(function() pending.objPos = pending.part:GetPivot().Position end) end
+    local ch = LocalPlayer.Character
+    local cp = ch and (ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart)
+    if cp then pcall(function() pending.charPos = cp.Position end) end
+    local ts = rawget(mod, "ThrowStart")
+    if typeof(ts) == "number" then
+        pending.tstart = ts
+        pending.tstartLastSeenAt = os.clock()
+    end
+    THROW_STATE.pending = pending
+end
+
+local function throwPoll()
+    local pending = THROW_STATE.pending
+    if not pending then return end
+    if os.clock() - pending.clock > 5 then
+        THROW_STATE.pending = nil
+        return
+    end
+    local mod = pending.mod
+    local ts = rawget(mod, "ThrowStart")
+    if typeof(ts) == "number" then
+        pending.tstart = ts
+        pending.tstartLastSeenAt = os.clock()
+        local ado = rawget(mod, "ActiveDragObject")
+        local part = type(ado) == "table" and (rawget(ado, "PartInstance") or ado.PartInstance) or nil
+        local root = type(ado) == "table" and (rawget(ado, "RootObject") or ado.RootObject) or nil
+        if part then
+            pending.part = part
+            pcall(function() pending.objPos = part:GetPivot().Position end)
+        end
+        if root then pending.root = root end
+        local ch = LocalPlayer.Character
+        local cp = ch and (ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart)
+        if cp then pcall(function() pending.charPos = cp.Position end) end
+    elseif rawget(mod, "CurrentlyDragging") == true then
+        THROW_STATE.pending = nil
+    elseif not THROW_STATE.uisOk then
+        finishThrow(pending)
+    end
+end
+
+do
+    local okB = pcall(function()
+        track(UserInputService.InputBegan:Connect(function(input)
+            pcall(function()
+                if input.UserInputType ~= Enum.UserInputType.Keyboard and input.UserInputType ~= Enum.UserInputType.Gamepad1 then return end
+                if not THROW_KEYS[input.KeyCode] then return end
+                armThrow()
+            end)
+        end))
+    end)
+    local okE = pcall(function()
+        track(UserInputService.InputEnded:Connect(function(input)
+            local pending = THROW_STATE.pending
+            if not pending then return end
+            pcall(function()
+                if input.UserInputType ~= Enum.UserInputType.Keyboard and input.UserInputType ~= Enum.UserInputType.Gamepad1 then return end
+                if not THROW_KEYS[input.KeyCode] then return end
+                task.defer(function() pcall(finishThrow, pending) end)
+            end)
+        end))
+    end)
+    THROW_STATE.uisOk = (okB and okE)
+end
+
+track(task.spawn(function()
+    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
+        task.wait(0.05)
+        pcall(throwPoll)
+    end
+end))
+
+-- ============================================================
 -- MOVEMENT  (experimental block REMOVED in oak-v2)
 -- ============================================================
 -- Infinite Jump / Walk Speed / Jump Power / Sprint Boost were live-tested:
@@ -1123,7 +1294,15 @@ local function buildMenu()
             if v >= 100 then return ("%dx"):format(math.floor(v + 0.5)) end
             return ("%.2fx"):format(v)
         end)
-    note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force, up to 1000x. Past ~20x only matters for heavy stuff (cars) - and it will FLY. Console prints each multiplier the moment it lands on a live drag; if things vibrate or rubber-band, come back down.")
+    slider(pmv, "Throw Power",
+        function() return Config.Drag.Throw end,
+        function(v) Config.Drag.Throw = v end, 0.25, 1, 1000,
+        function(v)
+            if v <= 1.001 then return "1.00x (vanilla)" end
+            if v >= 100 then return ("%dx"):format(math.floor(v + 0.5)) end
+            return ("%.2fx"):format(v)
+        end)
+    note(pmv, "Client-side dragger only - no packets sent. Reach = how far you can grab / keep holding (vanilla 12); strength = pull force, up to 1000x; Throw Power = extra impulse on the G-throw (hold G while dragging, release - Enhanced Drag must be on), up to 1000x. Past ~20x only matters for heavy stuff - and it will FLY. Console prints when each boost lands.")
 
     note(pmv, "Removed: speed / jump (oak-v2 - server bans) and Infinite Stamina (oak-v4 - it got detected and crashed the client). Everything left in this tab is client-side only.")
 
