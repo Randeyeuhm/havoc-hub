@@ -53,11 +53,12 @@
         wheel, tire or tyre - the live car hides them from every joint
         scan); during the jump the wheels go nocollide + weightless so
         nothing catches on them, then their physics comes back. The
-        landing nudges up over obstacles; the camera must be >20 studs
-        away so the chase cam can never trigger it. A beat after landing
-        the freecam drops so you SEE where it landed. Console prints
-        parts / assemblies / wheels + a settle line. Same class of
-        teleport as the store warps.
+        landing nudges up over obstacles, then sits the car on the
+        ground (raycasted - no sky-drop, no tipping); the camera must
+        be >20 studs away so the chase cam can never trigger it. A beat
+        after landing the freecam drops so you SEE where it landed.
+        Console prints parts / assemblies / wheels + a settle line.
+        Same class of teleport as the store warps.
       • Wood Lock      - automatic cargo lock: while you are seated in a
         vehicle, loose wood (logs / planks / lumber) on or in it is
         glued to the chassis by re-applying its car-relative offset
@@ -127,7 +128,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v35"
+local SCRIPT_VERSION = "oak-v36"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1921,10 +1922,40 @@ local function cameraTeleport()
         end)
     end
     if #parts == 0 then parts[1] = root end
+    -- land ON the ground, not floating at camera height (oak-v36): find
+    -- what is under the target point and slide it up so the car rests
+    -- just above it. The old sky-drop was why teleports with cargo could
+    -- tip the car on landing.
+    do
+        local minY = nil
+        for _, p in ipairs(parts) do
+            if p:IsA("BasePart") and not (ch and p:IsDescendantOf(ch)) then
+                local okB, bottom = pcall(function()
+                    return p.Position.Y - p.Size.Y * 0.5
+                end)
+                if okB and bottom and (minY == nil or bottom < minY) then
+                    minY = bottom
+                end
+            end
+        end
+        if minY ~= nil then
+            local dropBelow = root.Position.Y - minY
+            local rparams = RaycastParams.new()
+            rparams.FilterType = Enum.RaycastFilterType.Exclude
+            rparams.FilterDescendantsInstances = { ch }
+            rparams.IgnoreWater = true
+            local hit = Workspace:Raycast(landPos, Vector3.new(0, -300, 0), rparams)
+            if hit then
+                local wantedY = hit.Position.Y + dropBelow + 1.5
+                if landPos.Y > wantedY then
+                    landPos = Vector3.new(landPos.X, wantedY, landPos.Z)
+                end
+            end
+        end
+    end
     -- one CFrame write per unique assembly (setting one part moves its
     -- whole rigid assembly - a second write would double-move it).
-    -- Wood the cargo lock has welded on is part of the car's assembly
-    -- by now, so it rides along for free.
+    -- Locked wood rides along with the rest.
     local function tpApply()
         local shift = landPos - root.Position
         if shift.Magnitude < 0.5 then return 0, 0 end
@@ -1953,7 +1984,7 @@ local function cameraTeleport()
     -- pin the car where it landed for a moment in case anything (server
     -- replication, physics wake-up, streaming) tries to drag it back;
     -- the settle line is the evidence when something persistent fights
-    TP_JOB = { root = root, landPos = landPos, apply = tpApply, wheels = wheelState, nextAt = 0, doneAt = os.clock() + 0.5, hardDoneAt = os.clock() + 1.2, applies = 1 }
+    TP_JOB = { root = root, landPos = landPos, apply = tpApply, wheels = wheelState, nextAt = 0, doneAt = os.clock() + 0.4, hardDoneAt = os.clock() + 1.0, applies = 1 }
     if FREE.on then
         pcall(freecamOff)  -- camera back on you, so you SEE where it landed
         pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
