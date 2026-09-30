@@ -35,8 +35,11 @@
       • Vehicle Fly    - hovercar mode: W/S fly along the camera, A/D
         strafe, Space/Shift up, LeftCtrl down, neutral hovers (gravity
         compensated). Roll/pitch is locked so the car cannot capsize -
-        pull a flip and it rights itself. Direct velocity + angular
-        writes on your own vehicle - cars work best. Off by default.
+        pull a flip and it rights itself. While flying the wheels are
+        switched off (nocollide + massless, the same treatment the
+        teleport uses) so they never fight the hover physics or glitch
+        after a jump. Direct velocity + angular writes on your own
+        vehicle - cars work best. Off by default.
       • Freecam        - built in: toggles on a rebindable key
         (default RightCtrl - Camera section row; the toggle shows the
         live key chip), WASD flies, mouse looks, Space/LeftCtrl
@@ -128,7 +131,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v36"
+local SCRIPT_VERSION = "oak-v37"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1400,12 +1403,27 @@ end
 -- Direct AssemblyLinearVelocity writes on the assembly root = the same
 -- channel the game itself uses to drive barrows - client-simulated, so
 -- it just moves. Cars (wheel-driven) respond cleanest.
+-- forward: assigned in the Cam Teleport section (the wheel scan lives
+-- there); the fly step only runs at frame time so the assignment has
+-- always happened by then
+local flyWheelApply = nil
+local flyWheelRestoreAll = nil
+
 local function vehicleFlyStep(dt)
-    if not Config.Vehicle.Fly then return end
+    if not Config.Vehicle.Fly then
+        if flyWheelRestoreAll then pcall(flyWheelRestoreAll) end
+        return
+    end
     local ch = LocalPlayer.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
-    if not seat or not seat:IsA("VehicleSeat") then return end
+    if not seat or not seat:IsA("VehicleSeat") then
+        if flyWheelRestoreAll then pcall(flyWheelRestoreAll) end
+        return
+    end
+    -- wheels off while flying - same treatment as the teleport, so they
+    -- never fight the hover physics or glitch after a jump
+    if flyWheelApply then pcall(flyWheelApply, seat) end
     local root = seat.AssemblyRootPart or seat
     local speed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
     local cam = Workspace.CurrentCamera
@@ -1804,6 +1822,105 @@ end
 -- which is why the name sweep found nothing.
 local WHEEL_SLOTS = { fl = true, fr = true, bl = true, br = true, ml = true, mr = true, rl = true, rr = true }
 
+local function findWheelParts(scope)
+    local wheelParts, seenW = {}, {}
+    if not scope then return wheelParts end
+    local okW, descsW = pcall(function() return scope:GetDescendants() end)
+    if okW and descsW then
+        for _, p in ipairs(descsW) do
+            if p:IsA("BasePart") then
+                local nm = string.lower(p.Name)
+                local wheelish = WHEEL_SLOTS[nm] == true
+                    or string.find(nm, "wheel", 1, true) ~= nil
+                    or string.find(nm, "tyre", 1, true) ~= nil
+                    or string.find(nm, "tire", 1, true) ~= nil
+                if not wheelish then
+                    local anc = p.Parent
+                    while anc and anc ~= scope do
+                        if string.find(string.lower(anc.Name), "wheel", 1, true) then
+                            wheelish = true
+                            break
+                        end
+                        anc = anc.Parent
+                    end
+                end
+                if wheelish and not seenW[p] and #wheelParts < 60 then
+                    seenW[p] = true
+                    wheelParts[#wheelParts + 1] = p
+                end
+            end
+        end
+    end
+    return wheelParts
+end
+
+-- Vehicle Fly wheel freeze (oak-v37): while flying, the wheels get the
+-- exact treatment the teleport uses - nocollide + massless - so they
+-- never fight the hover physics or glitch after a jump. Restored the
+-- moment fly ends or you dismount.
+local function flyWheelTopModel(seat)
+    local top = seat
+    local cur = seat.Parent
+    while cur and cur ~= Workspace do
+        if cur:IsA("Model") then
+            top = cur
+        end
+        cur = cur.Parent
+    end
+    return top
+end
+
+flyWheelRestoreAll = function()
+    local job = VEH_STATE.flyWheelJob
+    if not job then return end
+    VEH_STATE.flyWheelJob = nil
+    for p, st in pairs(job.state) do
+        pcall(function()
+            if p.Parent then
+                p.CanCollide = st.cc
+                p.Massless = st.ml
+            end
+        end)
+    end
+    if (job.count or 0) > 0 then
+        print(("[oaklands] fly: wheels restored (%d)"):format(job.count))
+    end
+end
+
+flyWheelApply = function(seat)
+    local job = VEH_STATE.flyWheelJob
+    if job and job.seat == seat and job.model and job.model.Parent then
+        for p in pairs(job.state) do
+            if p.Parent and p.CanCollide then
+                pcall(function()
+                    p.CanCollide = false
+                    p.Massless = true
+                end)
+            end
+        end
+        return
+    end
+    if job then
+        flyWheelRestoreAll()
+    end
+    local scope = flyWheelTopModel(seat)
+    local wheels = findWheelParts(scope)
+    if #wheels == 0 then return end
+    local state, count = {}, 0
+    for _, p in ipairs(wheels) do
+        local ok = pcall(function()
+            state[p] = { cc = p.CanCollide, ml = p.Massless }
+            p.CanCollide = false
+            p.Massless = true
+        end)
+        if ok then count = count + 1 end
+    end
+    VEH_STATE.flyWheelJob = { seat = seat, model = scope, state = state, count = count }
+    if count > 0 then
+        print(("[oaklands] fly: wheels disabled (%d) - nocollide + massless until you stop flying"):format(count))
+    end
+end
+
 local function cameraTeleport()
     if not Config.Vehicle.CamTP then
         print("[oaklands] cam tp: toggle is off (Movement > Vehicles > Cam Teleport)")
@@ -1873,38 +1990,7 @@ local function cameraTeleport()
     local wheelParts = {}
     do
         local scope = commonVehicleModel(seat, parts, ch) or seat:FindFirstAncestorOfClass("Model")
-        local seenW = {}
-        local function addWheel(p)
-            if p and p:IsA("BasePart") and not seenW[p] and #wheelParts < 60 then
-                seenW[p] = true
-                wheelParts[#wheelParts + 1] = p
-            end
-        end
-        if scope then
-            local okW, descsW = pcall(function() return scope:GetDescendants() end)
-            if okW and descsW then
-                for _, p in ipairs(descsW) do
-                    if p:IsA("BasePart") then
-                        local nm = string.lower(p.Name)
-                        local wheelish = WHEEL_SLOTS[nm] == true
-                            or string.find(nm, "wheel", 1, true) ~= nil
-                            or string.find(nm, "tyre", 1, true) ~= nil
-                            or string.find(nm, "tire", 1, true) ~= nil
-                        if not wheelish then
-                            local anc = p.Parent
-                            while anc and anc ~= scope do
-                                if string.find(string.lower(anc.Name), "wheel", 1, true) then
-                                    wheelish = true
-                                    break
-                                end
-                                anc = anc.Parent
-                            end
-                        end
-                        if wheelish then addWheel(p) end
-                    end
-                end
-            end
-        end
+        wheelParts = findWheelParts(scope)
         for _, p in ipairs(wheelParts) do
             if not seenParts[p] then
                 seenParts[p] = true
@@ -2246,6 +2332,12 @@ pcall(function()
             end
             VEH_STATE.ghost[seat] = nil
         end
+    end
+end)
+-- leftover fly wheel freeze from an old build: give the wheels back
+pcall(function()
+    if VEH_STATE.flyWheelJob and flyWheelRestoreAll then
+        flyWheelRestoreAll()
     end
 end)
 
