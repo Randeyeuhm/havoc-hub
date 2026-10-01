@@ -162,7 +162,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.18"
+local SCRIPT_VERSION = "oak-v29.19"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1762,7 +1762,7 @@ end
 -- the ball (and every weld Part0/Part1 = the whole load) to the camera:
 -- fly the freecam across the map, press the key, release to drop the
 -- load there. Same client-side teleport family as Cam Teleport / store
--- warps (one CFrame write per unique assembly + short re-pin window).
+-- warps (one CFrame write per unique assembly + a 1.5s landing hold).
 local function grabberTeleport()
     if Config.Grabber.TP ~= true then
         print("[oaklands] grab tp: toggle is off (Movement > Grabbers > Grab Teleport)")
@@ -1826,7 +1826,9 @@ local function grabberTeleport()
     inst.LastRayRes = target
     local ap = ball:FindFirstChild("AlignPosition")
     if ap then ap.Position = target end
-    GRAB_STATE.tpJob = { ball = ball, target = target, untilAt = os.clock() + 0.5, nextAt = 0 }
+    -- hold the ball at the landing spot for 1.5s - physics / streaming
+    -- get time to settle before the game's own carry logic takes over
+    GRAB_STATE.tpJob = { ball = ball, target = target, untilAt = os.clock() + 1.5, nextAt = 0 }
     print(("[oaklands] grab tp: moved %d studs (%d assemblies)"):format(math.floor(delta.Magnitude), moved))
 end
 
@@ -1865,7 +1867,8 @@ local function grabberStep()
             print(("[oaklands] grabber behavior found (server reach: %s)"):format(tostring(list[1].MaxDistance)))
         end
     end
-    -- grab tp landing re-pin (runs while a teleport window is open)
+    -- grab tp landing re-pin (holds the ball for 1.5s - runs while a
+    -- teleport window is open)
     local tp = GRAB_STATE.tpJob
     if tp then
         if os.clock() >= tp.untilAt then
