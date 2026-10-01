@@ -69,7 +69,7 @@ Built from the game's decompiled source — everything gameplay-side flows throu
 
 - **Tree ESP** — every choppable tree (`World.TreeRegions` — the `Choppable` + `AltName` attributes the axe code itself reads) gets a species + distance label, optional highlight, and a species filter built live from the game's own `INFO` registry (keep the rares, hide the junk)
 - **Rock ESP** — every minable rock (the game's own `World.RockRegions` — `Mineable`/`AltName` attributes the chisel code reads) plus loose rocks (meteorites) gets a type + distance label and optional highlight; ore-bearing rocks show what they carry straight from the `OreName` attribute (Copper, Iron, Gold, Mythril, Amethyst, Quartz, Sand...). Its rock-type filter list fills itself from the rocks you've actually seen and persists across sessions
-- **Loose Item ESP** — everything under the game's own `Item` tag, with name + distance
+- **Loose Item ESP** — everything under the game's own `Item` tag, with name + distance; items that carry the game's `Price` / `EggsPrice` attribute (store displays, merchant goods) show it in the label
 - **Enemy ESP** and **Player ESP** — name + distance labels (players resolved from the username-named characters in the workspace)
 - **~~Auto Chop~~ (removed in oak-v2)** — live testing showed it does not work and crashes the client; its swing channel (`Backpack:InformServer`) is server-validated with client self-reporting, so the script sends nothing anymore
 - **~~Infinite Stamina~~ (removed in oak-v4)** — live testing got it detected and crashed the client

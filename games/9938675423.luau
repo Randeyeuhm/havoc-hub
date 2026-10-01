@@ -21,7 +21,10 @@
                           The type filter list fills itself from the rocks
                           actually found and persists across sessions.
       • Loose Item ESP  - everything the CollectionService "Item" tag holds
-                          (World.LooseItems etc) with name+distance.
+                          (World.LooseItems etc) with name+distance, plus the
+                          game's own Price / EggsPrice attribute when the
+                          item has one (store displays, merchant goods - the
+                          same attrs the game's hover tooltip reads).
       • Enemy ESP       - World.Enemies models (event mobs).
 
     Players
@@ -137,7 +140,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.12"
+local SCRIPT_VERSION = "oak-v29.13"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -742,12 +745,28 @@ local function discoverRockTypes()
     end
 end
 
+-- the game's own comma stringifier (its hover/sell UI uses exactly this):
+-- 4040 -> "4,040"
+local function commaNumber(n)
+    return (tostring(math.floor(tonumber(n) or 0)):reverse():gsub("(%d%d%d)", "%1,"):gsub(",(%-?)$", "%1"):reverse())
+end
+
 local function scanItems(list)
     table.clear(list)
     for _, inst in ipairs(CollectionService:GetTagged("Item")) do
         local pos = listPos(inst)
         if pos then
-            list[#list + 1] = { target = inst, pos = pos, text = inst.Name }
+            local text = inst.Name
+            -- Price = shop buy price, EggsPrice = egg currency (the attrs the
+            -- game's hover tooltip and sell menus read straight off the model)
+            local price = inst:GetAttribute("Price")
+            local eggs = inst:GetAttribute("EggsPrice")
+            if type(price) == "number" then
+                text = ("%s  $%s"):format(text, commaNumber(price))
+            elseif type(eggs) == "number" then
+                text = ("%s  \240\159\165\154 %s"):format(text, commaNumber(eggs))
+            end
+            list[#list + 1] = { target = inst, pos = pos, text = text }
         end
     end
 end
