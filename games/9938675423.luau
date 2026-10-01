@@ -58,7 +58,10 @@
         Then their physics comes back. The settle re-assert fights
         back ONLY the car + its wheels (max 10x/s), so a rig full of
         loose pieces (colliders, cargo) can't turn the jump into a
-        stutter fest. The
+        stutter fest. The wheel sweep itself is scoped to the rig
+        model (found via its RigWheels) and hard-capped, so a dragged
+        chunk of world can never be counted, scanned or stuttered
+        over again. The
         landing nudges up over obstacles; the camera must be >20 studs
         away so the chase cam can never trigger it. The car is pinned
         at the landing spot for a moment (beats physics / server
@@ -127,7 +130,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.6"
+local SCRIPT_VERSION = "oak-v29.7"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1758,8 +1761,16 @@ local function augmentVehicleParts(list, seen, seat, ch)
     if common then
         local ok, descs = pcall(function() return common:GetDescendants() end)
         if ok and descs then
-            for _ = 1, 4 do
-                if not sweepPass(descs) then break end
+            -- a dragged/loaded chunk can push the common ancestor up to a
+            -- half-the-map node; sweeping that is a GetDescendants
+            -- lagspike, not a rig sweep - skip it (the joint walk already
+            -- owns whatever the vehicle is actually connected to).
+            if #descs <= 3000 then
+                for _ = 1, 4 do
+                    if not sweepPass(descs) then break end
+                end
+            else
+                print(("[oaklands] cam tp: rig sweep skipped (%s holds %d descendants)"):format(common.Name, #descs))
             end
         end
     end
@@ -1861,7 +1872,29 @@ local function cameraTeleport()
     -- their physics comes back.
     local wheelParts = {}
     do
-        local scope = commonVehicleModel(seat, parts, ch) or seat:FindFirstAncestorOfClass("Model")
+        -- scope = the vehicle's rig model: climb from the seat to the
+        -- nearest Model that owns a RigWheels container (every Oaklands
+        -- rig - cars, barrows, semis - hangs its wheels there). NEVER
+        -- use "common ancestor of everything collected" here: a dragged
+        -- or loaded chunk of world drags that candidate up to a
+        -- half-the-map folder which swept live TREES into the match
+        -- (Acorn / FluffyLeaf / OctagonPart counts, console-proven) and
+        -- turned the sweep itself into a huge GetDescendants lagspike.
+        local scope = nil
+        do
+            local node, tries = seat, 0
+            while node and node ~= Workspace and node ~= game and tries < 8 do
+                tries = tries + 1
+                if node:IsA("Model") and node:FindFirstChild("RigWheels", true) then
+                    scope = node
+                    break
+                end
+                node = node.Parent
+            end
+            if not scope then
+                scope = seat:FindFirstAncestorOfClass("Model")
+            end
+        end
         local seenW = {}
         local function addWheel(p)
             if p and p:IsA("BasePart") and not seenW[p] and #wheelParts < 60 then
@@ -1871,6 +1904,10 @@ local function cameraTeleport()
         end
         if scope then
             local okW, descsW = pcall(function() return scope:GetDescendants() end)
+            if okW and descsW and #descsW > 1200 then
+                print(("[oaklands] cam tp: wheel scope %s holds %d descendants - too big, wheels skipped"):format(scope.Name, #descsW))
+                okW = false
+            end
             if okW and descsW then
                 for _, p in ipairs(descsW) do
                     if p:IsA("BasePart") then
@@ -1929,21 +1966,25 @@ local function cameraTeleport()
     local wheelLock = {}
     do
         local rootAsm = root.AssemblyRootPart or root
-        local seenLock = {}
+        local seenAsm = {}
         for _, p in ipairs(wheelParts) do
-            if not seenLock[p] then
-                seenLock[p] = true
-                if p.AssemblyRootPart ~= rootAsm and not p.Anchored then
-                    local okL, off = pcall(function() return root.CFrame:Inverse() * p.CFrame end)
-                    if okL and off then
-                        wheelLock[#wheelLock + 1] = { p = p, off = off }
-                    end
+            local asm = p.AssemblyRootPart
+            -- one glue anchor per separate wheel ASSEMBLY (a wheel part
+            -- plus its welded mesh wheels is 3 parts in ONE assembly -
+            -- counting parts made a 6-wheel rig read as 18 "wheels" and
+            -- tripped the safety cap, so the lock silently never
+            -- engaged on those vehicles)
+            if asm and asm ~= rootAsm and not seenAsm[asm] and not p.Anchored then
+                seenAsm[asm] = true
+                local okL, off = pcall(function() return root.CFrame:Inverse() * p.CFrame end)
+                if okL and off then
+                    wheelLock[#wheelLock + 1] = { p = p, off = off }
                 end
             end
         end
     end
-    if #wheelLock > 16 then
-        print(("[oaklands] cam tp: %d separate wheel matches - too many to glue safely, lock skipped (send this line)"):format(#wheelLock))
+    if #wheelLock > 24 then
+        print(("[oaklands] cam tp: %d separate wheel assemblies - too many to glue safely, lock skipped (send this line)"):format(#wheelLock))
         wheelLock = {}
     end
     local function tpWheelGlue()
@@ -2039,6 +2080,13 @@ local function cameraTeleport()
         for n, c in pairs(tally) do bits[#bits + 1] = ("%s=%d"):format(n, c) end
         table.sort(bits)
         print("[oaklands] cam tp: lot of wheel matches (" .. #wheelParts .. "): " .. table.concat(bits, ", ", 1, math.min(#bits, 8)) .. (#bits > 8 and " ..." or ""))
+        local full = {}
+        for i = 1, math.min(2, #wheelParts) do
+            local wp = wheelParts[i]
+            local okF, fn = pcall(function() return wp:GetFullName() end)
+            full[#full + 1] = okF and fn or "?"
+        end
+        print("[oaklands] cam tp: match sample: " .. table.concat(full, "  |  "))
     end
     -- pin the car where it landed for a moment in case anything (server
     -- replication, physics wake-up, streaming) tries to drag it back;
