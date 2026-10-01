@@ -130,7 +130,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.10"
+local SCRIPT_VERSION = "oak-v29.11"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -395,8 +395,9 @@ end
 -- a capture never fires an action.
 -- ============================================================
 local HOTKEYS = {
-    { Id = "Freecam", Desc = "Freecam toggle", Key = Enum.KeyCode.RightControl, Enabled = true },
-    { Id = "CamTP",   Desc = "Cam Teleport",   Key = Enum.KeyCode.T,            Enabled = true },
+    { Id = "ToggleMenu", Desc = "Show / hide menu", Key = Enum.KeyCode.RightShift, Enabled = true },
+    { Id = "Freecam",    Desc = "Freecam toggle",   Key = Enum.KeyCode.RightControl, Enabled = true },
+    { Id = "CamTP",      Desc = "Cam Teleport",     Key = Enum.KeyCode.T,            Enabled = true },
 }
 local HOTKEY_BY_ID = {}
 for _, entry in ipairs(HOTKEYS) do
@@ -446,6 +447,24 @@ end
 if UILib and type(UILib.attachInput) == "function" then
     track(UILib.attachInput())
 end
+
+-- Menu key (oak-v29.11): the footer and the close notice both promised
+-- "press RightShift to reopen", but nothing ever listened for it - hiding
+-- the menu made it unreachable. This flips the ScreenGui. The rebind guard
+-- runs first so a capture never toggles the menu mid-rebind.
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    pcall(function()
+        if UILib and UILib.handleRebindInput and UILib.handleRebindInput(input) then return end
+        if gameProcessed then return end
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        local hk = HOTKEY_BY_ID.ToggleMenu
+        if hk.Enabled == false then return end
+        if input.KeyCode ~= hk.Key then return end
+        if not screenGui then return end
+        screenGui.Enabled = not screenGui.Enabled
+    end)
+end))
 
 -- ============================================================
 -- CLIENT FRAMEWORK ACCESS  (REMOVED in oak-v4)
@@ -2386,7 +2405,10 @@ local function buildMenu()
         footerHint = "RightShift - show / hide this menu",
         onClose = function()
             screenGui.Enabled = false
+            -- the toaster lives inside screenGui, so this notify can never be
+            -- seen once the menu is hidden - mirror it to the console too
             notify("Menu hidden - press RightShift to reopen")
+            print("[Havoc Hub] Menu hidden - press RightShift to reopen")
         end,
     }
     local pw = win.tab(1)  -- World
@@ -2431,10 +2453,10 @@ local function buildMenu()
             return UILib.makeMultiSelect(page, text, items, isOn, setOn, { overlayParent = win.popupLayer })
         end)
     end
-    local function keybindRow(page, entry)
+    local function keybindRow(page, entry, opts)
         if type(UILib.makeKeybindRow) ~= "function" then return end
         guard("keybind row " .. entry.Desc, function()
-            return UILib.makeKeybindRow(page, entry)
+            return UILib.makeKeybindRow(page, entry, opts)
         end)
     end
 
@@ -2587,6 +2609,8 @@ local function buildMenu()
         function(v) Config.Camera.Speed = v end, 5, 25, 500,
         function(v) return ("%d studs/s"):format(v) end)
     -- ---------------- Misc ----------------
+    section(pmi, "Menu")
+    keybindRow(pmi, HOTKEY_BY_ID.ToggleMenu, { locked = true, lockNote = "RightShift is the menu key and stays bound" })
     section(pmi, "Lighting")
     toggle(pmi, "Fullbright",
         function() return Config.Misc.Fullbright end,
