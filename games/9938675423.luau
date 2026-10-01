@@ -68,6 +68,14 @@
         drag), then the freecam drops so you SEE where it landed.
         Console prints parts / assemblies / wheels + a settle line.
         Same class of teleport as the store warps.
+      • Cargo Grab     - optional, OFF by default: while you are
+        seated, loose world stuff (World.LooseItems) inside the grab
+        radius (25-300 studs) is pulled in a shallow arc into the
+        vehicle's cargo area (the trailer end / VehicleBack when the
+        rig names one). Client-side velocity pull on the loose
+        assemblies - the same class of pull as the dragger - and it
+        never touches the car itself; no packets. Radius slider sits
+        right under the toggle.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -130,7 +138,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.7"
+local SCRIPT_VERSION = "oak-v29.8"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -209,6 +217,8 @@ local DEFAULTS = {
         Fly      = false,
         FlySpeed = 150,  -- studs/s for the Vehicle Fly controller
         CamTP    = false, -- press T while driving: teleport to the camera (freecam)
+        CargoGrab   = false, -- pull loose stuff into the cargo area while seated
+        CargoRadius = 100,   -- pickup radius (studs) for Cargo Grab
     },
     Camera = {
         Free  = false,
@@ -280,6 +290,7 @@ Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 100000
 Config.Drag.Throw = math.clamp(tonumber(Config.Drag.Throw) or 1, 1, 100000)
 Config.Vehicle.Mult = math.clamp(tonumber(Config.Vehicle.Mult) or 3, 1, 25)
 Config.Vehicle.FlySpeed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
+Config.Vehicle.CargoRadius = math.clamp(tonumber(Config.Vehicle.CargoRadius) or 100, 25, 300)
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
 
 local function saveConfig()
@@ -1452,6 +1463,92 @@ local function vehicleFlyStep(dt)
     root.AssemblyAngularVelocity = Vector3.new(0, av.Y * 0.7, 0) + axis * corr
 end
 
+-- Cargo Grab (oak-v29.8): while seated, anything loose inside the grab
+-- radius gets pulled in a shallow arc into the vehicle's cargo area
+-- (the rig's trailer end / VehicleBack / Logging rack when it names
+-- one). Client-side velocity steering on the loose assemblies - the
+-- same class of pull the dragger itself applies - and it never touches
+-- the car, the character or a packet. OFF by default; the radius
+-- slider sits right under the toggle.
+local CARGO_TARGET_NAMES = { "logging", "vehicleback", "storage", "bed", "trailer" }
+local CARGO_TARGET_SET = {}
+for _, n in ipairs(CARGO_TARGET_NAMES) do CARGO_TARGET_SET[n] = true end
+
+local function cargoAreaOf(seat)
+    local model = seat:FindFirstAncestorOfClass("Model")
+    if not model then return nil end
+    local found = {}
+    local ok = pcall(function()
+        for _, d in ipairs(model:GetDescendants()) do
+            if d:IsA("BasePart") then
+                local nm = string.lower(d.Name)
+                if CARGO_TARGET_SET[nm] and not found[nm] then
+                    found[nm] = d
+                end
+            end
+        end
+    end)
+    if not ok then return nil end
+    for _, n in ipairs(CARGO_TARGET_NAMES) do
+        if found[n] then return found[n] end
+    end
+    return nil
+end
+
+local CARGO_STATE = { lastPrint = 0 }
+
+local function cargoStep()
+    if not Config.Vehicle.CargoGrab then return end
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local seat = hum and hum.SeatPart
+    if not (seat and seat:IsA("VehicleSeat")) then return end
+    local root = seat.AssemblyRootPart or seat
+    local target = cargoAreaOf(seat) or root
+    local goal = target.Position + Vector3.new(0, 10, 0)
+    local base = root.Position
+    local radius = math.clamp(tonumber(Config.Vehicle.CargoRadius) or 100, 25, 300)
+    local world = Workspace:FindFirstChild("World")
+    local loose = world and world:FindFirstChild("LooseItems")
+    if not loose then return end
+    local okL, items = pcall(function() return loose:GetDescendants() end)
+    if not okL or not items then return end
+    local seenAsm, pulled = {}, 0
+    for _, p in ipairs(items) do
+        if p:IsA("BasePart") and not p.Anchored and not (ch and p:IsDescendantOf(ch)) then
+            local asm = p.AssemblyRootPart
+            if asm and asm ~= root and not seenAsm[asm] then
+                seenAsm[asm] = true
+                local dist = (asm.Position - base).Magnitude
+                if dist <= radius and (asm.Position - goal).Magnitude > 8 and pulled < 24 then
+                    local dir = goal - asm.Position
+                    if dir.Magnitude > 0.5 then
+                        local speed = math.clamp(30 + dir.Magnitude * 0.8, 30, 120)
+                        local v = asm.AssemblyLinearVelocity
+                        asm.AssemblyLinearVelocity = v + (dir.Unit * speed - v) * 0.2
+                        asm.AssemblyAngularVelocity = asm.AssemblyAngularVelocity * 0.9
+                        pulled = pulled + 1
+                    end
+                end
+            end
+        end
+    end
+    if pulled > 0 then
+        local now = os.clock()
+        if now - (CARGO_STATE.lastPrint or 0) > 3 then
+            CARGO_STATE.lastPrint = now
+            print(("[oaklands] cargo grab: pulling %d piece(s) -> %s"):format(pulled, target.Name))
+        end
+    end
+end
+
+track(task.spawn(function()
+    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
+        task.wait(0.15)
+        pcall(cargoStep)
+    end
+end))
+
 track(RunService.RenderStepped:Connect(function(dt)
     if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
     pcall(vehicleFlyStep, dt)
@@ -2553,6 +2650,16 @@ local function buildMenu()
             notify(v and ("Cam teleport on - press " .. HOTKEY_BY_ID.CamTP.Key.Name .. " to pull the vehicle to your camera") or "Cam teleport off")
         end, HOTKEY_BY_ID.CamTP)
     keybindRow(pmv, HOTKEY_BY_ID.CamTP)
+    toggle(pmv, "Cargo Grab",
+        function() return Config.Vehicle.CargoGrab end,
+        function(v)
+            Config.Vehicle.CargoGrab = v
+            notify(v and "Cargo grab on - loose stuff in range gets pulled into the cargo area" or "Cargo grab off")
+        end)
+    slider(pmv, "Grab Radius",
+        function() return Config.Vehicle.CargoRadius end,
+        function(v) Config.Vehicle.CargoRadius = v end, 5, 25, 300,
+        function(v) return ("%d studs"):format(v) end)
     section(pmv, "Camera")
     toggle(pmv, "Freecam",
         function() return Config.Camera.Free end,
