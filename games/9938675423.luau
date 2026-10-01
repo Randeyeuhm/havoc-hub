@@ -123,9 +123,12 @@
                           Grab Through Walls (drops the game's wall-
                           clamp ray so the grab point can sit past
                           buildings - point lands inside geometry when
-                          aimed at ground, that is the trade) and Ghost
+                          aimed at ground, that is the trade), Ghost
                           Radius (the DragNoCollide scan - the game only
-                          tags VEHICLE bed parts, never buildings).
+                          tags VEHICLE bed parts, never buildings) and
+                          Grab Teleport (carry a load, press Y - the
+                          whole pile + ball teleport to your camera;
+                          fly the freecam and move resources anywhere).
                           All local writes, no packets; server grab
                           checks unknown - creep up.
 
@@ -155,7 +158,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.15"
+local SCRIPT_VERSION = "oak-v29.16"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -238,6 +241,7 @@ local DEFAULTS = {
         Reach    = 1,     -- multiplier on the server-pushed grabber MaxDistance
         Power    = 1,     -- multiplier on the carry ball's align forces
         Through  = false, -- drop the wall-clamp ray (grab through buildings)
+        TP       = false, -- press the key while carrying: pile teleports to the camera
         GhostRadius = 34, -- DragNoCollide passthrough scan radius (34 = vanilla)
     },
     Vehicle = {
@@ -319,6 +323,7 @@ Config.Drag.Throw = math.clamp(tonumber(Config.Drag.Throw) or 1, 1, 100000)
 Config.Grabber.Reach = math.clamp(tonumber(Config.Grabber.Reach) or 1, 1, 100)
 Config.Grabber.Power = math.clamp(tonumber(Config.Grabber.Power) or 1, 1, 100000)
 Config.Grabber.Through = Config.Grabber.Through == true
+Config.Grabber.TP = Config.Grabber.TP == true
 Config.Grabber.GhostRadius = math.clamp(tonumber(Config.Grabber.GhostRadius) or 34, 34, 250)
 Config.Vehicle.Mult = math.clamp(tonumber(Config.Vehicle.Mult) or 3, 1, 25)
 Config.Vehicle.FlySpeed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
@@ -481,6 +486,7 @@ local HOTKEYS = {
     { Id = "ToggleMenu", Desc = "Show / hide menu", Key = Enum.KeyCode.RightShift, Enabled = true },
     { Id = "Freecam",    Desc = "Freecam toggle",   Key = Enum.KeyCode.RightControl, Enabled = true },
     { Id = "CamTP",      Desc = "Cam Teleport",     Key = Enum.KeyCode.T,            Enabled = true },
+    { Id = "GrabTP",     Desc = "Grab Teleport",    Key = Enum.KeyCode.Y,            Enabled = true },
 }
 local HOTKEY_BY_ID = {}
 for _, entry in ipairs(HOTKEYS) do
@@ -1610,6 +1616,7 @@ local function findGrabbers()
 end
 
 local function grabberRestoreAll()
+    GRAB_STATE.tpJob = nil
     for inst, rec in pairs(GRAB_STATE.recs) do
         pcall(function()
             if type(inst) == "table" then
@@ -1698,9 +1705,99 @@ local function grabberApplyRay(inst, through)
     end)
 end
 
+-- Grab Teleport (oak-v29.16): while a wormhole grab is live, the carried
+-- load is welded to the DraggingBall and the CLIENT drives it every frame
+-- - so the pile can be yanked anywhere, no reach limit. This teleports
+-- the ball (and every weld Part0/Part1 = the whole load) to the camera:
+-- fly the freecam across the map, press the key, release to drop the
+-- load there. Same client-side teleport family as Cam Teleport / store
+-- warps (one CFrame write per unique assembly + short re-pin window).
+local function grabberTeleport()
+    if Config.Grabber.TP ~= true then
+        print("[oaklands] grab tp: toggle is off (Movement > Grabbers > Grab Teleport)")
+        return
+    end
+    local list = GRAB_STATE.list
+    local inst
+    if type(list) == "table" then
+        for _, v in ipairs(list) do
+            if v.IsDragging == true and v.DraggingBall then
+                inst = v
+                break
+            end
+        end
+    end
+    if not inst then
+        GRAB_STATE.nextFind = 0  -- fresh scan next tick (tool may be new)
+        print("[oaklands] grab tp: not carrying anything with a grabber")
+        return
+    end
+    local ball = inst.DraggingBall
+    if not (typeof(ball) == "Instance" and ball.Parent) then
+        print("[oaklands] grab tp: no dragging ball")
+        return
+    end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local target = cam.CFrame.Position
+    local delta = target - ball.Position
+    if delta.Magnitude < 3 then
+        print("[oaklands] grab tp: already at the camera")
+        return
+    end
+    -- one write per unique assembly; the welds dedupe to the ball's own
+    -- assembly in the normal case, the per-weld pass covers odd rigs
+    local seen = {}
+    local moved = 0
+    local function movePart(p)
+        if not (typeof(p) == "Instance" and p:IsA("BasePart") and p.Parent) then return end
+        local root = p.AssemblyRootPart or p
+        if seen[root] then return end
+        seen[root] = true
+        pcall(function()
+            p.CFrame = p.CFrame + delta
+            p.AssemblyLinearVelocity = Vector3.new()
+            p.AssemblyAngularVelocity = Vector3.new()
+        end)
+        moved = moved + 1
+    end
+    movePart(ball)
+    for _, w in ipairs(ball:GetChildren()) do
+        pcall(function()
+            if w:IsA("Weld") or w:IsA("WeldConstraint") then
+                movePart(w.Part0)
+                movePart(w.Part1)
+            end
+        end)
+    end
+    -- keep the game's own bookkeeping in sync: the ray tracker, and the
+    -- align target so the load is not yanked straight back
+    inst.LastRayRes = target
+    local ap = ball:FindFirstChild("AlignPosition")
+    if ap then ap.Position = target end
+    GRAB_STATE.tpJob = { ball = ball, target = target, untilAt = os.clock() + 0.5, nextAt = 0 }
+    print(("[oaklands] grab tp: moved %d studs (%d assemblies)"):format(math.floor(delta.Magnitude), moved))
+end
+
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    pcall(function()
+        if UILib and UILib.handleRebindInput and UILib.handleRebindInput(input) then return end
+        if gameProcessed then return end
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        local hk = HOTKEY_BY_ID.GrabTP
+        if hk.Enabled == false then return end
+        if input.KeyCode ~= hk.Key then return end
+        grabberTeleport()
+    end)
+end))
+
 local function grabberStep()
     local g = Config.Grabber
-    if type(g) ~= "table" or not g.Enhanced then return end
+    if type(g) ~= "table" then return end
+    -- Grab Teleport needs the instance list too, so the rescan stays alive
+    -- while either feature is on
+    if not g.Enhanced and not (g.TP == true) then return end
     local now = os.clock()
     if now >= GRAB_STATE.nextFind then
         local list = findGrabbers()
@@ -1713,6 +1810,26 @@ local function grabberStep()
             print(("[oaklands] grabber behavior found (server reach: %s)"):format(tostring(list[1].MaxDistance)))
         end
     end
+    -- grab tp landing re-pin (runs while a teleport window is open)
+    local tp = GRAB_STATE.tpJob
+    if tp then
+        if os.clock() >= tp.untilAt then
+            GRAB_STATE.tpJob = nil
+        elseif typeof(tp.ball) == "Instance" and tp.ball.Parent then
+            local drift = (tp.ball.Position - tp.target).Magnitude
+            if drift > 4 and os.clock() >= tp.nextAt then
+                tp.nextAt = os.clock() + 0.1
+                pcall(function()
+                    tp.ball.CFrame = tp.ball.CFrame + (tp.target - tp.ball.Position)
+                    tp.ball.AssemblyLinearVelocity = Vector3.new()
+                    tp.ball.AssemblyAngularVelocity = Vector3.new()
+                end)
+            end
+        else
+            GRAB_STATE.tpJob = nil
+        end
+    end
+    if not g.Enhanced then return end
     local list = GRAB_STATE.list
     if type(list) ~= "table" or #list == 0 then return end
 
@@ -3076,6 +3193,13 @@ local function buildMenu()
             if v <= 34 then return "34 (vanilla)" end
             return ("%d studs"):format(v)
         end)
+    toggle(pmv, "Grab Teleport",
+        function() return Config.Grabber.TP end,
+        function(v)
+            Config.Grabber.TP = v
+            notify(v and ("Grab teleport on - carrying with a grabber, press " .. HOTKEY_BY_ID.GrabTP.Key.Name) or "Grab teleport off")
+        end)
+    keybindRow(pmv, HOTKEY_BY_ID.GrabTP)
     section(pmv, "Vehicles")
     toggle(pmv, "Vehicle Speed",
         function() return Config.Vehicle.Enabled end,
