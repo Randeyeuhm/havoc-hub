@@ -127,8 +127,11 @@
                           Radius (the DragNoCollide scan - the game only
                           tags VEHICLE bed parts, never buildings) and
                           Grab Teleport (carry a load, press Y - the
-                          whole pile + ball teleport to your camera;
-                          fly the freecam and move resources anywhere).
+                          whole pile + ball teleport to your camera and
+                          THEN follow it: the carry point is pinned to
+                          the camera after the jump, killing the game's
+                          own correction that used to drag the load back
+                          toward your character; release to drop).
                           All local writes, no packets; server grab
                           checks unknown - creep up.
 
@@ -158,7 +161,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.16"
+local SCRIPT_VERSION = "oak-v29.17"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1629,8 +1632,9 @@ local function grabberRestoreAll()
                 if rec.scan and inst.PassthroughScanRadius ~= rec.scan then
                     inst.PassthroughScanRadius = rec.scan
                 end
-                if rawget(inst, "__havocGrabRay") then
+                if rawget(inst, "__havocGrabRay") or rawget(inst, "__havocGrabFollow") then
                     rawset(inst, "__havocGrabRay", nil)
+                    rawset(inst, "__havocGrabFollow", nil)
                     rawset(inst, "GetRayPosition", nil)
                 end
             end
@@ -1691,15 +1695,41 @@ local function grabRayThrough(self)
     return origin + dir.Unit * reach
 end
 
-local function grabberApplyRay(inst, through)
+-- dispatcher for the instance-method override: post-teleport FOLLOW wins
+-- (carry point pinned to the camera), then through-walls, then the class
+-- method itself (metatable fallback keeps vanilla semantics reachable)
+local function grabRayOverride(self)
+    if rawget(self, "__havocGrabFollow") == true and self.IsDragging == true then
+        local cam = Workspace.CurrentCamera
+        if cam then return cam.CFrame.Position end
+    end
+    if rawget(self, "__havocGrabRay") == true then
+        return grabRayThrough(self)
+    end
+    local mt = getmetatable(self)
+    if mt and type(mt.GetRayPosition) == "function" then
+        local ok, res = pcall(mt.GetRayPosition, self)
+        if ok and typeof(res) == "Vector3" then return res end
+    end
+    local char = LocalPlayer.Character
+    if char then return char:GetPivot().Position + Vector3.new(0, 2, 0) end
+    local cam = Workspace.CurrentCamera
+    return cam and cam.CFrame.Position or Vector3.new()
+end
+
+local function grabberApplyRay(inst, through, follow)
     pcall(function()
-        if through then
-            if rawget(inst, "GetRayPosition") ~= grabRayThrough then
-                rawset(inst, "__havocGrabRay", true)
-                rawset(inst, "GetRayPosition", grabRayThrough)
+        if follow == true then
+            rawset(inst, "__havocGrabFollow", true)
+        else
+            rawset(inst, "__havocGrabFollow", nil)
+        end
+        rawset(inst, "__havocGrabRay", through and true or nil)
+        if through or follow then
+            if rawget(inst, "GetRayPosition") ~= grabRayOverride then
+                rawset(inst, "GetRayPosition", grabRayOverride)
             end
-        elseif rawget(inst, "__havocGrabRay") then
-            rawset(inst, "__havocGrabRay", nil)
+        elseif rawget(inst, "GetRayPosition") == grabRayOverride then
             rawset(inst, "GetRayPosition", nil)
         end
     end)
@@ -1776,7 +1806,12 @@ local function grabberTeleport()
     local ap = ball:FindFirstChild("AlignPosition")
     if ap then ap.Position = target end
     GRAB_STATE.tpJob = { ball = ball, target = target, untilAt = os.clock() + 0.5, nextAt = 0 }
-    print(("[oaklands] grab tp: moved %d studs (%d assemblies)"):format(math.floor(delta.Magnitude), moved))
+    -- the game re-aims the carry point at a spot near your CHARACTER every
+    -- frame - that was the "correction" dragging the pile back toward the
+    -- old spot. From here on the carry point is pinned to the camera, so
+    -- the load follows you (fly anywhere) until you release.
+    rawset(inst, "__havocGrabFollow", true)
+    print(("[oaklands] grab tp: moved %d studs (%d assemblies) - load now follows the camera"):format(math.floor(delta.Magnitude), moved))
 end
 
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
@@ -1862,7 +1897,11 @@ local function grabberStep()
                 rec = {}
                 GRAB_STATE.recs[inst] = rec
             end
-            grabberApplyRay(inst, through)
+            -- follow auto-clears the moment the grab ends (release = drop)
+            if inst.IsDragging ~= true and rawget(inst, "__havocGrabFollow") then
+                rawset(inst, "__havocGrabFollow", nil)
+            end
+            grabberApplyRay(inst, through, rawget(inst, "__havocGrabFollow") == true)
             -- capture the server values once; SetStats re-pushes the
             -- reach on every equip, so it gets re-applied each tick
             local cur = inst.MaxDistance
