@@ -128,7 +128,11 @@
                           tags VEHICLE bed parts, never buildings) and
                           Grab Teleport (carry a load, press Y - the
                           whole pile + ball teleport to your camera;
-                          fly the freecam and move resources anywhere).
+                          while the freecam is on, a carry lock freezes
+                          the ball in place first - no re-aim, no auto-
+                          drop - so fly, then press Y to bring the load,
+                          press again to hop it along; freecam off or
+                          releasing ends the lock).
                           All local writes, no packets; server grab
                           checks unknown - creep up.
 
@@ -158,7 +162,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.16"
+local SCRIPT_VERSION = "oak-v29.18"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1633,6 +1637,10 @@ local function grabberRestoreAll()
                     rawset(inst, "__havocGrabRay", nil)
                     rawset(inst, "GetRayPosition", nil)
                 end
+                if rawget(inst, "__havocGrabLock") then
+                    rawset(inst, "__havocGrabLock", nil)
+                    rawset(inst, "UpdatePosition", nil)
+                end
             end
         end)
     end
@@ -1703,6 +1711,49 @@ local function grabberApplyRay(inst, through)
             rawset(inst, "GetRayPosition", nil)
         end
     end)
+end
+
+-- Freecam carry lock (oak-v29.18): while the freecam is on + Grab
+-- Teleport is enabled + a grab is live, the instance's UpdatePosition is
+-- swapped for this no-op. That stops the game's per-frame carry logic
+-- entirely - the align re-aim (which used to drag the load back toward
+-- the character), the >100-stud auto-release (which used to drop the
+-- load the moment the freecam flew away) and the camera-facing
+-- orientation chase. The ball + load freeze in place; the Y teleport
+-- still moves them (it writes the CFrame + align target directly) and
+-- can be pressed again to hop the load along. The lock releases when
+-- the grab ends, the freecam goes off, or the feature is toggled off.
+local function grabLockUpdate() end
+
+local function grabberLockStep()
+    local freeOn = genv.__HAVOC_OAKLANDS_FREECAM == true
+    local list = GRAB_STATE.list
+    if type(list) ~= "table" then return end
+    for _, inst in ipairs(list) do
+        pcall(function()
+            local wantLock = freeOn and Config.Grabber.TP == true
+                and inst.IsDragging == true and inst.DraggingBall ~= nil
+            if wantLock then
+                if rawget(inst, "UpdatePosition") ~= grabLockUpdate then
+                    rawset(inst, "__havocGrabLock", true)
+                    rawset(inst, "UpdatePosition", grabLockUpdate)
+                    if GRAB_STATE.lockPrint ~= true then
+                        GRAB_STATE.lockPrint = true
+                        print("[oaklands] grab lock: ball frozen - fly, then press "
+                            .. tostring(HOTKEY_BY_ID.GrabTP.Key.Name) .. " to bring the load")
+                    end
+                end
+            elseif rawget(inst, "__havocGrabLock") then
+                rawset(inst, "__havocGrabLock", nil)
+                rawset(inst, "UpdatePosition", nil)
+                inst.LastRayRes = nil  -- fresh aim baseline, no instant release
+                if GRAB_STATE.lockPrint == true then
+                    GRAB_STATE.lockPrint = false
+                    print("[oaklands] grab lock: released - normal carry control resumes")
+                end
+            end
+        end)
+    end
 end
 
 -- Grab Teleport (oak-v29.16): while a wormhole grab is live, the carried
@@ -1796,8 +1847,12 @@ local function grabberStep()
     local g = Config.Grabber
     if type(g) ~= "table" then return end
     -- Grab Teleport needs the instance list too, so the rescan stays alive
-    -- while either feature is on
-    if not g.Enhanced and not (g.TP == true) then return end
+    -- while either feature is on; if both are off, make sure no stale
+    -- freecam lock lingers on a live instance, then bail
+    if not g.Enhanced and not (g.TP == true) then
+        grabberLockStep()
+        return
+    end
     local now = os.clock()
     if now >= GRAB_STATE.nextFind then
         local list = findGrabbers()
@@ -1829,6 +1884,8 @@ local function grabberStep()
             GRAB_STATE.tpJob = nil
         end
     end
+    -- freecam carry lock runs even when only Grab Teleport is on
+    grabberLockStep()
     if not g.Enhanced then return end
     local list = GRAB_STATE.list
     if type(list) ~= "table" or #list == 0 then return end
