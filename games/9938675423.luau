@@ -13,6 +13,13 @@
                           gets a name+distance label, optional highlight.
                           A species filter (from /ReplicatedStorage/INFO)
                           lets you hide the junk trees and keep the rares.
+      • Rock ESP        - every minable rock (World.RockRegions, the
+                          Mineable + AltName attributes the chisel code
+                          reads), plus loose rocks (meteorites). Ore-bearing
+                          rocks show what they carry (Copper, Iron, Gold,
+                          Mythril, Amethyst...) straight from OreName.
+                          The type filter list fills itself from the rocks
+                          actually found and persists across sessions.
       • Loose Item ESP  - everything the CollectionService "Item" tag holds
                           (World.LooseItems etc) with name+distance.
       • Enemy ESP       - World.Enemies models (event mobs).
@@ -130,7 +137,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.11"
+local SCRIPT_VERSION = "oak-v29.12"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -175,6 +182,11 @@ local DEFAULTS = {
         TreeMaxDist    = 400,
         TreeHighlight  = true,
         Species        = {},
+        RockESP        = false,
+        RockMaxDist    = 600,
+        RockHighlight  = false,
+        RockTypes      = {},
+        RockSeen       = {},
         ItemESP        = false,
         ItemMaxDist    = 250,
         EnemyESP       = false,
@@ -261,6 +273,7 @@ end
 Config.World.TreeMaxDist = math.clamp(tonumber(Config.World.TreeMaxDist) or 400, 50, 2000)
 Config.World.ItemMaxDist = math.clamp(tonumber(Config.World.ItemMaxDist) or 250, 50, 1500)
 Config.World.EnemyMaxDist = math.clamp(tonumber(Config.World.EnemyMaxDist) or 500, 50, 2000)
+Config.World.RockMaxDist = math.clamp(tonumber(Config.World.RockMaxDist) or 600, 50, 2000)
 Config.Players.MaxDist = math.clamp(tonumber(Config.Players.MaxDist) or 1000, 100, 3000)
 Config.Camera.Speed = math.clamp(tonumber(Config.Camera.Speed) or 120, 25, 500)
 -- REMOVED features (oak-v2): Auto Chop (crashed the client; swings go
@@ -301,6 +314,47 @@ local function saveConfigDebounced()
         if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
         saveConfig()
     end)
+end
+
+-- ============================================================
+-- ROCK TYPE LIST (the Rock ESP filter - oak-v29.12)
+-- Rock names are discovered from live data (RockRegions + loose rocks)
+-- and stored in Config.World.RockSeen so the list survives sessions. The
+-- multiselect rebuilds its rows on every open, so new names simply show
+-- up as the scans find them - no UI rebuild needed.
+-- ============================================================
+local ROCK_TYPE_LIST, ROCK_TYPE_SET = {}, {}
+local ROCK_TYPE_UI = nil
+-- default on (nil ~= false), same convention as the tree species filter
+Config.World.RockSeen = (type(Config.World.RockSeen) == "table") and Config.World.RockSeen or {}
+Config.World.RockTypes = (type(Config.World.RockTypes) == "table") and Config.World.RockTypes or {}
+do
+    for name in pairs(Config.World.RockSeen) do
+        if type(name) == "string" and not ROCK_TYPE_SET[name] then
+            ROCK_TYPE_SET[name] = true
+            ROCK_TYPE_LIST[#ROCK_TYPE_LIST + 1] = name
+        end
+    end
+    for name in pairs(Config.World.RockTypes) do
+        if type(name) == "string" and not ROCK_TYPE_SET[name] then
+            ROCK_TYPE_SET[name] = true
+            ROCK_TYPE_LIST[#ROCK_TYPE_LIST + 1] = name
+        end
+    end
+    table.sort(ROCK_TYPE_LIST)
+end
+
+local function addRockType(name)
+    if type(name) ~= "string" or name == "" or ROCK_TYPE_SET[name] then return false end
+    ROCK_TYPE_SET[name] = true
+    ROCK_TYPE_LIST[#ROCK_TYPE_LIST + 1] = name
+    table.sort(ROCK_TYPE_LIST)
+    Config.World.RockSeen[name] = true
+    if ROCK_TYPE_UI and type(ROCK_TYPE_UI.update) == "function" then
+        pcall(ROCK_TYPE_UI.update)
+    end
+    saveConfigDebounced()
+    return true
 end
 
 -- ============================================================
@@ -480,7 +534,7 @@ end))
 local ESP_STATE = genv.__HAVOC_OAKLANDS_ESP
 if type(ESP_STATE) ~= "table" then
     ESP_STATE = {
-        trees = {}, items = {}, enemies = {}, players = {},
+        trees = {}, rocks = {}, items = {}, enemies = {}, players = {},
     }
     genv.__HAVOC_OAKLANDS_ESP = ESP_STATE
 end
@@ -488,7 +542,7 @@ end
 -- clean leftovers from a previous run (their ScreenGui is already
 -- gone, but Highlight instances live on the WORLD models)
 do
-    local buckets = { ESP_STATE.trees, ESP_STATE.items, ESP_STATE.enemies, ESP_STATE.players }
+    local buckets = { ESP_STATE.trees, ESP_STATE.rocks, ESP_STATE.items, ESP_STATE.enemies, ESP_STATE.players }
     for _, bucket in ipairs(buckets) do
         if type(bucket) == "table" then
             for _, entry in pairs(bucket) do
@@ -503,12 +557,13 @@ do
 end
 
 local TREE_COLOR   = Color3.fromRGB(255, 205, 70)
+local ROCK_COLOR   = Color3.fromRGB(210, 175, 120)
 local ITEM_COLOR   = Color3.fromRGB(120, 230, 255)
 local ENEMY_COLOR  = Color3.fromRGB(255, 90, 90)
 local PLAYER_COLOR = Color3.fromRGB(140, 255, 140)
 
 local ICON_CAP = {
-    trees = 70, items = 100, enemies = 40, players = 30,
+    trees = 70, rocks = 80, items = 100, enemies = 40, players = 30,
 }
 
 local function makeEntry(target, color, withHighlight)
@@ -579,7 +634,7 @@ local function listPos(inst)
 end
 
 -- candidates list: {target = instance, pos = Vector3|nil (live), text = string, species = string|nil}
-local treeList, itemList, enemyList, playerList = {}, {}, {}, {}
+local treeList, rockList, itemList, enemyList, playerList = {}, {}, {}, {}, {}
 
 local function scanTrees(list)
     table.clear(list)
@@ -608,6 +663,81 @@ local function scanTrees(list)
                     end
                 end
             end
+        end
+    end
+end
+
+-- a rock node = RockName attr (loose rocks) or Mineable attr (region
+-- formations; the dump shows those as direct region children, sometimes
+-- wrapped one model deep - check both levels like the tree scan does)
+local function rockInfoOf(obj)
+    local target
+    if obj:GetAttribute("RockName") or obj:GetAttribute("Mineable") then
+        target = obj
+    else
+        for _, sub in ipairs(obj:GetChildren()) do
+            if sub:GetAttribute("RockName") or sub:GetAttribute("Mineable") then
+                target = sub
+                break
+            end
+        end
+    end
+    if not target then return nil end
+    local name = target:GetAttribute("RockName") or target:GetAttribute("AltName") or target.Name
+    local ore = target:GetAttribute("OreName")
+    return target, tostring(name), ore ~= nil and tostring(ore) or nil
+end
+
+local function scanRocks(list)
+    table.clear(list)
+    local world = Workspace:FindFirstChild("World")
+    local regions = world and world:FindFirstChild("RockRegions")
+    if regions then
+        for _, region in ipairs(regions:GetChildren()) do
+            for _, obj in ipairs(region:GetChildren()) do
+                local target, name, ore = rockInfoOf(obj)
+                if target then
+                    addRockType(name)
+                    if Config.World.RockTypes[name] ~= false then
+                        local pos = listPos(target)
+                        if pos then
+                            local text = ore and ("%s (%s)"):format(ore, name) or name
+                            list[#list + 1] = { target = target, pos = pos, text = text, species = name }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- loose rocks (meteorites land all over the world) ride in LooseItems
+    local loose = world and world:FindFirstChild("LooseItems")
+    if loose then
+        for _, obj in ipairs(loose:GetChildren()) do
+            local nm = obj:GetAttribute("RockName")
+            if nm then
+                local name = tostring(nm)
+                addRockType(name)
+                if Config.World.RockTypes[name] ~= false then
+                    local pos = listPos(obj)
+                    if pos then
+                        list[#list + 1] = { target = obj, pos = pos, text = name, species = name }
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- one-off pass at menu build so the filter list starts populated from the
+-- area that is already loaded (the scans top it up live afterwards)
+local function discoverRockTypes()
+    local world = Workspace:FindFirstChild("World")
+    local regions = world and world:FindFirstChild("RockRegions")
+    if not regions then return end
+    for _, region in ipairs(regions:GetChildren()) do
+        for _, obj in ipairs(region:GetChildren()) do
+            local _, name = rockInfoOf(obj)
+            if name then addRockType(name) end
         end
     end
 end
@@ -692,7 +822,7 @@ end
 -- ESP render tick (0.2s throttle)
 do
     local lastTick = 0
-    local treeRescanAt, itemRescanAt, enemyRescanAt, playerRescanAt = 0, 0, 0, 0
+    local treeRescanAt, rockRescanAt, itemRescanAt, enemyRescanAt, playerRescanAt = 0, 0, 0, 0, 0
     track(RunService.RenderStepped:Connect(function()
         if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
         if not screenGui then return end
@@ -701,11 +831,12 @@ do
         lastTick = now
 
         local w = Config.World
-        local anyVisual = w.TreeESP or w.ItemESP or w.EnemyESP or Config.Players.Enable
+        local anyVisual = w.TreeESP or w.RockESP or w.ItemESP or w.EnemyESP or Config.Players.Enable
         if not anyVisual then
             -- slow idle: make sure everything is released once
-            if next(ESP_STATE.trees) or next(ESP_STATE.items) or next(ESP_STATE.enemies) or next(ESP_STATE.players) then
+            if next(ESP_STATE.trees) or next(ESP_STATE.rocks) or next(ESP_STATE.items) or next(ESP_STATE.enemies) or next(ESP_STATE.players) then
                 releaseBucket(ESP_STATE.trees)
+                releaseBucket(ESP_STATE.rocks)
                 releaseBucket(ESP_STATE.items)
                 releaseBucket(ESP_STATE.enemies)
                 releaseBucket(ESP_STATE.players)
@@ -721,6 +852,16 @@ do
             refreshBucket(ESP_STATE.trees, treeList, w.TreeMaxDist, ICON_CAP.trees, TREE_COLOR, w.TreeHighlight)
         else
             releaseBucket(ESP_STATE.trees)
+        end
+
+        if w.RockESP then
+            if now >= rockRescanAt then
+                rockRescanAt = now + 6
+                scanRocks(rockList)
+            end
+            refreshBucket(ESP_STATE.rocks, rockList, w.RockMaxDist, ICON_CAP.rocks, ROCK_COLOR, w.RockHighlight)
+        else
+            releaseBucket(ESP_STATE.rocks)
         end
 
         if w.ItemESP then
@@ -2449,7 +2590,7 @@ local function buildMenu()
         end)
     end
     local function multiselect(page, text, items, isOn, setOn)
-        guard("multiselect " .. text, function()
+        return guard("multiselect " .. text, function()
             return UILib.makeMultiSelect(page, text, items, isOn, setOn, { overlayParent = win.popupLayer })
         end)
     end
@@ -2490,6 +2631,32 @@ local function buildMenu()
             function(name) return Config.World.Species[name] ~= false end,
             function(name, on)
                 Config.World.Species[name] = on and true or false
+                saveConfig()
+            end)
+    end
+
+    section(pw, "Rocks")
+    toggle(pw, "Rock ESP",
+        function() return Config.World.RockESP end,
+        function(v)
+            Config.World.RockESP = v
+            notify(v and "Rock ESP on" or "Rock ESP off")
+        end)
+    slider(pw, "Max Distance",
+        function() return Config.World.RockMaxDist end,
+        function(v) Config.World.RockMaxDist = v end, 25, 50, 2000,
+        function(v) return ("%dm"):format(v) end)
+    toggle(pw, "Highlight",
+        function() return Config.World.RockHighlight end,
+        function(v) Config.World.RockHighlight = v end)
+
+    section(pw, "Rock types")
+    do
+        discoverRockTypes()
+        ROCK_TYPE_UI = multiselect(pw, "Types", ROCK_TYPE_LIST,
+            function(name) return Config.World.RockTypes[name] ~= false end,
+            function(name, on)
+                Config.World.RockTypes[name] = on and true or false
                 saveConfig()
             end)
     end
