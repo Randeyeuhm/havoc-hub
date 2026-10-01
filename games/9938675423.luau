@@ -162,7 +162,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.19"
+local SCRIPT_VERSION = "oak-v29.20"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1786,6 +1786,23 @@ local function grabberTeleport()
     local ball = inst.DraggingBall
     if not (typeof(ball) == "Instance" and ball.Parent) then
         print("[oaklands] grab tp: no dragging ball")
+        return
+    end
+    -- the server force-releases the carry once the pile is way too far
+    -- from the player - the welds vanish and the items are already loose
+    -- at the spot. Moving the empty ball would do nothing, so say so.
+    local welded = 0
+    for _, w in ipairs(ball:GetChildren()) do
+        pcall(function()
+            if (w:IsA("Weld") or w:IsA("WeldConstraint"))
+                and ((w.Part0 and w.Part0 ~= ball and w.Part0.Parent)
+                    or (w.Part1 and w.Part1 ~= ball and w.Part1.Parent)) then
+                welded = welded + 1
+            end
+        end)
+    end
+    if welded == 0 then
+        print("[oaklands] grab tp: server already released this load (too far from the player) - the items are loose at the spot")
         return
     end
     local cam = Workspace.CurrentCamera
