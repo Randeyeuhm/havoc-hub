@@ -68,18 +68,6 @@
         drag), then the freecam drops so you SEE where it landed.
         Console prints parts / assemblies / wheels + a settle line.
         Same class of teleport as the store warps.
-      • Cargo Lock     - optional, OFF by default: while you are
-        seated, every loose thing (World.LooseItems) inside the lock
-        radius (25-300 studs) is LOCKED onto the vehicle - glued at
-        its exact car-relative pose (massless + non-colliding) and
-        carried along wherever the car goes (drive, fly, cam tp) -
-        even when it sits outside the trunk/cargo area. The game
-        itself only adopts cargo once it rests in its crate and no
-        client packet can force that (packet catalog checked), so
-        this replicates the hold client-side, same family as the
-        dragger's carry. Releases when toggled off, the part is gone,
-        or the vehicle changes; re-exec restores leftovers. Radius
-        slider sits right under the toggle.
 
     Carry
       • Enhanced Drag   - optional, OFF by default. The carry/pickup
@@ -142,7 +130,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.9"
+local SCRIPT_VERSION = "oak-v29.10"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -221,8 +209,6 @@ local DEFAULTS = {
         Fly      = false,
         FlySpeed = 150,  -- studs/s for the Vehicle Fly controller
         CamTP    = false, -- press T while driving: teleport to the camera (freecam)
-        CargoGrab   = false, -- lock loose stuff onto the vehicle while seated
-        CargoRadius = 100,   -- lock radius (studs) for Cargo Lock
     },
     Camera = {
         Free  = false,
@@ -294,7 +280,6 @@ Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 100000
 Config.Drag.Throw = math.clamp(tonumber(Config.Drag.Throw) or 1, 1, 100000)
 Config.Vehicle.Mult = math.clamp(tonumber(Config.Vehicle.Mult) or 3, 1, 25)
 Config.Vehicle.FlySpeed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
-Config.Vehicle.CargoRadius = math.clamp(tonumber(Config.Vehicle.CargoRadius) or 100, 25, 300)
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
 
 local function saveConfig()
@@ -1467,23 +1452,14 @@ local function vehicleFlyStep(dt)
     root.AssemblyAngularVelocity = Vector3.new(0, av.Y * 0.7, 0) + axis * corr
 end
 
--- Cargo Lock (oak-v29.9): while seated, every loose thing (World.LooseItems)
--- inside the lock radius gets LOCKED onto the vehicle - glued at its exact
--- current car-relative pose, made massless + non-colliding, and carried
--- along everywhere the vehicle goes (drive, fly, even a cam teleport),
--- even when it sits outside the trunk/cargo area. The game itself only
--- adopts cargo once it rests in its crate and no client packet can force
--- that (whole packet catalog checked) - so this replicates the "loaded
--- cargo" hold client-side, same family as the dragger's carry. Releases
--- when toggled off, the part is gone, or the vehicle changes; a re-exec
--- restores anything a previous run left held.
-local CARGO_STATE = { parts = {}, lastScan = 0, lastPrint = 0 }
-local CARGO_CAP = 32
-
--- a previous run may have left parts held (re-exec): hand them back
+-- Cargo Lock (removed in oak-v29.10): live testing showed it does not
+-- hold loose items (they still could not be picked up / did not ride) -
+-- the client-side hold can't beat however the game re-simulates loose
+-- parts, so the whole feature is gone. One-time cleanup: if a previous
+-- run left items with CanCollide=false / Massless=true, restore them.
 pcall(function()
     local old = VEH_STATE.cargoLock
-    if type(old) == "table" and type(old.parts) == "table" and old ~= CARGO_STATE then
+    if type(old) == "table" and type(old.parts) == "table" then
         for p, st in pairs(old.parts) do
             if p.Parent then
                 pcall(function()
@@ -1495,143 +1471,6 @@ pcall(function()
         old.parts = {}
     end
 end)
-
-local function cargoCount()
-    local n = 0
-    for _ in pairs(CARGO_STATE.parts) do n = n + 1 end
-    return n
-end
-
-local function cargoPrint(text)
-    local now = os.clock()
-    if now - (CARGO_STATE.lastPrint or 0) > 2 then
-        CARGO_STATE.lastPrint = now
-        print("[oaklands] " .. text)
-    end
-end
-
-local function cargoReleaseAll()
-    local n = 0
-    for p, st in pairs(CARGO_STATE.parts) do
-        if p.Parent then
-            pcall(function()
-                p.CanCollide = st.cc
-                p.Massless = st.ml
-            end)
-        end
-        n = n + 1
-    end
-    CARGO_STATE.parts = {}
-    CARGO_STATE.root = nil
-    if n > 0 then
-        print(("[oaklands] cargo lock: released %d piece(s)"):format(n))
-    end
-end
-
-local function cargoAcquire(root, radius)
-    local world = Workspace:FindFirstChild("World")
-    local loose = world and world:FindFirstChild("LooseItems")
-    if not loose then return 0 end
-    local okL, items = pcall(function() return loose:GetDescendants() end)
-    if not okL or not items then return 0 end
-    local ch = LocalPlayer.Character
-    local got = 0
-    for _, p in ipairs(items) do
-        if cargoCount() >= CARGO_CAP then break end
-        if p:IsA("BasePart") and not p.Anchored and not (ch and p:IsDescendantOf(ch)) then
-            local asm = p.AssemblyRootPart
-            if asm and asm ~= root and not CARGO_STATE.parts[asm] then
-                if (asm.Position - root.Position).Magnitude <= radius then
-                    local okS = pcall(function()
-                        local cc, ml = asm.CanCollide, asm.Massless
-                        local off = root.CFrame:Inverse() * asm.CFrame
-                        CARGO_STATE.parts[asm] = { cc = cc, ml = ml, off = off }
-                        asm.CanCollide = false
-                        asm.Massless = true
-                    end)
-                    if okS then got = got + 1 end
-                end
-            end
-        end
-    end
-    return got
-end
-
-local function cargoGlue()
-    local root = CARGO_STATE.root
-    if not root or not root.Parent then
-        cargoReleaseAll()
-        return
-    end
-    local rcf = root.CFrame
-    local dead = nil
-    for p, st in pairs(CARGO_STATE.parts) do
-        if not p.Parent then
-            dead = dead or {}
-            dead[#dead + 1] = p
-        else
-            local want = rcf * st.off
-            local dp = (p.Position - want.Position).Magnitude
-            local dl = (p.CFrame.LookVector - want.LookVector).Magnitude
-            if dp > 0.02 or dl > 0.02 then
-                pcall(function()
-                    p.CFrame = want
-                    p.AssemblyLinearVelocity = Vector3.zero
-                    p.AssemblyAngularVelocity = Vector3.zero
-                end)
-            end
-        end
-    end
-    if dead then
-        for _, p in ipairs(dead) do
-            CARGO_STATE.parts[p] = nil
-        end
-    end
-end
-
-local function cargoStep()
-    if not Config.Vehicle.CargoGrab then
-        if cargoCount() > 0 then cargoReleaseAll() end
-        return
-    end
-    local ch = LocalPlayer.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local seat = hum and hum.SeatPart
-    if not (seat and seat:IsA("VehicleSeat")) then return end
-    local root = seat.AssemblyRootPart or seat
-    if CARGO_STATE.root and CARGO_STATE.root ~= root then
-        -- switched vehicles: whatever the old ride carried lets go
-        cargoReleaseAll()
-    end
-    CARGO_STATE.root = root
-    local now = os.clock()
-    if now - (CARGO_STATE.lastScan or 0) >= 0.5 then
-        CARGO_STATE.lastScan = now
-        local radius = math.clamp(tonumber(Config.Vehicle.CargoRadius) or 100, 25, 300)
-        local got = cargoAcquire(root, radius)
-        if got > 0 then
-            cargoPrint(("cargo lock: locked %d more piece(s), %d held"):format(got, cargoCount()))
-        end
-    end
-end
-
-track(task.spawn(function()
-    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
-        task.wait(0.15)
-        pcall(cargoStep)
-    end
-end))
-
-track(RunService.Heartbeat:Connect(function()
-    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
-    if not Config.Vehicle.CargoGrab then return end
-    if next(CARGO_STATE.parts) ~= nil then
-        pcall(cargoGlue)
-    end
-end))
-
--- hand the live lock to the genv so a re-exec can restore what it held
-VEH_STATE.cargoLock = CARGO_STATE
 
 track(RunService.RenderStepped:Connect(function(dt)
     if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
@@ -2734,16 +2573,6 @@ local function buildMenu()
             notify(v and ("Cam teleport on - press " .. HOTKEY_BY_ID.CamTP.Key.Name .. " to pull the vehicle to your camera") or "Cam teleport off")
         end, HOTKEY_BY_ID.CamTP)
     keybindRow(pmv, HOTKEY_BY_ID.CamTP)
-    toggle(pmv, "Cargo Lock",
-        function() return Config.Vehicle.CargoGrab end,
-        function(v)
-            Config.Vehicle.CargoGrab = v
-            notify(v and "Cargo lock on - loose stuff in range locks onto the ride" or "Cargo lock off")
-        end)
-    slider(pmv, "Lock Radius",
-        function() return Config.Vehicle.CargoRadius end,
-        function(v) Config.Vehicle.CargoRadius = v end, 5, 25, 300,
-        function(v) return ("%d studs"):format(v) end)
     section(pmv, "Camera")
     toggle(pmv, "Freecam",
         function() return Config.Camera.Free end,
