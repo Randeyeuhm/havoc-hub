@@ -116,14 +116,18 @@
       • Enhanced Grabbers - optional: the wormhole grabbers (Grabby
                           Grabber, Grabbiest Grabber, Lunar Staff - all
                           ONE shared client behavior, found via getgc)
-                          get client-side tuning: Grab Reach (x1-10 on
+                          get client-side tuning: Grab Reach (x1-100 on
                           the server-pushed MaxDistance the carry ray
                           uses), Pull Power (x1-100000 on the carry
-                          ball's align forces while a grab is live) and
-                          Ghost Radius (the DragNoCollide ghost-scan
-                          radius - pair with No-Collide Drag). All local
-                          writes, no packets; server grab checks
-                          unknown - creep up.
+                          ball's align forces while a grab is live),
+                          Grab Through Walls (drops the game's wall-
+                          clamp ray so the grab point can sit past
+                          buildings - point lands inside geometry when
+                          aimed at ground, that is the trade) and Ghost
+                          Radius (the DragNoCollide scan - the game only
+                          tags VEHICLE bed parts, never buildings).
+                          All local writes, no packets; server grab
+                          checks unknown - creep up.
 
     Misc
       • Fullbright       - grey ambient + no fog, re-applied every second
@@ -151,7 +155,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.14"
+local SCRIPT_VERSION = "oak-v29.15"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -233,6 +237,7 @@ local DEFAULTS = {
         Enhanced = false,
         Reach    = 1,     -- multiplier on the server-pushed grabber MaxDistance
         Power    = 1,     -- multiplier on the carry ball's align forces
+        Through  = false, -- drop the wall-clamp ray (grab through buildings)
         GhostRadius = 34, -- DragNoCollide passthrough scan radius (34 = vanilla)
     },
     Vehicle = {
@@ -311,8 +316,9 @@ Config.Movement.SprintBoost = 1
 Config.Drag.Reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
 Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 100000)
 Config.Drag.Throw = math.clamp(tonumber(Config.Drag.Throw) or 1, 1, 100000)
-Config.Grabber.Reach = math.clamp(tonumber(Config.Grabber.Reach) or 1, 1, 10)
+Config.Grabber.Reach = math.clamp(tonumber(Config.Grabber.Reach) or 1, 1, 100)
 Config.Grabber.Power = math.clamp(tonumber(Config.Grabber.Power) or 1, 1, 100000)
+Config.Grabber.Through = Config.Grabber.Through == true
 Config.Grabber.GhostRadius = math.clamp(tonumber(Config.Grabber.GhostRadius) or 34, 34, 250)
 Config.Vehicle.Mult = math.clamp(tonumber(Config.Vehicle.Mult) or 3, 1, 25)
 Config.Vehicle.FlySpeed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
@@ -1616,6 +1622,10 @@ local function grabberRestoreAll()
                 if rec.scan and inst.PassthroughScanRadius ~= rec.scan then
                     inst.PassthroughScanRadius = rec.scan
                 end
+                if rawget(inst, "__havocGrabRay") then
+                    rawset(inst, "__havocGrabRay", nil)
+                    rawset(inst, "GetRayPosition", nil)
+                end
             end
         end)
     end
@@ -1630,6 +1640,62 @@ local function grabberRestoreAll()
             end
         end)
     end
+end
+
+-- Grab Through Walls: the game's own GetRayPosition fires a SECOND ray
+-- from the character toward the aim point that clamps the result to the
+-- first wall in the way - that clamp is what stops grabs through
+-- buildings. While the toggle is on we rawset an instance method that
+-- keeps the original first ray + reach extension but drops the clamp, so
+-- the grab point (and the StartDrag position the server selects around)
+-- can sit at full reach along your aim line, even behind walls. When the
+-- aim line points into open ground the point lands inside it and the
+-- pile presses - that is the trade; off = byte-vanilla behavior.
+local function grabRayThrough(self)
+    local reach = tonumber(self.Distance) or tonumber(self.MaxDistance) or 12
+    local char = LocalPlayer.Character
+    local cam = Workspace.CurrentCamera
+    if not char then
+        if cam then return cam.CFrame.Position + cam.CFrame.LookVector * reach end
+        return Vector3.new()
+    end
+    local origin = char:GetPivot().Position + Vector3.new(0, 2, 0)
+    local unit
+    pcall(function() unit = LocalPlayer:GetMouse().UnitRay end)
+    if not unit then
+        if cam then return origin + cam.CFrame.LookVector * reach end
+        return origin
+    end
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    local exclude = { char }
+    local world = Workspace:FindFirstChild("World")
+    local fx = world and world:FindFirstChild("Effects")
+    if fx then exclude[#exclude + 1] = fx end
+    rp.FilterDescendantsInstances = exclude
+    rp.RespectCanCollide = true
+    -- first ray: where the mouse points (same as the original)
+    local hit = Workspace:Raycast(unit.Origin, unit.Direction.Unit * reach, rp)
+    local target = hit and hit.Position or (unit.Origin + unit.Direction.Unit * 1000)
+    -- extend along character -> aim to full reach and stop there; no
+    -- second ray = no wall clamp
+    local dir = target - origin
+    if dir.Magnitude < 0.01 then dir = unit.Direction.Unit end
+    return origin + dir.Unit * reach
+end
+
+local function grabberApplyRay(inst, through)
+    pcall(function()
+        if through then
+            if rawget(inst, "GetRayPosition") ~= grabRayThrough then
+                rawset(inst, "__havocGrabRay", true)
+                rawset(inst, "GetRayPosition", grabRayThrough)
+            end
+        elseif rawget(inst, "__havocGrabRay") then
+            rawset(inst, "__havocGrabRay", nil)
+            rawset(inst, "GetRayPosition", nil)
+        end
+    end)
 end
 
 local function grabberStep()
@@ -1650,7 +1716,7 @@ local function grabberStep()
     local list = GRAB_STATE.list
     if type(list) ~= "table" or #list == 0 then return end
 
-    local reachMult = math.clamp(tonumber(g.Reach) or 1, 1, 10)
+    local reachMult = math.clamp(tonumber(g.Reach) or 1, 1, 100)
     local powerMult = math.clamp(tonumber(g.Power) or 1, 1, 100000)
     local ghost = math.clamp(tonumber(g.GhostRadius) or 34, 34, 250)
 
@@ -1666,6 +1732,11 @@ local function grabberStep()
         GRAB_STATE.printedGhost = ghost
         print(("[oaklands] grabber ghost radius -> %d studs"):format(ghost))
     end
+    local through = g.Through == true
+    if through and GRAB_STATE.printedThrough ~= true then
+        GRAB_STATE.printedThrough = true
+        print("[oaklands] grabber through-walls on")
+    end
 
     for _, inst in ipairs(list) do
         pcall(function()
@@ -1674,6 +1745,7 @@ local function grabberStep()
                 rec = {}
                 GRAB_STATE.recs[inst] = rec
             end
+            grabberApplyRay(inst, through)
             -- capture the server values once; SetStats re-pushes the
             -- reach on every equip, so it gets re-applied each tick
             local cur = inst.MaxDistance
@@ -2976,9 +3048,15 @@ local function buildMenu()
             if not v then pcall(grabberRestoreAll) end
             notify(v and "Grabber tuning on - reaches farther, pulls harder, ghosts wider" or "Grabbers back to vanilla")
         end)
+    toggle(pmv, "Grab Through Walls",
+        function() return Config.Grabber.Through end,
+        function(v)
+            Config.Grabber.Through = v
+            notify(v and "Grab through walls on - aim point can sit past buildings" or "Grab through walls off - vanilla aim")
+        end)
     slider(pmv, "Grab Reach",
         function() return Config.Grabber.Reach end,
-        function(v) Config.Grabber.Reach = v end, 0.5, 1, 10,
+        function(v) Config.Grabber.Reach = v end, 0.5, 1, 100,
         function(v)
             if v <= 1.001 then return "1x (vanilla)" end
             return (tostring(v) .. "x")
