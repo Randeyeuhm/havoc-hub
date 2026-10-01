@@ -113,6 +113,17 @@
                           physics of a drag the server already granted - no
                           packets. Server checks on dragging are unknown:
                           keep modest.
+      • Enhanced Grabbers - optional: the wormhole grabbers (Grabby
+                          Grabber, Grabbiest Grabber, Lunar Staff - all
+                          ONE shared client behavior, found via getgc)
+                          get client-side tuning: Grab Reach (x1-10 on
+                          the server-pushed MaxDistance the carry ray
+                          uses), Pull Power (x1-100000 on the carry
+                          ball's align forces while a grab is live) and
+                          Ghost Radius (the DragNoCollide ghost-scan
+                          radius - pair with No-Collide Drag). All local
+                          writes, no packets; server grab checks
+                          unknown - creep up.
 
     Misc
       • Fullbright       - grey ambient + no fog, re-applied every second
@@ -140,7 +151,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.13"
+local SCRIPT_VERSION = "oak-v29.14"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -218,6 +229,12 @@ local DEFAULTS = {
         Throw    = 1,    -- multiplier on the classic dragger's G-throw impulse
         NoCollide = false, -- drag through DragNoCollide-tagged parts (game's own passthrough)
     },
+    Grabber = {
+        Enhanced = false,
+        Reach    = 1,     -- multiplier on the server-pushed grabber MaxDistance
+        Power    = 1,     -- multiplier on the carry ball's align forces
+        GhostRadius = 34, -- DragNoCollide passthrough scan radius (34 = vanilla)
+    },
     Vehicle = {
         Enabled = false,
         Mult    = 3,     -- multiplier on VehicleSeat MaxSpeed + Torque
@@ -294,6 +311,9 @@ Config.Movement.SprintBoost = 1
 Config.Drag.Reach = math.clamp(tonumber(Config.Drag.Reach) or 12, 12, 24)
 Config.Drag.Strength = math.clamp(tonumber(Config.Drag.Strength) or 1, 1, 100000)
 Config.Drag.Throw = math.clamp(tonumber(Config.Drag.Throw) or 1, 1, 100000)
+Config.Grabber.Reach = math.clamp(tonumber(Config.Grabber.Reach) or 1, 1, 10)
+Config.Grabber.Power = math.clamp(tonumber(Config.Grabber.Power) or 1, 1, 100000)
+Config.Grabber.GhostRadius = math.clamp(tonumber(Config.Grabber.GhostRadius) or 34, 34, 250)
 Config.Vehicle.Mult = math.clamp(tonumber(Config.Vehicle.Mult) or 3, 1, 25)
 Config.Vehicle.FlySpeed = math.clamp(tonumber(Config.Vehicle.FlySpeed) or 150, 25, 500)
 Config.Misc.FullbrightIntensity = math.clamp(tonumber(Config.Misc.FullbrightIntensity) or 190, 0, 255)
@@ -1519,6 +1539,202 @@ track(task.spawn(function()
     end
 end))
 pcall(noCollideStep)
+
+-- ============================================================
+-- GRABBER TUNING  (oak-v29.14 - the wormhole grabbers' client levers)
+-- ============================================================
+-- Grabby Grabber, Grabbiest Grabber and the Lunar Staff (MoonStaff) all
+-- run ONE client behavior (CON/_GrabberBehaviorBase): a click sends
+-- StartDrag ONCE, the SERVER picks the objects and spawns a DraggingBall
+-- in World.Effects (AlignPosition + AlignOrientation + a weld per
+-- grabbed object), and the CLIENT drives the carry every frame by
+-- writing DraggingBall.AlignPosition.Position toward the mouse ray -
+-- a ray capped by the behavior's MaxDistance (server-pushed on every
+-- equip through GetStats). Client-side levers, all local writes:
+--   * MaxDistance                          - grab reach (multiplier)
+--   * ball AlignPosition.MaxForce / AlignOrientation.MaxTorque
+--                                          - carry strength
+--   * PassthroughDefaultRadius / ScanRadius - the ghost-scan radius
+--     (only runs when the game's DragNoCollide passthrough is active -
+--     pair with No-Collide Drag to switch the ghosting on)
+-- Behavior instances are found via getgc - the constant pair below is
+-- unique to this base. No packets; server grab validation is unknown,
+-- so creep the sliders up and watch for rubber-banding.
+local GRAB_STATE = genv.__HAVOC_OAKLANDS_GRAB
+if type(GRAB_STATE) ~= "table" then
+    GRAB_STATE = {}
+    genv.__HAVOC_OAKLANDS_GRAB = GRAB_STATE
+end
+if type(GRAB_STATE.list) ~= "table" then GRAB_STATE.list = {} end
+if type(GRAB_STATE.nextFind) ~= "number" then GRAB_STATE.nextFind = 0 end
+-- one record per behavior instance: {reach/ghost/scan = server values
+-- captured on first sight}; weak keys so unequipped tools drop away
+if type(GRAB_STATE.recs) ~= "table" then
+    GRAB_STATE.recs = setmetatable({}, { __mode = "k" })
+end
+-- one base per align constraint (same pattern as the dragger boost)
+if type(GRAB_STATE.forces) ~= "table" then
+    GRAB_STATE.forces = setmetatable({}, { __mode = "k" })
+end
+
+local function findGrabbers()
+    local out = {}
+    pcall(function()
+        local fn = getgc
+        if type(fn) ~= "function" then return end
+        local heaps = {}
+        local ok1, g1 = pcall(fn, true)
+        if ok1 and type(g1) == "table" then table.insert(heaps, g1) end
+        local ok2, g2 = pcall(fn)
+        if ok2 and type(g2) == "table" and g2 ~= g1 then table.insert(heaps, g2) end
+        local seen = {}
+        for _, heap in ipairs(heaps) do
+            for _, v in ipairs(heap) do
+                if type(v) == "table" and not seen[v]
+                    and rawget(v, "PassthroughBatchSize") == 3
+                    and rawget(v, "PassthroughScanInterval") == 0.08
+                    and typeof(rawget(v, "PassthroughOverlapParams")) == "OverlapParams" then
+                    seen[v] = true
+                    out[#out + 1] = v
+                end
+            end
+        end
+    end)
+    return out
+end
+
+local function grabberRestoreAll()
+    for inst, rec in pairs(GRAB_STATE.recs) do
+        pcall(function()
+            if type(inst) == "table" then
+                if rec.reach and inst.MaxDistance ~= rec.reach then
+                    inst.MaxDistance = rec.reach
+                end
+                if rec.ghost and inst.PassthroughDefaultRadius ~= rec.ghost then
+                    inst.PassthroughDefaultRadius = rec.ghost
+                end
+                if rec.scan and inst.PassthroughScanRadius ~= rec.scan then
+                    inst.PassthroughScanRadius = rec.scan
+                end
+            end
+        end)
+    end
+    for con, base in pairs(GRAB_STATE.forces) do
+        pcall(function()
+            if typeof(con) == "Instance" and con.Parent then
+                if con:IsA("AlignPosition") then
+                    con.MaxForce = base
+                elseif con:IsA("AlignOrientation") then
+                    con.MaxTorque = base
+                end
+            end
+        end)
+    end
+end
+
+local function grabberStep()
+    local g = Config.Grabber
+    if type(g) ~= "table" or not g.Enhanced then return end
+    local now = os.clock()
+    if now >= GRAB_STATE.nextFind then
+        local list = findGrabbers()
+        GRAB_STATE.list = list
+        -- found: recheck every 30s (unequip kills the instance, the next
+        -- equip builds a fresh one); empty: keep looking every 5s
+        GRAB_STATE.nextFind = now + (#list > 0 and 30 or 5)
+        if #list > 0 and GRAB_STATE.foundPrint ~= true then
+            GRAB_STATE.foundPrint = true
+            print(("[oaklands] grabber behavior found (server reach: %s)"):format(tostring(list[1].MaxDistance)))
+        end
+    end
+    local list = GRAB_STATE.list
+    if type(list) ~= "table" or #list == 0 then return end
+
+    local reachMult = math.clamp(tonumber(g.Reach) or 1, 1, 10)
+    local powerMult = math.clamp(tonumber(g.Power) or 1, 1, 100000)
+    local ghost = math.clamp(tonumber(g.GhostRadius) or 34, 34, 250)
+
+    if reachMult > 1 and GRAB_STATE.printedReach ~= reachMult then
+        GRAB_STATE.printedReach = reachMult
+        print(("[oaklands] grabber reach -> x%s"):format(tostring(reachMult)))
+    end
+    if powerMult > 1 and GRAB_STATE.printedPower ~= powerMult then
+        GRAB_STATE.printedPower = powerMult
+        print(("[oaklands] grabber pull power -> x%s"):format(tostring(powerMult)))
+    end
+    if ghost > 34 and GRAB_STATE.printedGhost ~= ghost then
+        GRAB_STATE.printedGhost = ghost
+        print(("[oaklands] grabber ghost radius -> %d studs"):format(ghost))
+    end
+
+    for _, inst in ipairs(list) do
+        pcall(function()
+            local rec = GRAB_STATE.recs[inst]
+            if not rec then
+                rec = {}
+                GRAB_STATE.recs[inst] = rec
+            end
+            -- capture the server values once; SetStats re-pushes the
+            -- reach on every equip, so it gets re-applied each tick
+            local cur = inst.MaxDistance
+            if rec.reach == nil and type(cur) == "number" then rec.reach = cur end
+            if rec.ghost == nil and type(inst.PassthroughDefaultRadius) == "number" then
+                rec.ghost = inst.PassthroughDefaultRadius
+            end
+            if rec.scan == nil and type(inst.PassthroughScanRadius) == "number" then
+                rec.scan = inst.PassthroughScanRadius
+            end
+
+            if rec.reach then
+                local want = (reachMult > 1) and (rec.reach * reachMult) or rec.reach
+                if cur ~= want then inst.MaxDistance = want end
+            end
+
+            if rec.ghost then
+                -- expand above the captured default; lower back to it when
+                -- the slider returns to vanilla (compare against CURRENT,
+                -- not against rec.ghost, or the restore would never fire)
+                local wantGhost = (ghost > rec.ghost) and ghost or rec.ghost
+                if tonumber(inst.PassthroughDefaultRadius) ~= wantGhost then
+                    inst.PassthroughDefaultRadius = wantGhost
+                end
+                if wantGhost > rec.ghost then
+                    local scan = tonumber(inst.PassthroughScanRadius)
+                    if not scan or scan < wantGhost then
+                        inst.PassthroughScanRadius = wantGhost
+                    end
+                end
+            end
+
+            if powerMult > 1 and inst.IsDragging == true then
+                local ball = inst.DraggingBall
+                if typeof(ball) == "Instance" and ball.Parent then
+                    local ap = ball:FindFirstChild("AlignPosition")
+                    if ap then
+                        local base = GRAB_STATE.forces[ap]
+                        if not base then base = ap.MaxForce; GRAB_STATE.forces[ap] = base end
+                        local want = math.min((tonumber(base) or 0) * powerMult, 1e12)
+                        if ap.MaxForce ~= want then ap.MaxForce = want end
+                    end
+                    local ao = ball:FindFirstChild("AlignOrientation")
+                    if ao then
+                        local base = GRAB_STATE.forces[ao]
+                        if not base then base = ao.MaxTorque; GRAB_STATE.forces[ao] = base end
+                        local want = math.min((tonumber(base) or 0) * powerMult, 1e12)
+                        if ao.MaxTorque ~= want then ao.MaxTorque = want end
+                    end
+                end
+            end
+        end)
+    end
+end
+
+track(task.spawn(function()
+    while genv.__HAVOC_OAKLANDS_GEN == MY_GEN do
+        task.wait(0.25)
+        pcall(grabberStep)
+    end
+end))
 
 -- ============================================================
 -- VEHICLE SPEED  (client-side; the DRIVER simulates the vehicle)
@@ -2751,6 +2967,36 @@ local function buildMenu()
             Config.Drag.NoCollide = v
             if not v then pcall(noCollideStep) end
             notify(v and "Drag no-collide on" or "Drag no-collide off")
+        end)
+    section(pmv, "Grabbers")
+    toggle(pmv, "Enhanced Grabbers",
+        function() return Config.Grabber.Enhanced end,
+        function(v)
+            Config.Grabber.Enhanced = v
+            if not v then pcall(grabberRestoreAll) end
+            notify(v and "Grabber tuning on - reaches farther, pulls harder, ghosts wider" or "Grabbers back to vanilla")
+        end)
+    slider(pmv, "Grab Reach",
+        function() return Config.Grabber.Reach end,
+        function(v) Config.Grabber.Reach = v end, 0.5, 1, 10,
+        function(v)
+            if v <= 1.001 then return "1x (vanilla)" end
+            return (tostring(v) .. "x")
+        end)
+    slider(pmv, "Pull Power",
+        function() return Config.Grabber.Power end,
+        function(v) Config.Grabber.Power = v end, 0.25, 1, 100000,
+        function(v)
+            if v <= 1.001 then return "1.00x (vanilla)" end
+            if v >= 100 then return ("%dx"):format(math.floor(v + 0.5)) end
+            return ("%.2fx"):format(v)
+        end)
+    slider(pmv, "Ghost Radius",
+        function() return Config.Grabber.GhostRadius end,
+        function(v) Config.Grabber.GhostRadius = v end, 1, 34, 250,
+        function(v)
+            if v <= 34 then return "34 (vanilla)" end
+            return ("%d studs"):format(v)
         end)
     section(pmv, "Vehicles")
     toggle(pmv, "Vehicle Speed",
