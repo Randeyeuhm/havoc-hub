@@ -127,12 +127,13 @@
                           Radius (the DragNoCollide scan - the game only
                           tags VEHICLE bed parts, never buildings) and
                           Grab Teleport (carry a load, press Y - the
-                          whole pile + ball teleport to your camera;
-                          while the freecam is on, a carry lock freezes
-                          the ball in place first - no re-aim, no auto-
-                          drop - so fly, then press Y to bring the load,
-                          press again to hop it along; freecam off or
-                          releasing ends the lock).
+                          whole pile + ball teleport to your camera; the
+                          landing is then pinned for 1.5s at 60Hz with
+                          the game's re-aim frozen for the window, and
+                          while the freecam is on a carry lock keeps the
+                          ball frozen the whole flight - no re-aim, no
+                          auto-drop; fly, press Y to bring the load,
+                          press again to hop it along).
                           All local writes, no packets; server grab
                           checks unknown - creep up.
 
@@ -1727,17 +1728,24 @@ local function grabLockUpdate() end
 
 local function grabberLockStep()
     local freeOn = genv.__HAVOC_OAKLANDS_FREECAM == true
+    local tp = GRAB_STATE.tpJob
     local list = GRAB_STATE.list
     if type(list) ~= "table" then return end
     for _, inst in ipairs(list) do
         pcall(function()
-            local wantLock = freeOn and Config.Grabber.TP == true
+            -- the lock serves two jobs: the freecam carry (while flying)
+            -- and the teleport landing hold - freezing the game's re-aim
+            -- for the 1.5s window so the correction cannot drag the load
+            -- back between Y presses
+            local freecamLock = freeOn and Config.Grabber.TP == true
+            local tpLock = tp ~= nil and inst.DraggingBall ~= nil and tp.ball == inst.DraggingBall
+            local wantLock = (freecamLock or tpLock)
                 and inst.IsDragging == true and inst.DraggingBall ~= nil
             if wantLock then
                 if rawget(inst, "UpdatePosition") ~= grabLockUpdate then
                     rawset(inst, "__havocGrabLock", true)
                     rawset(inst, "UpdatePosition", grabLockUpdate)
-                    if GRAB_STATE.lockPrint ~= true then
+                    if freecamLock and GRAB_STATE.lockPrint ~= true then
                         GRAB_STATE.lockPrint = true
                         print("[oaklands] grab lock: ball frozen - fly, then press "
                             .. tostring(HOTKEY_BY_ID.GrabTP.Key.Name) .. " to bring the load")
@@ -1843,9 +1851,10 @@ local function grabberTeleport()
     inst.LastRayRes = target
     local ap = ball:FindFirstChild("AlignPosition")
     if ap then ap.Position = target end
-    -- hold the ball at the landing spot for 1.5s - physics / streaming
-    -- get time to settle before the game's own carry logic takes over
-    GRAB_STATE.tpJob = { ball = ball, target = target, untilAt = os.clock() + 1.5, nextAt = 0 }
+    -- hold the ball at the landing spot for 1.5s - a tight 60Hz re-pin
+    -- on the grabber Heartbeat (drift > 0.5 studs), while the carry lock
+    -- freezes the game's own re-aim for the same window
+    GRAB_STATE.tpJob = { ball = ball, target = target, untilAt = os.clock() + 1.5 }
     print(("[oaklands] grab tp: moved %d studs (%d assemblies)"):format(math.floor(delta.Magnitude), moved))
 end
 
@@ -1884,27 +1893,8 @@ local function grabberStep()
             print(("[oaklands] grabber behavior found (server reach: %s)"):format(tostring(list[1].MaxDistance)))
         end
     end
-    -- grab tp landing re-pin (holds the ball for 1.5s - runs while a
-    -- teleport window is open)
-    local tp = GRAB_STATE.tpJob
-    if tp then
-        if os.clock() >= tp.untilAt then
-            GRAB_STATE.tpJob = nil
-        elseif typeof(tp.ball) == "Instance" and tp.ball.Parent then
-            local drift = (tp.ball.Position - tp.target).Magnitude
-            if drift > 4 and os.clock() >= tp.nextAt then
-                tp.nextAt = os.clock() + 0.1
-                pcall(function()
-                    tp.ball.CFrame = tp.ball.CFrame + (tp.target - tp.ball.Position)
-                    tp.ball.AssemblyLinearVelocity = Vector3.new()
-                    tp.ball.AssemblyAngularVelocity = Vector3.new()
-                end)
-            end
-        else
-            GRAB_STATE.tpJob = nil
-        end
-    end
-    -- freecam carry lock runs even when only Grab Teleport is on
+    -- (the 1.5s landing hold itself runs on its own Heartbeat connection
+    -- below; here we only apply the carry-lock state)
     grabberLockStep()
     if not g.Enhanced then return end
     local list = GRAB_STATE.list
@@ -2000,6 +1990,32 @@ track(task.spawn(function()
         task.wait(0.25)
         pcall(grabberStep)
     end
+end))
+
+-- tight landing hold (oak-v29.20): while a teleport window is open the
+-- ball is re-pinned to the landing spot at 60Hz (drift > 0.5 studs) so
+-- the game's correction cannot visibly drag the orb away between presses
+track(RunService.Heartbeat:Connect(function()
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    local tp = GRAB_STATE.tpJob
+    if not tp then return end
+    pcall(function()
+        if os.clock() >= tp.untilAt then
+            GRAB_STATE.tpJob = nil
+            return
+        end
+        local ball = tp.ball
+        if typeof(ball) == "Instance" and ball.Parent then
+            local drift = tp.target - ball.Position
+            if drift.Magnitude > 0.5 then
+                ball.CFrame = ball.CFrame + drift
+                ball.AssemblyLinearVelocity = Vector3.new()
+                ball.AssemblyAngularVelocity = Vector3.new()
+            end
+        else
+            GRAB_STATE.tpJob = nil
+        end
+    end)
 end))
 
 -- ============================================================
