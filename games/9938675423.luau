@@ -128,12 +128,12 @@
                           tags VEHICLE bed parts, never buildings) and
                           Grab Teleport (carry a load, press Y - the
                           whole pile + ball teleport to your camera; the
-                          landing is then pinned for 1.5s at 60Hz with
-                          the game's re-aim frozen for the window, and
-                          while the freecam is on a carry lock keeps the
-                          ball frozen the whole flight - no re-aim, no
-                          auto-drop; fly, press Y to bring the load,
-                          press again to hop it along).
+                          landing is pinned at 60Hz and the move keeps
+                          auto-retrying for a few seconds, with the
+                          game's re-aim frozen for the window - so even
+                          at the edge of the streaming range the load
+                          lands without spamming Y; while freecam is on
+                          a carry lock keeps it frozen the whole flight).
                           All local writes, no packets; server grab
                           checks unknown - creep up.
 
@@ -163,7 +163,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.20"
+local SCRIPT_VERSION = "oak-v29.21"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1770,42 +1770,14 @@ end
 -- the ball (and every weld Part0/Part1 = the whole load) to the camera:
 -- fly the freecam across the map, press the key, release to drop the
 -- load there. Same client-side teleport family as Cam Teleport / store
--- warps (one CFrame write per unique assembly + a 1.5s landing hold).
-local function grabberTeleport()
-    if Config.Grabber.TP ~= true then
-        print("[oaklands] grab tp: toggle is off (Movement > Grabbers > Grab Teleport)")
-        return
-    end
-    local list = GRAB_STATE.list
-    local inst
-    if type(list) == "table" then
-        for _, v in ipairs(list) do
-            if v.IsDragging == true and v.DraggingBall then
-                inst = v
-                break
-            end
-        end
-    end
-    if not inst then
-        GRAB_STATE.nextFind = 0  -- fresh scan next tick (tool may be new)
-        print("[oaklands] grab tp: not carrying anything with a grabber")
-        return
-    end
-    local ball = inst.DraggingBall
-    if not (typeof(ball) == "Instance" and ball.Parent) then
-        print("[oaklands] grab tp: no dragging ball")
-        return
-    end
-    local cam = Workspace.CurrentCamera
-    if not cam then return end
-    local target = cam.CFrame.Position
+-- warps (one CFrame write per unique assembly + a hold/auto-retry
+-- window that keeps re-applying the move until streaming settles).
+-- The move is shared with the retry loop below: one write per unique
+-- assembly; the welds dedupe to the ball's own assembly in the normal
+-- case, the per-weld pass covers odd rigs. Parts that are streamed out
+-- right now are skipped and picked up by the next pass.
+local function grabberMovePile(inst, ball, target)
     local delta = target - ball.Position
-    if delta.Magnitude < 3 then
-        print("[oaklands] grab tp: already at the camera")
-        return
-    end
-    -- one write per unique assembly; the welds dedupe to the ball's own
-    -- assembly in the normal case, the per-weld pass covers odd rigs
     local seen = {}
     local moved = 0
     local function movePart(p)
@@ -1834,11 +1806,58 @@ local function grabberTeleport()
     inst.LastRayRes = target
     local ap = ball:FindFirstChild("AlignPosition")
     if ap then ap.Position = target end
-    -- hold the ball at the landing spot for 1.5s - a tight 60Hz re-pin
-    -- on the grabber Heartbeat (drift > 0.5 studs), while the carry lock
-    -- freezes the game's own re-aim for the same window
-    GRAB_STATE.tpJob = { ball = ball, target = target, untilAt = os.clock() + 1.5 }
-    print(("[oaklands] grab tp: moved %d studs (%d assemblies)"):format(math.floor(delta.Magnitude), moved))
+    return moved, delta.Magnitude
+end
+
+local function grabberTeleport()
+    if Config.Grabber.TP ~= true then
+        print("[oaklands] grab tp: toggle is off (Movement > Grabbers > Grab Teleport)")
+        return
+    end
+    local list = GRAB_STATE.list
+    local inst
+    if type(list) == "table" then
+        for _, v in ipairs(list) do
+            if v.IsDragging == true and v.DraggingBall then
+                inst = v
+                break
+            end
+        end
+    end
+    if not inst then
+        GRAB_STATE.nextFind = 0  -- fresh scan next tick (tool may be new)
+        print("[oaklands] grab tp: not carrying anything with a grabber")
+        return
+    end
+    local ball = inst.DraggingBall
+    if not (typeof(ball) == "Instance") then
+        print("[oaklands] grab tp: no dragging ball")
+        return
+    end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local target = cam.CFrame.Position
+    if not ball.Parent then
+        -- the ball is streamed out right now (flew beyond the streaming
+        -- range) - open a retry window instead of failing; the Heartbeat
+        -- below picks the move up the moment it streams back
+        GRAB_STATE.tpJob = { inst = inst, ball = ball, target = target,
+            retryUntil = os.clock() + 4, nextRetryAt = os.clock() + 0.3, attempts = 0 }
+        print("[oaklands] grab tp: ball is streamed out - auto-retrying")
+        return
+    end
+    if (target - ball.Position).Magnitude < 3 then
+        print("[oaklands] grab tp: already at the camera")
+        return
+    end
+    local moved, dist = grabberMovePile(inst, ball, target)
+    -- hold + auto-retry window: the 60Hz pin keeps the ball at the spot
+    -- and every 0.4s the move is re-applied (re-targeting your camera) -
+    -- the "spam Y" behaviour automated, because streaming can swallow
+    -- parts mid-flight and they only move once they stream back in
+    GRAB_STATE.tpJob = { inst = inst, ball = ball, target = target,
+        retryUntil = os.clock() + 4, nextRetryAt = os.clock() + 0.4, attempts = 1 }
+    print(("[oaklands] grab tp: moved %d studs (%d assemblies)"):format(math.floor(dist), moved))
 end
 
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
@@ -1975,29 +1994,56 @@ track(task.spawn(function()
     end
 end))
 
--- tight landing hold (oak-v29.20): while a teleport window is open the
--- ball is re-pinned to the landing spot at 60Hz (drift > 0.5 studs) so
--- the game's correction cannot visibly drag the orb away between presses
+-- landing hold + auto-retry (oak-v29.21): while a teleport window is
+-- open the ball is re-pinned to the landing spot at 60Hz (drift > 0.5
+-- studs), and every 0.4s the whole move is re-applied toward your camera
+-- - that is the "spam Y" trick automated, because streaming can swallow
+-- parts mid-flight (they get skipped and picked up by the next pass when
+-- they stream back in). The window runs a few seconds, then clears.
 track(RunService.Heartbeat:Connect(function()
     if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
     local tp = GRAB_STATE.tpJob
     if not tp then return end
     pcall(function()
-        if os.clock() >= tp.untilAt then
+        local now = os.clock()
+        if now >= tp.retryUntil then
             GRAB_STATE.tpJob = nil
             return
         end
         local ball = tp.ball
-        if typeof(ball) == "Instance" and ball.Parent then
+        if typeof(ball) ~= "Instance" then
+            GRAB_STATE.tpJob = nil
+            return
+        end
+        if ball.Parent and tp.inst then
+            -- periodic re-apply (auto-spam): re-target the camera and move
+            -- again; parts streamed out now are skipped, next pass gets them
+            if now >= (tp.nextRetryAt or 0) then
+                tp.nextRetryAt = now + 0.4
+                local cam = Workspace.CurrentCamera
+                if cam then
+                    tp.target = cam.CFrame.Position
+                    local drift = tp.target - ball.Position
+                    if drift.Magnitude > 0.5 then
+                        grabberMovePile(tp.inst, ball, tp.target)
+                        tp.attempts = (tp.attempts or 0) + 1
+                        if tp.attempts == 2 and not tp.retryPrint then
+                            tp.retryPrint = true
+                            print("[oaklands] grab tp: auto-retrying through the streaming gap...")
+                        end
+                    end
+                end
+            end
+            -- continuous tight pin between retry passes
             local drift = tp.target - ball.Position
             if drift.Magnitude > 0.5 then
                 ball.CFrame = ball.CFrame + drift
                 ball.AssemblyLinearVelocity = Vector3.new()
                 ball.AssemblyAngularVelocity = Vector3.new()
             end
-        else
-            GRAB_STATE.tpJob = nil
         end
+        -- ball streamed out right now: keep the window open; the retry
+        -- pass resumes the moment it streams back in
     end)
 end))
 
