@@ -17,8 +17,10 @@
                         cannot tell it apart from a legit cheat
       • Max Aim Assist - cranks the game's own AimAssistController:
                         huge range/FOV, head lock, through walls
-      • Player ESP    - name + distance labels, highlight chams,
-                        teammate / enemy / bot colors
+      • Player / Bot ESP - the shared esp.luau engine (the only ESP in
+                        this repo) with the FULL schema as menu
+                        controls: boxes, names, health, distance,
+                        chams, tracers - every element customisable
       • Weapon        - no recoil (camera kick), infinite ammo
       • Anti-AFK, config persistence, unload button
 
@@ -103,12 +105,12 @@ local DEFAULTS = {
         AutoFire = false,
     },
     ESP = {
+        Enabled = false,
         Players = false,
         Bots = false,
-        Names = true,
-        Distance = true,
-        Highlight = true,
-        MaxDist = 2500,
+        MaxDistance = 2000,
+        TeamCheck = true,
+        VisibleOnly = false,
     },
     Misc = {
         NoRecoil = false,
@@ -164,7 +166,6 @@ Config.Aimbot.Smoothing = math.clamp(tonumber(Config.Aimbot.Smoothing) or 4, 0, 
 Config.Aimbot.MaxDist = math.clamp(tonumber(Config.Aimbot.MaxDist) or 600, 50, 5000)
 if Config.Aimbot.Mode ~= "Always" then Config.Aimbot.Mode = "Hold RMB" end
 if Config.Aimbot.Part ~= "Torso" then Config.Aimbot.Part = "Head" end
-Config.ESP.MaxDist = math.clamp(tonumber(Config.ESP.MaxDist) or 2500, 100, 10000)
 
 local function saveConfig()
     pcall(function()
@@ -200,7 +201,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v1.1"
+local SCRIPT_VERSION = "aim-v1.2"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -221,6 +222,34 @@ do
         end
     else
         warn("[Havoc Hub] uilib.luau not loaded (" .. tostring(res) .. ") - settings menu will be skipped")
+    end
+end
+
+-- ============================================================
+-- ESP LIBRARY (esp.luau - the shared engine, loaded from the
+-- loader stash; every game script uses THIS, never a custom ESP)
+-- ============================================================
+local ESP_FILE = "esp.luau"
+local ESP
+do
+    local ok, res = pcall(function()
+        local src = moduleSource(ESP_FILE)
+        if not src then error("no source (loader stash empty, no local file)") end
+        local chunk, compileErr = loadstring(src, "@" .. ESP_FILE)
+        if not chunk then error("compile error: " .. tostring(compileErr)) end
+        return chunk()
+    end)
+    if ok and type(res) == "table" then
+        ESP = res
+        ESP.fill(Config.ESP)
+        ESP.sanitize(Config.ESP)
+        if ESP.VERSION then
+            print("[aimbot] esp " .. tostring(ESP.VERSION) .. " loaded")
+        else
+            warn("[aimbot] esp.luau has no version marker - re-run the loader to update it")
+        end
+    else
+        warn("[Havoc Hub] esp.luau not loaded (" .. tostring(res) .. ") - ESP disabled")
     end
 end
 
@@ -573,136 +602,77 @@ local function assistRestore()
 end
 
 -- ============================================================
--- ESP  (custom light renderer: labels + highlight chams)
+-- PLAYER / BOT ESP  (esp.luau engine - the shared library)
 -- ============================================================
-local ESP_STATE = genv.__HAVOC_AIMBOT_ESP
-if type(ESP_STATE) ~= "table" then
-    ESP_STATE = { entries = {} }
-    genv.__HAVOC_AIMBOT_ESP = ESP_STATE
+local PlayerESP
+if ESP and type(ESP.new) == "function" then
+    PlayerESP = ESP.new(function() return Config.ESP end)
 end
 
--- clean leftovers from a previous run
-do
-    for inst, e in pairs(ESP_STATE.entries) do
-        if type(e) == "table" then
-            if e.gui then pcall(function() e.gui:Destroy() end) end
-            if e.hl then pcall(function() e.hl:Destroy() end) end
-        end
-    end
-    table.clear(ESP_STATE.entries)
+local function espVisible(model, fromPos, toPos)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    local filter = {}
+    if LocalPlayer.Character then filter[#filter + 1] = LocalPlayer.Character end
+    if model then filter[#filter + 1] = model end
+    rp.FilterDescendantsInstances = filter
+    return Workspace:Raycast(fromPos, toPos - fromPos, rp) == nil
 end
 
-local COLOR_ENEMY = Color3.fromRGB(255, 90, 90)
-local COLOR_TEAM = Color3.fromRGB(140, 255, 140)
-local COLOR_BOT = Color3.fromRGB(255, 180, 60)
-
-local function releaseESP()
-    for inst, e in pairs(ESP_STATE.entries) do
-        if e.gui then pcall(function() e.gui:Destroy() end) end
-        if e.hl then pcall(function() e.hl:Destroy() end) end
-    end
-    table.clear(ESP_STATE.entries)
-end
-
-local function espEntryFor(t, color)
-    local e = ESP_STATE.entries[t.char]
-    if not e then
-        local gui = Instance.new("BillboardGui")
-        gui.Name = "HavocAimESP"
-        gui.Size = UDim2.fromOffset(190, 16)
-        gui.AlwaysOnTop = true
-        gui.MaxDistance = Config.ESP.MaxDist
-        gui.Adornee = t.head or t.root
-        local lbl = Instance.new("TextLabel")
-        lbl.BackgroundTransparency = 1
-        lbl.Size = UDim2.new(1, 0, 1, 0)
-        lbl.Font = Enum.Font.GothamBold
-        lbl.TextSize = 13
-        lbl.TextColor3 = color
-        lbl.TextStrokeColor3 = Color3.new(0, 0, 0)
-        lbl.TextStrokeTransparency = 0.3
-        lbl.Text = ""
-        lbl.Parent = gui
-        gui.Parent = screenGui
-        local hl = nil
-        if Config.ESP.Highlight then
-            hl = Instance.new("Highlight")
-            hl.Name = "HavocAimHL"
-            hl.FillColor = color
-            hl.FillTransparency = 0.6
-            hl.OutlineColor = color
-            hl.OutlineTransparency = 0.3
-            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-            hl.Parent = t.char
-        end
-        e = { gui = gui, label = lbl, hl = hl, adornee = t.head or t.root }
-        ESP_STATE.entries[t.char] = e
-    end
-    e.gui.Adornee = t.head or t.root
-    e.gui.MaxDistance = Config.ESP.MaxDist
-    if e.hl then
-        e.hl.FillColor = color
-        e.hl.OutlineColor = color
-    end
-    local root = t.root
-    local cam = Workspace.CurrentCamera
-    local dist = cam and math.floor((root.Position - cam.CFrame.Position).Magnitude) or 0
-    local text = t.name
-    if Config.ESP.Distance then
-        text = text .. "  [" .. tostring(dist) .. "m]"
-    end
-    if t.bot then text = text .. " BOT" end
-    e.label.Text = text
-    e.label.TextColor3 = color
-    return e
-end
-
-local function espStep()
-    local wantPlayers = Config.ESP.Players
-    local wantBots = Config.ESP.Bots
-    if not wantPlayers and not wantBots then
-        if next(ESP_STATE.entries) then releaseESP() end
+local espAccum = 0
+local function refreshPlayerESP(dt)
+    if not PlayerESP then return end
+    espAccum = espAccum + (dt or 0)
+    if espAccum < 0.2 then return end
+    espAccum = 0
+    local cfg = Config.ESP
+    -- the esp.luau engine gates EVERYTHING on cfg.Enabled - the master
+    -- switch must follow the UI toggles or nothing ever draws
+    cfg.Enabled = (Config.ESP.Players == true or Config.ESP.Bots == true)
+    if not cfg.Enabled then
+        PlayerESP:Prune({})
         return
     end
+    local cam = Workspace.CurrentCamera
+    local camPos = cam and cam.CFrame.Position
+    local anchor = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local anchorPos = anchor and anchor.Position
+    local maxDist = tonumber(cfg.MaxDistance) or 2000
     local seen = {}
-    if wantPlayers then
-        for _, t in ipairs(collectTargets(false)) do
-            seen[t.char] = true
-            local color = (Config.Aimbot.TeamCheck and isTeammate(t.hum)) and COLOR_TEAM or COLOR_ENEMY
-            espEntryFor(t, color)
+    local function consider(ch)
+        local hum = ch:FindFirstChildOfClass("Humanoid")
+        local hrp = ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart
+        if not hrp then return end
+        if hum and hum.Health <= 0 then return end
+        if hum and cfg.TeamCheck and isTeammate(hum) then return end
+        if anchorPos and ((hrp.Position - anchorPos).Magnitude > maxDist) then return end
+        if cfg.VisibleOnly and camPos then
+            local head = ch:FindFirstChild("Head")
+            local tpos = (head and head.Position) or hrp.Position
+            local ok, vis = pcall(espVisible, ch, camPos, tpos)
+            if not (ok and vis) then return end
+        end
+        PlayerESP:Ensure(ch)
+        seen[ch] = true
+    end
+    if Config.ESP.Players then
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl ~= LocalPlayer then
+                local ch = characterOf(pl)
+                if ch then consider(ch) end
+            end
         end
     end
-    if wantBots then
+    if Config.ESP.Bots then
         local gamen = Workspace:FindFirstChild("Game")
         local bots = gamen and gamen:FindFirstChild("__ServerBotCharacters")
         if bots then
             for _, ch in ipairs(bots:GetChildren()) do
-                if ch:IsA("Model") then
-                    local hum = ch:FindFirstChildOfClass("Humanoid")
-                    if isInRound(hum) then
-                        local t = buildTarget(ch, hum, ch.Name, true)
-                        if t then
-                            seen[t.char] = true
-                            espEntryFor(t, COLOR_BOT)
-                        end
-                    end
-                end
+                if ch:IsA("Model") then consider(ch) end
             end
         end
     end
-    for inst, e in pairs(ESP_STATE.entries) do
-        if not seen[inst] then
-            if e.gui then pcall(function() e.gui:Destroy() end) end
-            if e.hl then pcall(function() e.hl:Destroy() end) end
-            ESP_STATE.entries[inst] = nil
-        end
-    end
-    -- names-only mode: no name and no distance = nothing to show
-    if not Config.ESP.Names and not Config.ESP.Distance then
-        for _, e in pairs(ESP_STATE.entries) do
-            e.label.Text = ""
-        end
-    end
+    PlayerESP:Prune(seen)
 end
 
 -- ============================================================
@@ -743,9 +713,12 @@ end
 -- ============================================================
 local hasMouseRel = type(mousemoverel) == "function"
 
-track(RunService.RenderStepped:Connect(function()
+track(RunService.RenderStepped:Connect(function(dt)
     if not genOK() then return end
     updateFovCircle()
+    pcall(refreshPlayerESP, dt)
+    local espCam = Workspace.CurrentCamera
+    if espCam and PlayerESP then pcall(function() PlayerESP:Render(espCam) end) end
     if not Config.Aimbot.Enabled then return end
     if Config.Aimbot.Mode == "Hold RMB"
         and not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
@@ -812,13 +785,6 @@ track(task.spawn(function()
             local ctrl = CTRL_STATE.controller
             if ctrl then pcall(function() ctrl:deactivate() end) end
         end
-    end
-end))
-
-track(task.spawn(function()
-    while genOK() do
-        task.wait(0.25)
-        pcall(espStep)
     end
 end))
 
@@ -1049,36 +1015,123 @@ local function buildMenu()
             end
         end)
 
-    -- ---------------- ESP ----------------
-    section(pe, "Players")
+    -- ---------------- ESP  (esp.luau full schema) ----------------
+    local function saveAfter(fn)
+        return function(v)
+            fn(v)
+            saveConfigDebounced()
+        end
+    end
+    local function colorRow(page, text, cfgTable, prefix)
+        guard("colour " .. text, function()
+            return UILib.makeColorPicker(page, text, cfgTable, prefix, saveConfigDebounced)
+        end)
+    end
+    local function multiRow(page, text, items, cfgTable, prefix)
+        guard("multiselect " .. text, function()
+            return UILib.makeMultiSelect(page, text, items,
+                function(item) return cfgTable[prefix .. item] == true end,
+                function(item, on)
+                    cfgTable[prefix .. item] = on
+                    saveConfigDebounced()
+                end,
+                { overlayParent = win.popupLayer })
+        end)
+    end
+    -- the FULL esp.luau schema as controls - same builder every game
+    -- script uses, so nothing from the library is ever hidden
+    local function buildESPControls(page, cfg)
+        section(page, "BOX")
+        toggle(page, "Box", function() return cfg.Box end, saveAfter(function(v) cfg.Box = v end))
+        dropdown(page, "Box style", function() return { "Corner", "Full" } end,
+            function() return cfg.BoxStyle end, saveAfter(function(v) cfg.BoxStyle = v end))
+        slider(page, "Corner length", function() return cfg.BoxCornerLength end,
+            saveAfter(function(v) cfg.BoxCornerLength = v end), 1, 0, 40)
+        slider(page, "Box thickness", function() return cfg.BoxThickness end,
+            saveAfter(function(v) cfg.BoxThickness = v end), 1, 1, 6)
+        slider(page, "Box opacity", function() return cfg.BoxTransparency end,
+            saveAfter(function(v) cfg.BoxTransparency = v end), 0.05, 0, 1)
+        colorRow(page, "Box colour", cfg, "Box")
+
+        section(page, "NAME")
+        toggle(page, "Name", function() return cfg.Name end, saveAfter(function(v) cfg.Name = v end))
+        dropdown(page, "Name source", function() return { "Username", "DisplayName" } end,
+            function() return cfg.NameSource end, saveAfter(function(v) cfg.NameSource = v end))
+        slider(page, "Name size", function() return cfg.NameSize end,
+            saveAfter(function(v) cfg.NameSize = v end), 1, 8, 24)
+        slider(page, "Name opacity", function() return cfg.NameTransparency end,
+            saveAfter(function(v) cfg.NameTransparency = v end), 0.05, 0, 1)
+        colorRow(page, "Name colour", cfg, "Name")
+
+        section(page, "HEALTH")
+        toggle(page, "Health", function() return cfg.Health end, saveAfter(function(v) cfg.Health = v end))
+        slider(page, "Health size", function() return cfg.HealthSize end,
+            saveAfter(function(v) cfg.HealthSize = v end), 1, 8, 24)
+        slider(page, "Health opacity", function() return cfg.HealthTransparency end,
+            saveAfter(function(v) cfg.HealthTransparency = v end), 0.05, 0, 1)
+
+        section(page, "DISTANCE")
+        toggle(page, "Distance", function() return cfg.Distance end, saveAfter(function(v) cfg.Distance = v end))
+        slider(page, "Distance size", function() return cfg.DistanceSize end,
+            saveAfter(function(v) cfg.DistanceSize = v end), 1, 8, 24)
+        slider(page, "Distance opacity", function() return cfg.DistanceTransparency end,
+            saveAfter(function(v) cfg.DistanceTransparency = v end), 0.05, 0, 1)
+        colorRow(page, "Distance colour", cfg, "Distance")
+
+        section(page, "CHAMS")
+        multiRow(page, "Parts to highlight", { "Head", "Body" }, cfg, "Chams")
+        toggle(page, "Filled", function() return cfg.ChamsFilled ~= false end,
+            saveAfter(function(v) cfg.ChamsFilled = v end))
+        slider(page, "Fill opacity", function() return cfg.ChamsTransparency end,
+            saveAfter(function(v) cfg.ChamsTransparency = v end), 0.05, 0, 1)
+        colorRow(page, "Chams colour", cfg, "Chams")
+
+        section(page, "TRACERS")
+        toggle(page, "Tracers", function() return cfg.Tracers end, saveAfter(function(v) cfg.Tracers = v end))
+        dropdown(page, "Tracer origin", function() return { "Bottom", "Center" } end,
+            function() return cfg.TracerOrigin end, saveAfter(function(v) cfg.TracerOrigin = v end))
+        slider(page, "Tracer thickness", function() return cfg.TracerThickness end,
+            saveAfter(function(v) cfg.TracerThickness = v end), 1, 1, 5)
+        slider(page, "Tracer opacity", function() return cfg.TracerTransparency end,
+            saveAfter(function(v) cfg.TracerTransparency = v end), 0.05, 0, 1)
+        colorRow(page, "Tracer colour", cfg, "Tracer")
+    end
+
+    section(pe, "PLAYER ESP")
     toggle(pe, "Player ESP",
         function() return Config.ESP.Players end,
         function(v)
             Config.ESP.Players = v
+            Config.ESP.Enabled = v
             notify(v and "Player ESP on" or "Player ESP off")
         end)
-    toggle(pe, "Highlight chams",
-        function() return Config.ESP.Highlight end,
-        function(v)
-            Config.ESP.Highlight = v
-            releaseESP()
-        end)
-    toggle(pe, "Names",
-        function() return Config.ESP.Names end,
-        function(v) Config.ESP.Names = v end)
-    toggle(pe, "Distance",
-        function() return Config.ESP.Distance end,
-        function(v) Config.ESP.Distance = v end)
     slider(pe, "Max distance",
-        function() return Config.ESP.MaxDist end,
-        function(v) Config.ESP.MaxDist = v end, 100, 100, 10000,
+        function() return Config.ESP.MaxDistance end,
+        function(v)
+            Config.ESP.MaxDistance = v
+            saveConfigDebounced()
+        end, 50, 100, 4000,
         function(v) return ("%d studs"):format(v) end)
+    toggle(pe, "Team check",
+        function() return Config.ESP.TeamCheck end,
+        function(v)
+            Config.ESP.TeamCheck = v
+            saveConfigDebounced()
+        end)
+    toggle(pe, "Visible only",
+        function() return Config.ESP.VisibleOnly end,
+        function(v)
+            Config.ESP.VisibleOnly = v
+            saveConfigDebounced()
+        end)
+    buildESPControls(pe, Config.ESP)
 
-    section(pe, "Bots")
+    section(pe, "BOTS")
     toggle(pe, "Bot ESP",
         function() return Config.ESP.Bots end,
         function(v)
             Config.ESP.Bots = v
+            if v then Config.ESP.Enabled = true end
             notify(v and "Bot ESP on" or "Bot ESP off")
         end)
 
@@ -1116,7 +1169,7 @@ local function buildMenu()
             table.clear(genv.__HAVOC_AIMBOT_DISCONNECT)
         end
         pcall(assistRestore)
-        pcall(releaseESP)
+        if PlayerESP then pcall(function() PlayerESP:Clear() end) end
         for c in pairs(ORIG) do
             pcall(function()
                 rawset(c, "shoot", nil)
