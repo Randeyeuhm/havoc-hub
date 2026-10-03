@@ -141,7 +141,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "uv1"
+local SCRIPT_VERSION = "uv2"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -617,6 +617,22 @@ track(UserInputService.InputBegan:Connect(function(input, processed)
 end))
 
 -- ============================================================
+-- UNLOAD
+-- ============================================================
+local function unloadUniversal()
+    for _, c in ipairs(Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Connections)
+    pcall(function() RunService:UnbindFromRenderStep("HavocHubAimbot") end)
+    if espRenderer then pcall(function() espRenderer:clear() end) end
+    if fovCircle then pcall(function() fovCircle.Visible = false; fovCircle:Remove() end) end
+    pcall(setFullbright, false)
+    if screenGui then pcall(function() screenGui:Destroy() end) end
+    print("[Havoc Hub] universal unloaded")
+end
+
+-- ============================================================
 -- MENU
 -- ============================================================
 local function buildMenu()
@@ -684,7 +700,6 @@ local function buildMenu()
     local function button(page, text, onClick, opts)
         guard("button " .. text, function() return UILib.makeButton(page, text, onClick, opts) end)
     end
-    local function note(page, text) pcall(function() UILib.makeNote(page, text, "auto") end) end
     local function color(page, label, cfgTable, prefix)
         guard("colour " .. label, function()
             return UILib.makeColorPicker(page, label, cfgTable, prefix, saveConfig)
@@ -733,8 +748,6 @@ local function buildMenu()
         function() return Config.Aimbot.VisibleOnly end,
         function(v) Config.Aimbot.VisibleOnly = v end)
     bindrow(p1, hotkeyById.ToggleAimbot)
-    note(p1, "Camera aim: locks onto the closest player inside the FOV circle. " ..
-        "Hold RMB (or use Always), and raise Smoothness for a softer lock.")
 
     -- ---------------- ESP ----------------
     local p2 = pages[2]
@@ -832,7 +845,6 @@ local function buildMenu()
         function() return Config.ESP.TracerTransparency end,
         function(v) Config.ESP.TracerTransparency = v end, 0.05, 0, 1)
     color(p2, "Tracer colour", Config.ESP, "Tracer")
-    note(p2, "Opacity sliders: 1 = fully visible.")
 
     -- ---------------- Movement ----------------
     local p3 = pages[3]
@@ -853,7 +865,6 @@ local function buildMenu()
     slider(p3, "Fly Speed",
         function() return Config.Movement.FlySpeed end,
         function(v) Config.Movement.FlySpeed = v end, 5, 10, 400)
-    note(p3, "Fly: WASD to move, Space to rise, Left Ctrl to descend.")
 
     -- ---------------- Misc ----------------
     local p4 = pages[4]
@@ -873,8 +884,9 @@ local function buildMenu()
         notify("Rejoining…")
         pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
     end, { confirm = true, confirmText = "Click again to rejoin" })
-    note(p4, ("Havoc Hub - universal fallback script. PlaceId %d has no " ..
-        "game-specific script yet."):format(game.PlaceId))
+    button(p4, "Unload Havoc Hub", function()
+        unloadUniversal()
+    end, { danger = true, confirm = true, confirmText = "Click again to unload" })
 
     win.setTab(1)
     print(("[universal] %s menu built (%d controls)"):format(SCRIPT_VERSION, builtCount))

@@ -279,7 +279,7 @@ local function track(conn)
     return conn
 end
 
-local SCRIPT_VERSION = "dl-v48"
+local SCRIPT_VERSION = "dl-v49"
 
 -- ============================================================
 -- CONFIG  (persisted to havoc_hub/deadline_config.json)
@@ -3679,6 +3679,30 @@ local function buildMenu()
             end
         end)
     end, { confirm = true, confirmText = "Click again to fire the trap", danger = true })
+
+    local function unloadDeadline()
+        genv.__HAVOC_DEADLINE_GEN = nil
+        if type(genv.__HAVOC_DEADLINE_DISCONNECT) == "function" then
+            pcall(genv.__HAVOC_DEADLINE_DISCONNECT)
+        end
+        pcall(function() RunService:UnbindFromRenderStep("HavocHubDeadlineFullbright") end)
+        pcall(function() RunService:UnbindFromRenderStep("HavocHubDeadlineAim") end)
+        if espRenderer then pcall(function() espRenderer:clear() end) end
+        if fovCircle then pcall(function() fovCircle:Remove() end) end
+        if silentFovCircle then pcall(function() silentFovCircle:Remove() end) end
+        pcall(unstubSwaySprings)
+        pcall(applyNoDeaf, false)
+        pcall(zeroWeightRestore)
+        pcall(ballisticsRestore)
+        pcall(setFullbright, false)
+        if screenGui then pcall(function() screenGui:Destroy() end) end
+        print("[deadline] unloaded")
+    end
+
+    section(pm, "Script")
+    button(pm, "Unload Havoc Hub", function()
+        unloadDeadline()
+    end, { danger = true, confirm = true, confirmText = "Click again to unload" })
 
     section(pm, "Reset")
     button(pm, "Restore vanilla", function()

@@ -180,7 +180,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.26"
+local SCRIPT_VERSION = "oak-v29.27"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -3454,6 +3454,30 @@ local function buildMenu()
     toggle(pmi, "Anti-AFK",
         function() return Config.Misc.AntiAFK end,
         function(v) Config.Misc.AntiAFK = v end)
+
+    local function unloadOaklands()
+        genv.__HAVOC_OAKLANDS_GEN = nil
+        if type(genv.__HAVOC_OAKLANDS_DISCONNECT) == "table" then
+            for _, c in ipairs(genv.__HAVOC_OAKLANDS_DISCONNECT) do
+                pcall(function() c:Disconnect() end)
+            end
+            table.clear(genv.__HAVOC_OAKLANDS_DISCONNECT)
+        end
+        pcall(function() RunService:UnbindFromRenderStep(FREE_BIND) end)
+        genv.__HAVOC_OAKLANDS_FREECAM = nil
+        pcall(releaseBucket, ESP_STATE.trees)
+        pcall(releaseBucket, ESP_STATE.items)
+        pcall(releaseBucket, ESP_STATE.enemies)
+        pcall(releaseBucket, ESP_STATE.players)
+        pcall(applyFullbright, false)
+        if screenGui then pcall(function() screenGui:Destroy() end) end
+        print("[oaklands] unloaded")
+    end
+
+    section(pmi, "Script")
+    button(pmi, "Unload Havoc Hub", function()
+        unloadOaklands()
+    end, { danger = true, confirm = true, confirmText = "Click again to unload" })
 
     section(pmi, "Reset")
     button(pmi, "Restore vanilla", function()

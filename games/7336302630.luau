@@ -5550,8 +5550,6 @@ do
             addColor("Players", "Main", "Friend colour", P, "Highlight")
 
             addSection("Players", "Main", "Whitelist")
-            makeNote(win.subtab("Players", "Main"), "Friends are skipped by the aimbot and shown green.")
-
             local container = Instance.new("Frame")
             container.Size = UDim2.new(1, 0, 0, 0)
             container.BackgroundTransparency = 1
@@ -5638,8 +5636,6 @@ do
                 Config.Misc.KeybindsEnabled = v
                 notify(v and "Keybinds enabled" or "Keybinds disabled — RightShift still opens the menu")
             end)
-        makeNote(win.subtab("Config", "Main"), "Click Rebind, then press a key. Esc cancels.")
-
         for _, entry in ipairs(Hotkeys) do
             local e = makeKeybindRow(win.subtab("Config", "Main"), entry, {
                 -- The menu key can never be disabled.
@@ -5648,6 +5644,11 @@ do
             })
             table.insert(guiControls, e)
         end
+
+        addSection("Config", "Main", "Script")
+        addButton("Config", "Main", "Unload Havoc Hub", function()
+            cleanupAll()
+        end)
 
         state.currentCategory = "Aimbot"
         win.setTab(1)

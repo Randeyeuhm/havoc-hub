@@ -180,7 +180,7 @@ end
 
 -- Bump on every change so the console / window subtitle prove which
 -- build is running (same scheme as the other scripts: uvN / de-vNN).
-local SCRIPT_VERSION = "crim-v44"
+local SCRIPT_VERSION = "crim-v45"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -2979,7 +2979,6 @@ local function buildMenu()
     local function button(page, text, onClick, opts)
         guard("button " .. text, function() return UILib.makeButton(page, text, onClick, opts) end)
     end
-    local function note(page, text) pcall(function() UILib.makeNote(page, text, "auto") end) end
     local function color(page, label, cfgTable, prefix)
         guard("colour " .. label, function()
             return UILib.makeColorPicker(page, label, cfgTable, prefix, saveConfig)
@@ -3028,9 +3027,6 @@ local function buildMenu()
         function() return Config.Aimbot.VisibleOnly end,
         function(v) Config.Aimbot.VisibleOnly = v end)
     bindrow(p1, hotkeyById.ToggleAimbot)
-    note(p1, "Camera aim: locks onto the closest player inside the FOV circle - Hold RMB (or Always). " ..
-        "WARNING: moderators can spectate in first person and watch your mouse/camera - keep Smoothness 6+ " ..
-        "so the lock looks human, and leave Visible Check on.")
 
     -- ---------------- ESP ----------------
     local p2 = pages[2]
@@ -3128,7 +3124,6 @@ local function buildMenu()
         function() return Config.ESP.TracerTransparency end,
         function(v) Config.ESP.TracerTransparency = v end, 0.05, 0, 1)
     color(p2, "Tracer colour", Config.ESP, "Tracer")
-    note(p2, "Opacity sliders: 1 = fully visible.")
 
     -- ---------------- Weapons ----------------
     local p3 = pages[3]
@@ -3615,13 +3610,27 @@ local function buildMenu()
         locked = true,
         lockNote = "RightShift is the menu key and stays bound",
     })
+    local function unloadCriminality()
+        for _, c in ipairs(Connections) do
+            pcall(function() c:Disconnect() end)
+        end
+        table.clear(Connections)
+        pcall(function() RunService:UnbindFromRenderStep("HavocHubAimbot") end)
+        if espRenderer then pcall(function() espRenderer:clear() end) end
+        if fovCircle then pcall(function() fovCircle.Visible = false; fovCircle:Remove() end) end
+        if Config.Misc then Config.Misc.Fullbright = false end
+        if type(setFullbright) == "function" then pcall(setFullbright, false) end
+        if screenGui then pcall(function() screenGui:Destroy() end) end
+        print("[criminality] unloaded")
+    end
+
     button(p4, "Rejoin Server", function()
         notify("Rejoining…")
         pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
     end, { confirm = true, confirmText = "Click again to rejoin" })
-    note(p4, "Criminality: the game renamed ReplicatedStorage ('RepIicatedStorage') and runs client/moderation " ..
-        "systems - this script only moves YOUR CAMERA and draws locally, it never touches game remotes. " ..
-        "Keep aimbot smoothing high when a moderator could be watching.")
+    button(p4, "Unload Havoc Hub", function()
+        unloadCriminality()
+    end, { danger = true, confirm = true, confirmText = "Click again to unload" })
 
     win.setTab(1)
     print(("[criminality] %s menu built (%d controls)"):format(SCRIPT_VERSION, builtCount))

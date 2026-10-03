@@ -36,7 +36,7 @@ local TeleportService  = game:GetService("TeleportService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer      = Players.LocalPlayer
 
-local SCRIPT_VERSION = "de-v79"
+local SCRIPT_VERSION = "de-v80"
 
 -- ONE-RUN-PER-CLIENT GUARD: the queued teleport payload checks this flag
 -- before loading the hub, and the hub itself sets it - so even if several
@@ -3756,7 +3756,6 @@ local function buildMenu()
     local function button(page, text, onClick, opts)
         guard("button " .. text, function() return UILib.makeButton(page, text, onClick, opts) end)
     end
-    local function note(page, text) pcall(function() UILib.makeNote(page, text, "auto") end) end
     local function color(page, label, cfgTable, prefix)
         guard("colour " .. label, function()
             return UILib.makeColorPicker(page, label, cfgTable, prefix, saveConfig)
@@ -3817,7 +3816,6 @@ local function buildMenu()
     toggle(p1, "Ignore speed caps",
         function() return Config.Vehicle.NoSpeedCap end,
         function(v) Config.Vehicle.NoSpeedCap = v end)
-    note(p1, "Resets when you switch cars - keep 1.0 for races you care about.")
 
     section(p1, "Race assist")
     button(p1, "Finish race (take all checkpoints)", function() runRaceRoutine() end)
@@ -3828,7 +3826,6 @@ local function buildMenu()
     for _, tp in ipairs(TELEPORTS) do
         button(p2, tp.label, function() teleportTo(tp.part, tp.label) end)
     end
-    note(p2, "If a location says 'not found', drive closer once - the map streams in.")
 
     -- ---------------- Visuals ----------------
     local p4 = pages[3]
@@ -3926,7 +3923,6 @@ local function buildMenu()
         function() return Config.ESP.TracerTransparency end,
         function(v) Config.ESP.TracerTransparency = v end, 0.05, 0, 1)
     color(p4, "Tracer colour", Config.ESP, "Tracer")
-    note(p4, "Opacity sliders: 1 = fully visible.")
     section(p4, "World")
     toggle(p4, "Fullbright",
         function() return Config.Misc.Fullbright end,
@@ -4001,7 +3997,6 @@ local function buildMenu()
             notify("Teleport failed")
         end
     end)
-    note(p5, "Teleports to each pickup/dropoff and freezes your car while on. Hard pays more; outlaws can steal. Pacing holds each stop so runs don't complete at teleport speed.")
 
     section(p5, "Outlaw auto-farm  (Criminal job)")
     toggle(p5, "Auto-run the outlaw job",
@@ -4086,13 +4081,31 @@ local function buildMenu()
         refreshTeleportQueue(true)
         notify(teleportPersist.fn and "Re-exec queued - runs after your next teleport" or "This executor has no queueonteleport function")
     end)
-    note(p6, "Re-runs the hub after every teleport - the farm survives place hops.")
     section(p6, "Menu")
     bindrow(p6, hotkeyById.ToggleMenu, {
         locked = true,
         lockNote = "RightShift is the menu key and stays bound",
     })
-    note(p6, ("Havoc Hub - Driving Empire (%s). Config: %s"):format(SCRIPT_VERSION, CONFIG_FILE))
+    local function unloadDrivingEmpire()
+        for _, c in ipairs(Connections) do
+            pcall(function() c:Disconnect() end)
+        end
+        table.clear(Connections)
+        if espRenderer then pcall(function() espRenderer:clear() end) end
+        if vehicleHooks then
+            pcall(function()
+                vehicleHooks.speedFactor = 1
+                vehicleHooks.torqueFactor = 1
+            end)
+        end
+        if Config.Misc then Config.Misc.Fullbright = false end
+        if type(applyFullbright) == "function" then pcall(applyFullbright) end
+        if screenGui then pcall(function() screenGui:Destroy() end) end
+        print("[driving-empire] unloaded")
+    end
+    button(p6, "Unload Havoc Hub", function()
+        unloadDrivingEmpire()
+    end, { danger = true, confirm = true, confirmText = "Click again to unload" })
 
     -- ---------------- Extra ----------------
     local p7 = pages[6]
@@ -4154,7 +4167,6 @@ local function buildMenu()
         raceExactSave()
         notify("Precision finish: learned offset cleared - the next finished run re-learns it")
     end, { confirm = true, confirmText = "Click again to reset" })
-    note(p7, "The finish remote carries NO time - the server stamps it the moment you cross - so this times the crossing instead: checkpoints as usual, then the car GLIDES (tween, no teleport) through the gate exactly on the target, corrected by an offset learned from your own finished runs. Run once to teach the offset; every finish sharpens it. Targets under the track payout floor can lose the payout.")
 
     win.setTab(1)
     print(("[driving-empire] menu built (%d controls)"):format(builtCount))
