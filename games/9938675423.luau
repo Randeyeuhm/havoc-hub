@@ -140,12 +140,18 @@
                           All local writes, no packets; server grab
                           checks unknown - creep up.
 
-    Test (oak-v29.29)
-      • Packet tier      - Item Spawner / Loot Vacuum / Quests /
-                           Players / Enemies: every send rides the SAFE
-                           channel (the _Types scanner never runs) and
-                           prints to the console. Server validation is
-                           UNKNOWN for all of it - this is the bench.
+    Test (oak-v29.30)
+      • Packet tier      - Loot Vacuum / Quests / Players / Enemies:
+                           every send rides the SAFE channel (the
+                           _Types scanner never runs) and prints to the
+                           console. Server validation is UNKNOWN - this
+                           is the bench. The Item Spawner was pulled
+                           after live testing: SpawnItem gets an
+                           instant server kick (fully server-gated).
+      • Diagnostics      - one button prints what is actually armed /
+                           found live: SAFE key, guard hook, redirect
+                           hashes, weapon / saw / swing / golf / jar /
+                           basket / breath / quest objects.
       • Passive          - Swing Redirect (swings retarget the nearest
                            tree / rock within the slider radius) and
                            Grab Point (grab clicks send a point at the
@@ -204,7 +210,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.29"
+local SCRIPT_VERSION = "oak-v29.30"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -4050,6 +4056,35 @@ local function testRestoreAll()
     table.clear(TEST_STATE.recs)
 end
 
+-- one-click state dump: what is armed, what the finders actually see
+local function testDiagnostics()
+    local client, keyMod = safeDeps()
+    local hashes = testEnsureHashes()
+    local function yn(v, yes, no)
+        return v and yes or no
+    end
+    print("[oaklands] test diag: SAFE key=" .. tostring(type(SAFE.key) == "string" and "learned" or "MISSING")
+        .. " client=" .. tostring(type(client) == "table" and "ok" or "nil")
+        .. " keyMod=" .. tostring(type(keyMod) == "function" and "ok" or "nil"))
+    print("[oaklands] test diag: guard=" .. tostring(shield.installed and "installed" or "OFF")
+        .. " shield=" .. tostring(Config.Misc.HAXShield and "on" or "off")
+        .. " redirectHashes=" .. tostring(hashes and "ready" or "waiting for key"))
+    print(("[oaklands] test diag: weapons=%d saw=%d swings=%d golf=%d"):format(
+        #testFind({ "HitRadius", "Cooldown", "SwingTime", "Inventory" }),
+        #testFind({ "Fuel", "MaxFuel", "Cutting" }),
+        #testFind({ "MaxSwingTime", "Inventory" }),
+        #testFind({ "SwingPower", "SwingDistance" })))
+    print(("[oaklands] test diag: jar=%s basket=%s breath=%s quests=%s"):format(
+        yn(findJarInstance(), "found", "no"),
+        yn(findBasketInstance(), "found", "no"),
+        yn(findBreathInstance(), "found", "no"),
+        yn(findQuestModule(), "found", "no")))
+    print(("[oaklands] test diag: swing scan trees=%d rocks=%d (age %s)"):format(
+        TEST_STATE.swingTrees and #TEST_STATE.swingTrees or 0,
+        TEST_STATE.swingRocks and #TEST_STATE.swingRocks or 0,
+        TEST_STATE.swingScanAt and (("%ds"):format(math.floor(os.clock() - TEST_STATE.swingScanAt))) or "never"))
+end
+
 local function testStep()
     if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
     pcall(testWeaponStep)
@@ -4484,40 +4519,11 @@ local function buildMenu()
         notify("Restored vanilla settings")
     end)
 
-    -- ---------------- Test (oak-v29.29) ----------------
-    section(pt, "Item Spawner")
-    input(pt, "Object name",
-        function() return Config.Test.SpawnName end,
-        function(v) Config.Test.SpawnName = v end,
-        { placeholder = "e.g. WoodenAxe" })
-    input(pt, "Object form",
-        function() return Config.Test.SpawnForm end,
-        function(v) Config.Test.SpawnForm = v end,
-        { placeholder = "Item" })
-    button(pt, "Spawn x1", function()
-        local name = tostring(Config.Test.SpawnName or ""):gsub("^%s+", ""):gsub("%s+$", "")
-        if name == "" then
-            notify("Type an object name first")
-            return
-        end
-        local form = tostring(Config.Test.SpawnForm or "")
-        if form == "" then form = "Item" end
-        if testPacket("SpawnItem", { ObjectName = name, ObjectForm = form, SpawnWith999 = false }) then
-            print("[oaklands] test: SpawnItem sent - " .. name .. " (" .. form .. ")")
-        end
+    -- ---------------- Test (oak-v29.30) ----------------
+    section(pt, "Diagnostics")
+    button(pt, "Run diagnostics", function()
+        pcall(testDiagnostics)
     end)
-    button(pt, "Spawn x999", function()
-        local name = tostring(Config.Test.SpawnName or ""):gsub("^%s+", ""):gsub("%s+$", "")
-        if name == "" then
-            notify("Type an object name first")
-            return
-        end
-        local form = tostring(Config.Test.SpawnForm or "")
-        if form == "" then form = "Item" end
-        if testPacket("SpawnItem", { ObjectName = name, ObjectForm = form, SpawnWith999 = true }) then
-            print("[oaklands] test: SpawnItem x999 sent - " .. name)
-        end
-    end, { danger = true, confirm = true })
 
     section(pt, "Loot Vacuum")
     toggle(pt, "Auto-store items",
