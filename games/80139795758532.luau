@@ -102,6 +102,7 @@ local DEFAULTS = {
         TeamCheck = true,
         VisibleOnly = false,
         TargetBots = true, -- also lock + silent-fire at __ServerBotCharacters
+        SkipProtected = true, -- ignore targets with a spawn-protection ForceField
         Part = "Head",     -- Head / Torso
     },
     Silent = {
@@ -209,7 +210,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v1.8"
+local SCRIPT_VERSION = "aim-v1.9"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -353,6 +354,16 @@ local function isInRound(hum)
     return hum ~= nil and hum.Health > 0 and hum:GetAttribute("IN_ROUND") == true
 end
 
+-- spawn protection = a ForceField instance parented to the character
+-- (the game's own "spawnProtection" highlight + ForcefieldEffectClient
+-- module confirm it). Live check: the frame the shield is removed the
+-- target becomes aimable again automatically.
+local function isSpawnProtected(ch, hum)
+    if ch and ch:FindFirstChildOfClass("ForceField") then return true end
+    if hum and hum:FindFirstChildOfClass("ForceField") then return true end
+    return false
+end
+
 -- ============================================================
 -- TARGET SYSTEM (shared by aimbot + silent aim)
 -- ============================================================
@@ -383,7 +394,9 @@ local function collectTargets(includeBots)
             local ch = characterOf(pl)
             local hum = ch and ch:FindFirstChildOfClass("Humanoid")
             if ch and isInRound(hum) then
-                if not (Config.Aimbot.TeamCheck and isTeammate(hum)) then
+                local skip = (Config.Aimbot.TeamCheck and isTeammate(hum))
+                    or (Config.Aimbot.SkipProtected and isSpawnProtected(ch, hum))
+                if not skip then
                     local t = buildTarget(ch, hum, pl.Name, false)
                     if t then list[#list + 1] = t end
                 end
@@ -399,7 +412,9 @@ local function collectTargets(includeBots)
                     local hum = ch:FindFirstChildOfClass("Humanoid")
                     -- bots carry REAL TEAM attrs in TDM ("Red"/"Blue"),
                     -- so the same team check applies to them
-                    if isInRound(hum) and not (Config.Aimbot.TeamCheck and isTeammate(hum)) then
+                    local skip = (Config.Aimbot.TeamCheck and isTeammate(hum))
+                        or (Config.Aimbot.SkipProtected and isSpawnProtected(ch, hum))
+                    if isInRound(hum) and not skip then
                         local t = buildTarget(ch, hum, ch.Name, true)
                         if t then list[#list + 1] = t end
                     end
@@ -1158,6 +1173,9 @@ local function buildMenu()
     toggle(pa, "Target bots",
         function() return Config.Aimbot.TargetBots end,
         function(v) Config.Aimbot.TargetBots = v end)
+    toggle(pa, "Skip spawn protection",
+        function() return Config.Aimbot.SkipProtected end,
+        function(v) Config.Aimbot.SkipProtected = v end)
     slider(pa, "Max distance",
         function() return Config.Aimbot.MaxDist end,
         function(v) Config.Aimbot.MaxDist = v end, 25, 50, 5000,
