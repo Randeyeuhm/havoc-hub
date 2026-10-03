@@ -84,6 +84,17 @@ Built from the game's decompiled source — everything gameplay-side flows throu
 - **Test tab (oak-v29.29, trimmed in v29.30)** — the dump-sweep exploit set on the SAFE channel (no scanning, no canaries, every send console-logged, all off by default): **Loot Vacuum** (`StoreItem` auto-pickup), **Quests** (auto fulfil / claim), **Kick / Softban** (private-server powers), **Damage Aura** (`DamageEnemy`); the passive rewrites **Swing Redirect** (your swings retarget the nearest tree / rock within the radius — the game's own packet is rewritten on the wire in the guard hook) and **Grab Point** (grab clicks send a camera-forward point at the slider range instead of the capped ray); the local tier **Weapon Stats** (damage × / radius × / attack speed ÷), **Projectile range override** (past the 100-stud clamp, up to 5000), **Chainsaw infinite fuel**, **Swing speed**, **Golf power**, **Firefly Jar** reach + auto-collect, **Fruit Basket** reach / full-gate / auto-collect — plus **Infinite Breath**, a **Run diagnostics** button (prints what's armed / found live: SAFE key, guard, redirect hashes, weapon / saw / swing / golf / jar / basket / breath / quest counts) and **Restore all test tuning**. The **Item Spawner was pulled after live testing — the server answers `SpawnItem` with an instant kick (fully server-gated)**
 - No game-framework calls at all anymore (the anticheat self-reports `"[C]"` callers and module-loader misuse — nothing here does either), and the script is re-run safe like the rest of the hub
 
+### AIMBOT — `games/80139795758532.luau` (PlaceId 80139795758532, GameId 9210599831)
+
+A cheats-arena FPS where the game itself sells "cheats" as gameplay — built off the structure dump, this one is the real thing:
+
+- **Aimbot** — FOV circle (radius in px, drawn exactly as the pick area), Hold RMB / Always, head or torso, team + visibility checks, max distance, smoothing (0 = straight lock; the mouse moves through the game's own input path)
+- **Silent Aim** — every shot redirects to the target at the wire **using the game's own native flow**: the live `BlasterController`'s `shoot()` takes an optional CFrame, and the game's own spinbot fires exactly that way (`shoot(CFrame.lookAt(cameraPos, targetPos))` + ammo refill). The rays, hit story, headshot map and spread seed are all built by the game's own code — and the shoot packet carries no aim flag, so the server cannot tell a redirected shot apart from the game's legit cheats. Optional auto fire while a target is in FOV
+- **Max aim assist** — cranks the game's own `AimAssistController` through its public setters: 2000-stud range, 180° FOV, head lock, ignore line of sight, all method strengths maxed (re-asserted every second, restored on toggle off)
+- **Player ESP** — name + distance labels with enemy / teammate / bot colors and Highlight chams; **Bot ESP** covers the round bots (`Workspace.Game.__ServerBotCharacters`)
+- **Weapon** — no recoil (the camera-kick function is bypassed) and infinite ammo
+- Menu key RightShift, config in `havoc_hub/aimbot_config.json`, unload button in Extras
+
 ### Universal — `games/universal.luau` (any other game)
 
 Generic toolkit for games without a dedicated script:
@@ -108,6 +119,7 @@ Copy `games/7336302630.luau` (or `games/universal.luau`) into your executor's wo
 | `games/8343259840.luau` | Criminality (recoil & spread toolkit) |
 | `games/12144402492.luau` | Deadline (weapon mods, reload speed, aimbot, ESP) |
 | `games/9938675423.luau` | Oaklands (ESP suite, enhanced drag + grabbers, vehicle speed / fly / freecam teleports, fullbright, anti-cheat shield, test / exploit tab) |
+| `games/80139795758532.luau` | AIMBOT (aimbot + silent aim via the game's own shot path, max aim assist, player / bot ESP, no recoil, infinite ammo) |
 | `games/universal.luau` | Universal aimbot / ESP / utilities fallback |
 | `uilib.luau` | Shared UI toolkit — Project Delta-style window shell (dot header, drawn-X close, searchable left-rail tabs, footer), widgets, toasts, rebind capture, popup management |
 | `esp.luau` | One-file ESP library — Project Delta based engine (corner box, name/health/distance, highlights) + two-window customizer (preview + settings) used by every script |

@@ -45,6 +45,7 @@ local UNIVERSES = {
     [4283416256] = 12144402492, -- Deadline (lobby + its match places)
     [3666294218] = 9938675423,  -- Oaklands (all of its places)
     [9224753153] = 100283815455755, -- Vagrant Survival (all of its places)
+    [9210599831] = 80139795758532, -- AIMBOT (all of its places)
 }
 
 local RAW_BASE = ("https://raw.githubusercontent.com/%s/%s/%s/"):format(USER, REPO, BRANCH)
