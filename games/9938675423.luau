@@ -150,7 +150,7 @@
                            instant server kick (fully server-gated).
       • Diagnostics      - one button prints what is actually armed /
                            found live: SAFE key, guard hook, redirect
-                           hashes, weapon / saw / swing / golf / jar /
+                           hashes, weapon / saw / swing / lumberjack / jar /
                            basket / breath / quest objects.
       • Passive          - Swing Redirect (swings retarget the nearest
                            tree / rock within the slider radius) and
@@ -158,7 +158,8 @@
                            slider range instead of the capped ray);
                            both rewrite the game's own packets in the
                            guard hook - no sends of their own.
-      • Local tier       - Weapon Stats / Tools / Golf / Firefly Jar /
+      • Local tier       - Weapon Stats / Tools / Lumberjack Sim /
+                           Firefly Jar /
                            Fruit Basket tuning with recorded bases and
                            full restore; Infinite Breath (the 150
                            watchdog report is eaten by the shield).
@@ -210,7 +211,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.30"
+local SCRIPT_VERSION = "oak-v29.31"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -335,7 +336,12 @@ local DEFAULTS = {
         -- tools (local writes)
         SawFuel    = false, -- chainsaw never stalls on empty fuel
         SwingSpeed = 1,     -- divisor on MaxSwingTime (axes/pickaxes/chisel)
-        GolfPower  = 1,     -- multiplier on golf SwingPower
+        -- lumberjack sim (idle minigame - all logic client-side)
+        LJAutoClick = false,
+        LJCPS       = 12,
+        LJSuper     = false,
+        LJHandsaws  = 0,    -- forced crit count (0 = leave alone)
+        LJLogsInput = "",
         -- firefly jar
         JarRadius  = 16,    -- collect reach (16 = vanilla)
         JarAuto    = false,
@@ -3238,8 +3244,20 @@ local function installHaxShield()
             if getnamecallmethod() == "FireServer" then
                 local first = ...
                 local isHax = typeof(self) == "Instance" and self.Name == "HAX"
-                if Config.Misc.HAXShield
-                    and (isHax or (type(first) == "table" and first.val == 11291)) then
+                -- the _Types tripwire fires HAX:FireServer(11291) + a
+                -- {<runtime-decrypted key> = 11291} beacon at a random
+                -- remote - scan the payload for the 11291 VALUE so the
+                -- drop still works if they rename the key literal
+                local canary = type(first) == "number" and first == 11291
+                if not canary and type(first) == "table" then
+                    for _, cv in pairs(first) do
+                        if cv == 11291 then
+                            canary = true
+                            break
+                        end
+                    end
+                end
+                if Config.Misc.HAXShield and (isHax or canary) then
                     if isHax then
                         shieldNote(("HAX report dropped (code %s)"):format(tostring(first)))
                     else
@@ -3641,13 +3659,74 @@ local function testSwingStep()
     end
 end
 
-local function testGolfStep()
+-- ============================================================
+-- LUMBERJACK SIM  (dump-verified: the idle minigame runs fully
+-- client-side - GameInfo{Logs,Handsaws,Lumberjacks,Bombs} +
+-- ClickEvent(amount); totals save via SetLumberjackArcadeData
+-- every 5s / on close. Features work while the sim is OPEN.)
+-- ============================================================
+local function findLJSim()
+    local inst = TEST_STATE.ljSim
+    if inst and inst.Instance and inst.Instance.Parent then
+        return inst
+    end
+    local now = os.clock()
+    if now < (TEST_STATE.ljNext or 0) then return nil end
+    TEST_STATE.ljNext = now + 5
+    TEST_STATE.ljSim = nil
+    local fn = getgc
+    if type(fn) ~= "function" then return nil end
+    local heaps = {}
+    local ok1, g1 = pcall(fn, true)
+    if ok1 and type(g1) == "table" then table.insert(heaps, g1) end
+    local ok2, g2 = pcall(fn)
+    if ok2 and type(g2) == "table" and g2 ~= g1 then table.insert(heaps, g2) end
+    for _, heap in ipairs(heaps) do
+        for _, v in ipairs(heap) do
+            if type(v) == "table" then
+                local gi = rawget(v, "GameInfo")
+                if type(gi) == "table"
+                    and rawget(gi, "Logs") ~= nil
+                    and rawget(gi, "Handsaws") ~= nil
+                    and rawget(gi, "Lumberjacks") ~= nil
+                    and rawget(gi, "Bombs") ~= nil
+                    and rawget(v, "FallingLogs") ~= nil
+                    and type(rawget(v, "SuperSpeed")) == "boolean"
+                    and rawget(v, "Instance") ~= nil then
+                    TEST_STATE.ljSim = v
+                    print("[oaklands] test: lumberjack sim found")
+                    return v
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local ljAcc = 0
+
+local function testLJStep()
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
     local t = Config.Test
-    local mult = math.clamp(tonumber(t.GolfPower) or 1, 1, 100)
-    for _, inst in ipairs(testFind({ "SwingPower", "SwingDistance" })) do
-        local rec = TEST_STATE.recs[inst]
-        if not rec then rec = {} TEST_STATE.recs[inst] = rec end
-        tuneMult(inst, rec, "SwingPower", mult)
+    if not (t.LJAutoClick or t.LJSuper or (tonumber(t.LJHandsaws) or 0) > 0) then return end
+    local inst = findLJSim()
+    if not (inst and inst.Instance and inst.Instance.Parent) then return end
+    if t.LJSuper then
+        inst.SuperSpeed = true
+        inst.SuperSpeedUntil = os.clock() + 60
+    end
+    local wants = math.floor(tonumber(t.LJHandsaws) or 0)
+    if wants > 0 and (tonumber(rawget(inst.GameInfo, "Handsaws")) or 0) ~= wants then
+        inst.GameInfo.Handsaws = wants
+    end
+    if t.LJAutoClick then
+        ljAcc = ljAcc + 0.05 * math.clamp(tonumber(t.LJCPS) or 12, 1, 50)
+        while ljAcc >= 1 do
+            ljAcc = ljAcc - 1
+            pcall(function() inst:ClickEvent(1) end)
+        end
+    else
+        ljAcc = 0
     end
 end
 
@@ -4069,11 +4148,11 @@ local function testDiagnostics()
     print("[oaklands] test diag: guard=" .. tostring(shield.installed and "installed" or "OFF")
         .. " shield=" .. tostring(Config.Misc.HAXShield and "on" or "off")
         .. " redirectHashes=" .. tostring(hashes and "ready" or "waiting for key"))
-    print(("[oaklands] test diag: weapons=%d saw=%d swings=%d golf=%d"):format(
+    print(("[oaklands] test diag: weapons=%d saw=%d swings=%d ljSim=%s"):format(
         #testFind({ "HitRadius", "Cooldown", "SwingTime", "Inventory" }),
         #testFind({ "Fuel", "MaxFuel", "Cutting" }),
         #testFind({ "MaxSwingTime", "Inventory" }),
-        #testFind({ "SwingPower", "SwingDistance" })))
+        findLJSim() and "found" or "no"))
     print(("[oaklands] test diag: jar=%s basket=%s breath=%s quests=%s"):format(
         yn(findJarInstance(), "found", "no"),
         yn(findBasketInstance(), "found", "no"),
@@ -4090,7 +4169,6 @@ local function testStep()
     pcall(testWeaponStep)
     pcall(testSawStep)
     pcall(testSwingStep)
-    pcall(testGolfStep)
     pcall(testJarStep)
     pcall(testBasketStep)
     pcall(testNukeStep)
@@ -4115,6 +4193,14 @@ track(task.spawn(function()
     while true do
         task.wait(0.35)
         pcall(testStep)
+    end
+end))
+
+-- lumberjack sim runs on a faster tick (auto click up to 50/s)
+track(task.spawn(function()
+    while true do
+        task.wait(0.05)
+        pcall(testLJStep)
     end
 end))
 
@@ -4662,11 +4748,45 @@ local function buildMenu()
         function(v) Config.Test.SwingSpeed = v end, 1, 1, 10,
         function(v) return ("x%d"):format(v) end)
 
-    section(pt, "Golf")
-    slider(pt, "Launch power x",
-        function() return Config.Test.GolfPower end,
-        function(v) Config.Test.GolfPower = v end, 5, 1, 100,
-        function(v) return ("x%d"):format(v) end)
+    section(pt, "Lumberjack Sim")
+    toggle(pt, "Auto click",
+        function() return Config.Test.LJAutoClick end,
+        function(v)
+            Config.Test.LJAutoClick = v
+            notify(v and "Auto click on - open the lumberjack sim" or "Auto click off")
+        end)
+    slider(pt, "Auto click rate",
+        function() return Config.Test.LJCPS end,
+        function(v) Config.Test.LJCPS = v end, 1, 1, 50,
+        function(v) return ("%d/s"):format(v) end)
+    toggle(pt, "Super speed",
+        function() return Config.Test.LJSuper end,
+        function(v)
+            Config.Test.LJSuper = v
+            if not v then
+                local inst = findLJSim()
+                if inst then pcall(function() inst.SuperSpeedUntil = 0 end) end
+            end
+            notify(v and "Super speed forced" or "Super speed off")
+        end)
+    slider(pt, "Handsaws (crit)",
+        function() return Config.Test.LJHandsaws end,
+        function(v) Config.Test.LJHandsaws = v end, 1, 0, 1000,
+        function(v) return v > 0 and ("%d forced"):format(v) or "vanilla" end)
+    input(pt, "Set logs",
+        function() return Config.Test.LJLogsInput end,
+        function(v) Config.Test.LJLogsInput = tostring(v or "") end, { numeric = true })
+    button(pt, "Apply logs", function()
+        local inst = findLJSim()
+        local raw = tostring(Config.Test.LJLogsInput or "")
+        local n = tonumber(raw) or tonumber((raw:gsub(",", "")))
+        if inst and n then
+            inst.GameInfo.Logs = math.max(0, math.floor(n))
+            notify("Logs set - saves every 5s while the sim is open")
+        else
+            notify(inst and "enter a number first" or "open the lumberjack sim first")
+        end
+    end)
 
     section(pt, "Firefly Jar")
     slider(pt, "Collect radius",
