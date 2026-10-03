@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - ARMORED PATROL                         ap-v1.5
+    HAVOC HUB - ARMORED PATROL                         ap-v1.6
     ============================================================
 
     PlaceId 10518166490  ·  GameId 3826087550  ·  loader hands this in
@@ -82,7 +82,7 @@
     "you actually control that rig".
 ]]
 
-local SCRIPT_VERSION = "ap-v1.5"
+local SCRIPT_VERSION = "ap-v1.6"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -599,7 +599,7 @@ end
 -- treads leave the ground instead of dragging. While flying, the rig's
 -- own drive/steer invokes are suppressed (see the __namecall hook in the
 -- aim section) so the game's drive loop cannot fight the flight.
-local FLY = { active = false, rig = nil, liftT = 0, logT = 0, freezeLog = 0, pos = nil, glue = nil, lastPos = nil, lastSet = nil, lastVel = nil, pushCount = 0, pushMax = 0, jarLog = 0, hrp = nil }
+local FLY = { active = false, rig = nil, liftT = 0, logT = 0, freezeLog = 0, pos = nil, glue = nil, lastPos = nil, lastSet = nil, lastVel = nil, pushCount = 0, pushMax = 0, jarLog = 0, hrp = nil, chassis = nil, root = nil, noLuaLogged = false }
 
 -- guard bookkeeping lives here (early) so the fly stepper can see it -
 -- the actual guard hunt + hook lives further down (aim section)
@@ -609,6 +609,9 @@ if type(GUARDED) ~= "table" then
     GUARDED = {}
     genv.__HAVOC_AP_GUARDED = GUARDED
 end
+
+-- chassis write tracer bookkeeping (the tracer itself lives further down)
+local CHW = { seen = {}, total = 0, suppressed = {} }
 
 local function stepRigFly(dt)
     if not Config.Rig.FlyOn then
@@ -645,11 +648,13 @@ local function stepRigFly(dt)
         FLY.lastSet = nil
         FLY.lastVel = nil
         FLY.pushCount, FLY.pushMax = 0, 0
+        FLY.noLuaLogged = false
     end
     local chNow = LocalPlayer.Character
     FLY.hrp = (chNow and chNow:FindFirstChild("HumanoidRootPart")) or nil
 
     local root = chassis.AssemblyRootPart or chassis
+    FLY.chassis, FLY.root = chassis, root
     local speed = math.clamp(Config.Rig.FlySpeed, 20, 400)
     local cam = Workspace.CurrentCamera
     local look = (cam and cam.CFrame.LookVector) or root.CFrame.LookVector
@@ -674,9 +679,10 @@ local function stepRigFly(dt)
         FLY.liftT = FLY.liftT - (dt or 0)
         dir += Vector3.new(0, 0.8, 0)
     end
+    local sdt = math.min(dt or 0, 0.1)
     local step = Vector3.zero
     if dir.Magnitude > 0.01 then
-        step = dir.Unit * math.min(dir.Magnitude, 1.6) * speed * (dt or 0)
+        step = dir.Unit * math.min(dir.Magnitude, 1.6) * speed * sdt
         if step.Magnitude > 8 then step = step.Unit * 8 end
     end
     if not FLY.pos then FLY.pos = root.Position end
@@ -695,12 +701,12 @@ local function stepRigFly(dt)
     local flat = Vector3.new(fwd.X, 0, fwd.Z)
     if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
     local newCF = CFrame.lookAt(FLY.pos, FLY.pos + flat.Unit, Vector3.new(0, 1, 0))
-    local setVel = (dt and dt > 0) and (step / dt) or Vector3.zero
+    local setVel = (sdt > 0) and (step / sdt) or Vector3.zero
     if setVel.Magnitude > 480 then setVel = setVel.Unit * 480 end
     -- external push detection: residual beyond our own velocity's progress
     local pre = root.Position
     if FLY.lastSet then
-        local expected = FLY.lastSet + (FLY.lastVel or Vector3.zero) * (dt or 0)
+        local expected = FLY.lastSet + (FLY.lastVel or Vector3.zero) * sdt
         local residual = (pre - expected).Magnitude
         if residual > 3 then
             FLY.pushCount = FLY.pushCount + 1
@@ -759,9 +765,16 @@ local function stepRigFly(dt)
             local o = root:GetNetworkOwner()
             owner = o and o.Name or "server"
         end)
-        log(("fly moved=%.0f/s drift=%.1f push=%d/%.0f owner=%s state=%s"):format(
-            moved, drift, FLY.pushCount, FLY.pushMax, tostring(owner), tostring(stateOf(rig))))
+        local supp = 0
+        for _ in pairs(CHW.suppressed) do supp = supp + 1 end
+        log(("fly moved=%.0f/s drift=%.1f push=%d/%.0f chw=%d supp=%d owner=%s state=%s"):format(
+            moved, drift, FLY.pushCount, FLY.pushMax, CHW.total, supp, tostring(owner), tostring(stateOf(rig))))
+        if FLY.pushCount > 30 and CHW.total == 0 and not FLY.noLuaLogged then
+            FLY.noLuaLogged = true
+            log("shoved with ZERO Lua chassis writers - engine replication: the server owns the rig")
+        end
         FLY.pushCount, FLY.pushMax = 0, 0
+        CHW.total = 0
         if dir.Magnitude > 0.01 and moved < 10 and (os.clock() - FLY.freezeLog) > 3 then
             FLY.freezeLog = os.clock()
             local p = root.Position
@@ -851,6 +864,38 @@ else
     warn("[AP] hookmetamethod unavailable - aim assist disabled")
 end
 
+-- Chassis writer tracer (ap-v1.6): any GAME-side Lua write to the
+-- chassis CFrame / velocity is recorded by source; a repeat offender
+-- (>=5 writes) while flying gets hookfunction'd quiet. If the rig is
+-- being shoved around while NO Lua writer ever appears, the fight is
+-- engine replication - i.e. the server owns the rig.
+local function noteChassisWriter(fn)
+    local rec = CHW.seen[fn]
+    if not rec then
+        local src = "?"
+        pcall(function() src = tostring(debug.info(fn, "s")) .. "@" .. tostring(debug.info(fn, "l")) end)
+        rec = { src = src, n = 0 }
+        CHW.seen[fn] = rec
+    end
+    rec.n = rec.n + 1
+    CHW.total = CHW.total + 1
+    if FLY.active and rec.n >= 5 and not CHW.suppressed[fn] and type(hookfunction) == "function" then
+        local orig
+        local ok = pcall(function()
+            orig = hookfunction(fn, function(...)
+                if FLY.active then return end
+                return orig(...)
+            end)
+        end)
+        if ok and type(orig) == "function" then
+            CHW.suppressed[fn] = true
+            log(("chassis writer suppressed: %s"):format(rec.src))
+        else
+            rec.n = 0
+        end
+    end
+end
+
 -- Rig Fly support: while flying, drop the rig's own drive/steer invokes
 -- (BindableFunction "DriveFunction" -> "drive-forward", "steer", ...) so
 -- the local drive loop cannot fight the flight. "hello", "unseat" and
@@ -863,6 +908,11 @@ if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" 
             if genv.__HAVOC_AP_GEN ~= MY_GEN then return oldN(self, ...) end
             if FLY.active and self == FLY.hrp and getnamecallmethod() == "PivotTo" then
                 return nil -- seated-character rubber-bands cannot yank the rig
+            end
+            if FLY.active and (self == FLY.chassis or self == FLY.root) and getnamecallmethod() == "PivotTo" then
+                local fn = debug.info(2, "f")
+                if type(fn) == "function" then pcall(noteChassisWriter, fn) end
+                return nil -- local rig pivots are dropped while flying
             end
             if FLY.active and getnamecallmethod() == "Invoke" and self ~= nil and self.Name == "DriveFunction" then
                 local cmd = ...
@@ -895,11 +945,19 @@ if type(hookmetamethod) == "function" then
                 and (key == "AssemblyLinearVelocity" or key == "AssemblyAngularVelocity") then
                 return
             end
+            if key == "CFrame" or key == "AssemblyLinearVelocity" or key == "AssemblyAngularVelocity" or key == "Position" then
+                if self == FLY.chassis or self == FLY.root then
+                    local fn = debug.info(2, "f")
+                    if type(fn) == "function" then
+                        pcall(noteChassisWriter, fn)
+                    end
+                end
+            end
             return oldW(self, key, value)
         end)
     end)
     if okW then
-        log("seated-character write blocker installed")
+        log("seated-character write blocker + chassis tracer installed")
     end
 end
 
