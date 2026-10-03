@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - ARMORED PATROL                         ap-v1.2
+    HAVOC HUB - ARMORED PATROL                         ap-v1.3
     ============================================================
 
     PlaceId 10518166490  ·  GameId 3826087550  ·  loader hands this in
@@ -53,7 +53,12 @@
                             velocity for ~2s (120 frames) the moment
                             chassis speed passes 500. That freeze was
                             the "speed gets corrected" / "fly stops for
-                            a couple seconds" seen live.
+                            a couple seconds" seen live. ap-v1.3 hooks
+                            that guard for our rig: pure over-speed
+                            freezes are skipped entirely (NaN recovery
+                            kept), and while flying the guard's tracked
+                            parts get flushed to chassis velocity so
+                            void-linked treads cannot stretch into NaN.
         • Rig -> Camera   - slam your rig (and you) to the freecam-ish
                             camera spot; pinned for a moment, velocities
                             zeroed. Hotkey V.
@@ -79,7 +84,7 @@
     "you actually control that rig".
 ]]
 
-local SCRIPT_VERSION = "ap-v1.2"
+local SCRIPT_VERSION = "ap-v1.3"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -596,7 +601,7 @@ end
 -- treads leave the ground instead of dragging. While flying, the rig's
 -- own drive/steer invokes are suppressed (see the __namecall hook in the
 -- aim section) so the game's drive loop cannot fight the flight.
-local FLY = { active = false, rig = nil, liftT = 0, logT = 0 }
+local FLY = { active = false, rig = nil, liftT = 0, logT = 0, frozenT = 0, freezeLog = 0, spikeLog = 0, lastTgt = 0 }
 
 local function stepRigFly(dt)
     if not Config.Rig.FlyOn then
@@ -635,6 +640,27 @@ local function stepRigFly(dt)
         if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then lift -= 1 end
     end)
 
+    -- freeze/spike telemetry: something sometimes pins the rig for ~2s -
+    -- report it so the console tells the story on the next live test
+    local preMag = root.AssemblyLinearVelocity.Magnitude
+    if preMag > 500 then
+        if (os.clock() - FLY.spikeLog) > 3 then
+            FLY.spikeLog = os.clock()
+            log(("vel spike past cap: %.0f"):format(preMag))
+        end
+    end
+    if (throttle ~= 0 or strafe ~= 0 or lift ~= 0 or FLY.liftT > 0) and preMag < 5 then
+        FLY.frozenT = FLY.frozenT + (dt or 0)
+        if FLY.frozenT > 0.5 and (os.clock() - FLY.freezeLog) > 3 then
+            FLY.freezeLog = os.clock()
+            local p = root.Position
+            log(("FREEZE DETECTED vel=%.0f pos=(%d,%d,%d) state=%s"):format(
+                preMag, p.X, p.Y, p.Z, tostring(stateOf(rig))))
+        end
+    else
+        FLY.frozenT = 0
+    end
+
     local target = look * (throttle * speed) + right * (strafe * speed)
         + Vector3.new(0, Workspace.Gravity * (dt or 0), 0)
     if lift > 0 then
@@ -649,11 +675,12 @@ local function stepRigFly(dt)
 
     -- LsDrive's NaN guard hard-freezes the rig (~2s, CFrame pinned +
     -- velocities zeroed) as soon as chassis speed passes 500. Stay under
-    -- it - that freeze is the "speed gets corrected" seen live.
+    -- it - and the guard hook (see below) skips the over-speed freeze.
     local mag = target.Magnitude
     if mag > 480 then
         target = target.Unit * 480
     end
+    FLY.lastTgt = target.Magnitude
 
     local v = root.AssemblyLinearVelocity
     root.AssemblyLinearVelocity = v + (target - v) * 0.35
@@ -661,7 +688,7 @@ local function stepRigFly(dt)
     FLY.logT = FLY.logT + (dt or 0)
     if FLY.logT >= 1 then
         FLY.logT = 0
-        log(("fly vel=%d state=%s"):format(root.AssemblyLinearVelocity.Magnitude, tostring(stateOf(rig))))
+        log(("fly vel=%d tgt=%d state=%s"):format(root.AssemblyLinearVelocity.Magnitude, FLY.lastTgt, tostring(stateOf(rig))))
     end
 
     -- level lock: kill roll/pitch tumble, right the rig if flipped
@@ -783,6 +810,108 @@ if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" 
         log("drive suppression hook installed")
     else
         warn("[AP] __namecall hook failed - drive loop keeps running while flying")
+    end
+end
+
+-- ============================================================
+-- LsDrive NaN-GUARD NEUTRALIZER (ap-v1.3)
+-- LsDrive's heartbeat guard (x112) PINS the rig's CFrame + zeroes all
+-- velocities for 120 frames (~2s) when chassis speed passes 500 or any
+-- tracked part NaNs/infs. We hook that guard for our rig: pure
+-- over-speed freezes are skipped, NaN events still run the heal path.
+-- While flying we also flush the guard's tracked part list (its upvalue
+-- 2 - the void-linked treads/wheels) with the chassis velocity so they
+-- can never stretch the solver into NaN in the first place.
+-- ============================================================
+local GRD = { chassis = nil, parts = nil, nanLog = 0 }
+local GUARDED = genv.__HAVOC_AP_GUARDED
+if type(GUARDED) ~= "table" then
+    GUARDED = {}
+    genv.__HAVOC_AP_GUARDED = GUARDED
+end
+
+local function grabUp(f, i)
+    local ok, _, v = pcall(debug.getupvalue, f, i)
+    if ok then return v end
+    return nil
+end
+
+local function installGuard(rig)
+    local chassis = chassisOf(rig)
+    if not chassis or GUARDED[chassis] then return end
+    if type(getconnections) ~= "function" or type(debug.getupvalue) ~= "function" then return end
+    local okC, conns = pcall(getconnections, RunService.Heartbeat)
+    if not okC or type(conns) ~= "table" then return end
+    for _, conn in ipairs(conns) do
+        local f = conn.Function
+        if type(f) == "function" and grabUp(f, 1) == chassis then
+            local uv2, uv3, uv4 = grabUp(f, 2), grabUp(f, 3), grabUp(f, 4)
+            local uv8, uv9, uv13 = grabUp(f, 8), grabUp(f, 9), grabUp(f, 13)
+            if type(uv2) == "table" and type(uv3) == "number"
+                and type(uv4) == "function" and type(uv8) == "function"
+                and type(uv9) == "function" and type(uv13) == "boolean" then
+                local orig
+                local wrapped = function(...)
+                    local lv = chassis.AssemblyLinearVelocity
+                    local pos = chassis.CFrame.Position
+                    local av = chassis.AssemblyAngularVelocity
+                    local nan = (lv.X ~= lv.X) or (lv.Y ~= lv.Y) or (lv.Z ~= lv.Z)
+                        or (pos.X ~= pos.X) or (pos.Y ~= pos.Y) or (pos.Z ~= pos.Z)
+                        or (av.X ~= av.X) or (av.Y ~= av.Y) or (av.Z ~= av.Z)
+                    if nan then
+                        local now = os.clock()
+                        if (now - GRD.nanLog) > 5 then
+                            GRD.nanLog = now
+                            log("guard: NaN seen - heal path runs")
+                        end
+                        if orig then return orig(...) end
+                        return
+                    end
+                    if lv.Magnitude > 500 then
+                        return -- pure over-speed: skip the 2s freeze
+                    end
+                    if orig then return orig(...) end
+                end
+                local okH, res = pcall(hookfunction, f, wrapped)
+                if okH and type(res) == "function" then
+                    orig = res
+                    GUARDED[chassis] = true
+                    GRD.chassis, GRD.parts = chassis, uv2
+                    log(("guard neutralized for %s (%d tracked parts)"):format(rig.Name, #uv2))
+                else
+                    warn("[AP] guard hook failed for", rig.Name)
+                end
+                return
+            end
+        end
+    end
+end
+
+local guardScanT = 0
+local function stepGuard(dt)
+    if not (Config.Rig.FlyOn or Config.Rig.SpeedOn) then return end
+    local rig = myRig()
+    if not rig then return end
+    local chassis = chassisOf(rig)
+    if not chassis then return end
+    if not GUARDED[chassis] then
+        guardScanT = guardScanT + dt
+        if guardScanT >= 2 then
+            guardScanT = 0
+            pcall(installGuard, rig)
+        end
+    end
+    if Config.Rig.FlyOn and GRD.chassis == chassis and type(GRD.parts) == "table" then
+        local root = chassis.AssemblyRootPart or chassis
+        local lv = root.AssemblyLinearVelocity
+        for _, p in ipairs(GRD.parts) do
+            if p and p.Parent then
+                pcall(function()
+                    p.AssemblyLinearVelocity = lv
+                    p.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end
     end
 end
 
@@ -1274,6 +1403,8 @@ local aimFirstAccum = 0
 
 track(RunService.Heartbeat:Connect(function(dt)
     if genv.__HAVOC_AP_GEN ~= MY_GEN then return end
+    pcall(stepGuard, dt)
+
     claimAccum = claimAccum + dt
     if claimAccum >= 3 then
         claimAccum = 0
