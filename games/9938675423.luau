@@ -136,7 +136,10 @@
                           game's re-aim frozen for the window - so even
                           at the edge of the streaming range the load
                           lands without spamming Y; while freecam is on
-                          a carry lock keeps it frozen the whole flight).
+                          a carry lock freezes it AND keeps the drag
+                          alive hands-free - let go of the mouse, fly,
+                          press Y to bring the load; freecam off hands
+                          normal carry control back).
                           All local writes, no packets; server grab
                           checks unknown - creep up.
 
@@ -166,7 +169,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.23"
+local SCRIPT_VERSION = "oak-v29.24"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1645,6 +1648,11 @@ local function grabberRestoreAll()
                     rawset(inst, "__havocGrabLock", nil)
                     rawset(inst, "UpdatePosition", nil)
                 end
+                if rawget(inst, "__havocGrabHold") then
+                    rawset(inst, "__havocGrabHold", nil)
+                    rawset(inst, "PrimaryAction", nil)
+                    rawset(inst, "PrimaryActionStart", nil)
+                end
             end
         end)
     end
@@ -1717,17 +1725,29 @@ local function grabberApplyRay(inst, through)
     end)
 end
 
--- Freecam carry lock (oak-v29.18): while the freecam is on + Grab
--- Teleport is enabled + a grab is live, the instance's UpdatePosition is
--- swapped for this no-op. That stops the game's per-frame carry logic
--- entirely - the align re-aim (which used to drag the load back toward
--- the character), the >100-stud auto-release (which used to drop the
--- load the moment the freecam flew away) and the camera-facing
--- orientation chase. The ball + load freeze in place; the Y teleport
--- still moves them (it writes the CFrame + align target directly) and
--- can be pressed again to hop the load along. The lock releases when
--- the grab ends, the freecam goes off, or the feature is toggled off.
+-- Freecam carry lock (oak-v29.18, hands-free since v29.24): while the
+-- freecam is on + Grab Teleport is enabled + a grab is live, the
+-- instance's UpdatePosition is swapped for this no-op. That stops the
+-- game's per-frame carry logic entirely - the align re-aim (which used
+-- to drag the load back toward the character), the >100-stud
+-- auto-release (which used to drop the load the moment the freecam flew
+-- away) and the camera-facing orientation chase. The ball + load freeze
+-- in place; the Y teleport still moves them (it writes the CFrame +
+-- align target directly) and can be pressed again to hop the load
+-- along. The lock releases when the grab ends, the freecam goes off, or
+-- the feature is toggled off.
+-- Hands-free (oak-v29.24): the game's tool binder wires MouseButton1
+-- down/up straight to PrimaryActionStart / PrimaryAction - which send
+-- the StartDrag / StopDrag packets. While the FREECAM half of the lock
+-- is active both are swapped for no-ops, so releasing the mouse no
+-- longer ends the drag: let go, fly, press Y - the load stays held and
+-- frozen until the teleport lands or the freecam goes off (the lock
+-- then lifts and normal carry control resumes; any click starts the
+-- usual grab/drop flow again). Stray clicks while frozen can't re-send
+-- StartDrag either.
 local function grabLockUpdate() end
+local function grabLockStop() end    -- swallows the mouse-up (StopDrag)
+local function grabLockStart() end   -- swallows stray clicks (StartDrag)
 
 local function grabberLockStep()
     local freeOn = genv.__HAVOC_OAKLANDS_FREECAM == true
@@ -1750,13 +1770,34 @@ local function grabberLockStep()
                     rawset(inst, "UpdatePosition", grabLockUpdate)
                     if freecamLock and GRAB_STATE.lockPrint ~= true then
                         GRAB_STATE.lockPrint = true
-                        print("[oaklands] grab lock: ball frozen - fly, then press "
+                        print("[oaklands] grab lock: load frozen + held hands-free - let go of the mouse, fly, then press "
                             .. tostring(HOTKEY_BY_ID.GrabTP.Key.Name) .. " to bring the load")
                     end
+                end
+                -- hands-free hold: only while the FREECAM half of the
+                -- lock is active - swallow mouse-up (which would send
+                -- StopDrag and end the grab) and stray re-clicks (which
+                -- would re-send StartDrag). Lifts the moment the freecam
+                -- goes off, so normal click-to-drop comes back.
+                if freecamLock then
+                    if rawget(inst, "__havocGrabHold") ~= true then
+                        rawset(inst, "__havocGrabHold", true)
+                        rawset(inst, "PrimaryAction", grabLockStop)
+                        rawset(inst, "PrimaryActionStart", grabLockStart)
+                    end
+                elseif rawget(inst, "__havocGrabHold") then
+                    rawset(inst, "__havocGrabHold", nil)
+                    rawset(inst, "PrimaryAction", nil)
+                    rawset(inst, "PrimaryActionStart", nil)
                 end
             elseif rawget(inst, "__havocGrabLock") then
                 rawset(inst, "__havocGrabLock", nil)
                 rawset(inst, "UpdatePosition", nil)
+                if rawget(inst, "__havocGrabHold") then
+                    rawset(inst, "__havocGrabHold", nil)
+                    rawset(inst, "PrimaryAction", nil)
+                    rawset(inst, "PrimaryActionStart", nil)
+                end
                 inst.LastRayRes = nil  -- fresh aim baseline, no instant release
                 if GRAB_STATE.lockPrint == true then
                     GRAB_STATE.lockPrint = false
@@ -3361,7 +3402,7 @@ local function buildMenu()
         function() return Config.Grabber.TP end,
         function(v)
             Config.Grabber.TP = v
-            notify(v and ("Grab teleport on - carrying with a grabber, press " .. HOTKEY_BY_ID.GrabTP.Key.Name) or "Grab teleport off")
+            notify(v and ("Grab teleport on - carry with a grabber, press " .. HOTKEY_BY_ID.GrabTP.Key.Name .. "; in freecam the load stays held hands-free") or "Grab teleport off")
         end)
     keybindRow(pmv, HOTKEY_BY_ID.GrabTP)
     section(pmv, "Vehicles")
