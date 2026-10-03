@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - ARMORED PATROL                         ap-v1.1
+    HAVOC HUB - ARMORED PATROL                         ap-v1.2
     ============================================================
 
     PlaceId 10518166490  ·  GameId 3826087550  ·  loader hands this in
@@ -47,6 +47,13 @@
                             drive/steer invokes are suppressed while
                             flying so nothing fights the flight
                             (WASD / Space / LeftCtrl).
+                            NOTE: all our rig velocity writes are hard-
+                            capped at 480 - LsDrive's client NaN guard
+                            (x112) PINS the rig's CFrame + zeroes every
+                            velocity for ~2s (120 frames) the moment
+                            chassis speed passes 500. That freeze was
+                            the "speed gets corrected" / "fly stops for
+                            a couple seconds" seen live.
         • Rig -> Camera   - slam your rig (and you) to the freecam-ish
                             camera spot; pinned for a moment, velocities
                             zeroed. Hotkey V.
@@ -72,7 +79,7 @@
     "you actually control that rig".
 ]]
 
-local SCRIPT_VERSION = "ap-v1.1"
+local SCRIPT_VERSION = "ap-v1.2"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -573,7 +580,8 @@ local function stepRigDrive()
     local flat = Vector3.new(v.X, 0, v.Z)
     if flat.Magnitude > 4 then
         local mult = Config.Rig.SpeedMult
-        local newMag = math.min(flat.Magnitude * mult, 60 * mult)
+        -- stay under the LsDrive NaN-guard's 500 threshold (see header)
+        local newMag = math.min(flat.Magnitude * mult, math.min(60 * mult, 480))
         pcall(function()
             chassis.AssemblyLinearVelocity = flat.Unit * newMag + Vector3.new(0, v.Y, 0)
         end)
@@ -588,7 +596,7 @@ end
 -- treads leave the ground instead of dragging. While flying, the rig's
 -- own drive/steer invokes are suppressed (see the __namecall hook in the
 -- aim section) so the game's drive loop cannot fight the flight.
-local FLY = { active = false, rig = nil, liftT = 0 }
+local FLY = { active = false, rig = nil, liftT = 0, logT = 0 }
 
 local function stepRigFly(dt)
     if not Config.Rig.FlyOn then
@@ -639,8 +647,22 @@ local function stepRigFly(dt)
         target += Vector3.new(0, speed * 0.9, 0)
     end
 
+    -- LsDrive's NaN guard hard-freezes the rig (~2s, CFrame pinned +
+    -- velocities zeroed) as soon as chassis speed passes 500. Stay under
+    -- it - that freeze is the "speed gets corrected" seen live.
+    local mag = target.Magnitude
+    if mag > 480 then
+        target = target.Unit * 480
+    end
+
     local v = root.AssemblyLinearVelocity
     root.AssemblyLinearVelocity = v + (target - v) * 0.35
+
+    FLY.logT = FLY.logT + (dt or 0)
+    if FLY.logT >= 1 then
+        FLY.logT = 0
+        log(("fly vel=%d state=%s"):format(root.AssemblyLinearVelocity.Magnitude, tostring(stateOf(rig))))
+    end
 
     -- level lock: kill roll/pitch tumble, right the rig if flipped
     local up = root.CFrame.UpVector
