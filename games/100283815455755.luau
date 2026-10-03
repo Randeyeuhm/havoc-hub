@@ -52,7 +52,7 @@
     Re-run safe: genv generation token, old UI + ESP cleaned on boot.
 ]]
 
-local SCRIPT_VERSION = "vs-v1"
+local SCRIPT_VERSION = "vs-v1.1"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -114,11 +114,11 @@ local DEFAULT_CONFIG = {
     },
     Aim = {
         Enabled = false,
-        FOV = 25,
+        FOV = 30,
         MaxDist = 800,
         TeamCheck = false,
         Wildlife = false,   -- also lock onto animals
-        Smoothing = 0.35,   -- 0 = instant snap, 0.95 = slow drift
+        Smoothing = 0.25,   -- 0 = instant snap, 0.95 = slow drift
         AutoFire = false,
         Circle = true,
     },
@@ -307,6 +307,24 @@ local function myAnchorPos()
     return cam and cam.CFrame.Position or nil
 end
 
+-- Characters live under /Workspace/Spawned/<session folder>/<username>.
+-- Player.Character normally points straight at them; this fallback covers
+-- any moment where it does not (re-parents during spawn, spectate, etc).
+local function findChar(pl)
+    local ch = pl.Character
+    if ch then return ch end
+    local spawned = Workspace:FindFirstChild("Spawned")
+    if spawned then
+        for _, folder in ipairs(spawned:GetChildren()) do
+            local c = folder:FindFirstChild(pl.Name)
+            if c and c:IsA("Model") and c:FindFirstChild("Humanoid") then
+                return c
+            end
+        end
+    end
+    return nil
+end
+
 -- ============================================================
 -- PLAYER ESP (esp.luau engine)
 -- ============================================================
@@ -321,19 +339,22 @@ local function refreshPlayerESP(dt)
     espAccum = espAccum + dt
     if espAccum < 0.25 then return end
     espAccum = 0
-    if not Config.Players.ESP then
-        PlayerESP:Prune({})
-        return
-    end
     local cfg = Config.ESP
+    -- the esp.luau engine gates EVERYTHING on cfg.Enabled - the master
+    -- switch must follow our UI toggle or nothing ever draws
+    cfg.Enabled = Config.Players.ESP and true or false
     cfg.MaxDistance = Config.Players.MaxDist
     cfg.ChamsHead = Config.Players.Chams and true or false
     cfg.ChamsBody = Config.Players.Chams and true or false
+    if not cfg.Enabled then
+        PlayerESP:Prune({})
+        return
+    end
     local anchor = myAnchorPos()
     local seen = {}
     for _, pl in ipairs(Players:GetPlayers()) do
         if pl ~= LocalPlayer then
-            local ch = pl.Character
+            local ch = findChar(pl)
             if ch and ch:FindFirstChild("HumanoidRootPart") then
                 if not (Config.Players.TeamCheck and sameTeam(pl)) then
                     local okDist = true
@@ -370,14 +391,15 @@ local function refreshWildESP(dt)
     wildAccum = wildAccum + dt
     if wildAccum < 0.3 then return end
     wildAccum = 0
-    if not Config.World.Wildlife then
-        WildESP:Prune({})
-        return
-    end
     local cfg = Config.WildESP
+    cfg.Enabled = Config.World.Wildlife and true or false
     cfg.MaxDistance = Config.World.WildMaxDist
     cfg.ChamsHead = Config.World.WildChams and true or false
     cfg.ChamsBody = Config.World.WildChams and true or false
+    if not cfg.Enabled then
+        WildESP:Prune({})
+        return
+    end
     local anchor = myAnchorPos()
     local seen = {}
     local folder = wildlifeFolder()
@@ -448,7 +470,7 @@ local function pickAimTarget()
 
     for _, pl in ipairs(Players:GetPlayers()) do
         if pl ~= LocalPlayer and not (Config.Aim.TeamCheck and sameTeam(pl)) then
-            local ch = pl.Character
+            local ch = findChar(pl)
             local hum = ch and ch:FindFirstChildOfClass("Humanoid")
             if hum and hum.Health > 0 then
                 local part = ch:FindFirstChild("Head") or ch:FindFirstChild("HumanoidRootPart")
@@ -660,7 +682,10 @@ if UILib then
     local plr = window.tab("Players")
     UILib.makeSectionHeader(plr, "PLAYER ESP")
     toggleRow(plr, "Player ESP", function() return Config.Players.ESP end,
-        function(v) Config.Players.ESP = v end)
+        function(v)
+            Config.Players.ESP = v
+            Config.ESP.Enabled = v -- flip the library master switch right away
+        end)
     sliderRow(plr, "Max distance", function() return Config.Players.MaxDist end,
         function(v) Config.Players.MaxDist = v end, 50, 100, 4000, function(v)
             return ("%d m"):format(v)
@@ -717,7 +742,10 @@ if UILib then
     local world = window.tab("World")
     UILib.makeSectionHeader(world, "WILDLIFE ESP")
     toggleRow(world, "Wildlife ESP", function() return Config.World.Wildlife end,
-        function(v) Config.World.Wildlife = v end)
+        function(v)
+            Config.World.Wildlife = v
+            Config.WildESP.Enabled = v
+        end)
     sliderRow(world, "Max distance", function() return Config.World.WildMaxDist end,
         function(v) Config.World.WildMaxDist = v end, 50, 100, 4000, function(v)
             return ("%d m"):format(v)
