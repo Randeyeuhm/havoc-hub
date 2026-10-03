@@ -54,6 +54,8 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace         = game:GetService("Workspace")
 local LocalPlayer       = Players.LocalPlayer
 
+local genv = (type(getgenv) == "function" and getgenv()) or _G
+
 local MY_GEN = {}
 genv.__HAVOC_AIMBOT_GEN = MY_GEN
 
@@ -198,7 +200,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v1"
+local SCRIPT_VERSION = "aim-v1.1"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
