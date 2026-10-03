@@ -211,7 +211,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v2.0"
+local SCRIPT_VERSION = "aim-v2.1"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -982,39 +982,62 @@ end))
 -- game's own MouseDown/MouseUp handler) call the wrapped shoot directly
 -- at our own cadence; ammo is refilled exactly like the game's spinbot
 -- does, and silent aim redirects each shot on top.
--- CHAOS SPAM fires a whole burst per engine tick with no inter-shot
--- wait - hundreds of Shoot:FireServer packets + ray draws per second,
--- enough to visibly choke the client and the lobby (that's the point).
+-- CHAOS SPAM fires whole bursts per engine tick with no inter-shot wait
+-- AND runs CHAOS_WORKERS parallel burst threads - thousands of
+-- Shoot:FireServer packets + ray draws a second, enough to choke the
+-- client and drown the lobby server (that's the point).
+local CHAOS_BURST = 24
+local CHAOS_WORKERS = 4
+
+local function fireOnce()
+    local ctrl = CTRL_STATE.controller
+    if not (ctrl and ctrl.activated and ctrl.equipped) then return false end
+    pcall(function()
+        if not ctrl:isHumanoidAlive() then return end
+        local mag = ctrl.blaster and ctrl.blaster:GetAttribute("magazineSize")
+        if mag and (ctrl.ammo <= 0 or ctrl.reloading) then
+            if ctrl.reloadTask then
+                pcall(task.cancel, ctrl.reloadTask)
+                ctrl.reloadTask = nil
+            end
+            ctrl.reloading = false
+            ctrl.ammo = mag
+            ctrl.guiController:setReloading(false)
+            ctrl.guiController:setAmmo(ctrl.ammo)
+        end
+        ctrl:shoot()
+    end)
+    return true
+end
+
 track(task.spawn(function()
     while genOK() do
         local chaos = Config.Misc.RapidFireChaos == true
         local rate = math.clamp(tonumber(Config.Misc.RapidFireRate) or 14, 3, 200)
         if not chaos then task.wait(1 / rate) end
         if Config.Misc.RapidFire or chaos then
-            local burst = chaos and 8 or 1
-            for _ = 1, burst do
-                local ctrl = CTRL_STATE.controller
-                if not (ctrl and ctrl.activated and ctrl.equipped) then break end
-                pcall(function()
-                    if not ctrl:isHumanoidAlive() then return end
-                    local mag = ctrl.blaster and ctrl.blaster:GetAttribute("magazineSize")
-                    if mag and (ctrl.ammo <= 0 or ctrl.reloading) then
-                        if ctrl.reloadTask then
-                            pcall(task.cancel, ctrl.reloadTask)
-                            ctrl.reloadTask = nil
-                        end
-                        ctrl.reloading = false
-                        ctrl.ammo = mag
-                        ctrl.guiController:setReloading(false)
-                        ctrl.guiController:setAmmo(ctrl.ammo)
-                    end
-                    ctrl:shoot()
-                end)
+            for _ = 1, (chaos and CHAOS_BURST or 1) do
+                if not fireOnce() then break end
             end
         end
         if chaos then task.wait() end
     end
 end))
+
+-- extra chaos workers: parallel burst threads that only run in chaos
+-- mode - each one adds another CHAOS_BURST shots per engine tick
+for _ = 1, CHAOS_WORKERS - 1 do
+    track(task.spawn(function()
+        while genOK() do
+            task.wait()
+            if Config.Misc.RapidFireChaos then
+                for _ = 1, CHAOS_BURST do
+                    if not fireOnce() then break end
+                end
+            end
+        end
+    end))
+end
 
 pcall(function()
     LocalPlayer.Idled:Connect(function()
@@ -1407,7 +1430,7 @@ local function buildMenu()
         function() return Config.Misc.RapidFireChaos end,
         function(v)
             Config.Misc.RapidFireChaos = v
-            notify(v and "CHAOS ON - hold the trigger, this wrecks the lobby" or "Chaos off")
+            notify(v and "CHAOS x4 ON - hold the trigger, brace for impact" or "Chaos off")
         end)
     toggle(px, "Xray bullets (wallbang)",
         function() return Config.Misc.Xray end,
