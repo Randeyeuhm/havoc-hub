@@ -201,7 +201,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v1.2"
+local SCRIPT_VERSION = "aim-v1.3"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -403,8 +403,12 @@ local function isVisibleTo(t, fromPos, toPos)
     return hit == nil
 end
 
--- nearest target to the crosshair inside the FOV circle
-local function pickTarget()
+-- nearest target to the crosshair inside the FOV circle.
+-- requireLOS = true is used by SILENT AIM: a redirected shot only
+-- registers when the game's own raycast can actually reach the target
+-- (blocks behind cover would make the shot claim nothing), so silent
+-- only picks targets with a clear line from the camera.
+local function pickTarget(requireLOS)
     local cam = Workspace.CurrentCamera
     if not cam then return nil end
     local mouse = UserInputService:GetMouseLocation()
@@ -421,7 +425,7 @@ local function pickTarget()
                 local dx, dy = sp.X - mouse.X, sp.Y - mouse.Y
                 local score = math.sqrt(dx * dx + dy * dy)
                 if score <= fovPx and score < bestScore then
-                    if not Config.Aimbot.VisibleOnly or isVisibleTo(t, origin, pos) then
+                    if not (Config.Aimbot.VisibleOnly or requireLOS) or isVisibleTo(t, origin, pos) then
                         best, bestScore = t, score
                     end
                 end
@@ -475,7 +479,7 @@ end
 
 -- silent shot bookkeeping (mirrors the game's spinbotShoot exactly:
 -- cancel reload -> refill -> shoot at the target CFrame -> refill + UI)
-local silentShot = { fired = 0, redirected = 0 }
+local silentShot = { fired = 0, redirected = 0, lastNote = 0 }
 
 local function installWrappers(ctrl)
     local rec = ORIG[ctrl]
@@ -486,8 +490,8 @@ local function installWrappers(ctrl)
     end
     rawset(ctrl, "shoot", function(self, cf)
         -- silent aim: any real shot can be redirected at the wire
-        if Config.Silent.Enabled and self == CTRL_STATE.controller then
-            local target = pickTarget()
+        if Config.Silent.Enabled and rawget(self, "__havocAimOwn") == true then
+            local target = pickTarget(true)
             if target then
                 local cam = Workspace.CurrentCamera
                 if cam then
@@ -509,9 +513,8 @@ local function installWrappers(ctrl)
                             self.guiController:setAmmo(self.ammo)
                         end)
                     end
-                    silentShot.fired = silentShot.fired + 1
                     silentShot.redirected = silentShot.redirected + 1
-                    if silentShot.redirected == 1 or silentShot.redirected % 50 == 0 then
+                    if silentShot.redirected == 1 or silentShot.redirected % 25 == 0 then
                         print(("[aimbot] silent: redirected %d shots"):format(silentShot.redirected))
                     end
                     if not ok then
@@ -521,6 +524,11 @@ local function installWrappers(ctrl)
                 end
             end
             silentShot.fired = silentShot.fired + 1
+            local now = os.clock()
+            if now - silentShot.lastNote >= 2.5 then
+                silentShot.lastNote = now
+                print(("[aimbot] silent: no clear target in FOV - fired straight (%d)"):format(silentShot.fired))
+            end
         end
         if Config.Misc.InfAmmo then
             local mag = self.blaster and self.blaster:GetAttribute("magazineSize")
@@ -532,6 +540,7 @@ local function installWrappers(ctrl)
         if Config.Misc.NoRecoil then return end
         return rec.recoil(self, ...)
     end)
+    rawset(ctrl, "__havocAimOwn", true)
     return true
 end
 
@@ -542,12 +551,17 @@ local function ensureController()
     end
     local now = os.clock()
     if now < CTRL_STATE.nextScan then return CTRL_STATE.controller end
-    CTRL_STATE.nextScan = now + 1
+    CTRL_STATE.nextScan = now + 3
     local found = findController()
     if found and found ~= c then
         CTRL_STATE.controller = found
         if installWrappers(found) then
-            print("[aimbot] blaster controller hooked")
+            print(("[aimbot] blaster controller hooked%s"):format(Config.Silent.Enabled and " (silent armed)" or ""))
+        end
+    elseif not found then
+        if Config.Silent.Enabled and now - (CTRL_STATE.lastMiss or 0) >= 10 then
+            CTRL_STATE.lastMiss = now
+            print("[aimbot] silent: controller not found yet - equip a blaster to arm it")
         end
     end
     return CTRL_STATE.controller
@@ -768,7 +782,7 @@ track(task.spawn(function()
         if Config.Silent.AutoFire and Config.Silent.Enabled then
             local ctrl = CTRL_STATE.controller
             if ctrl and ctrl.equipped and ctrl:isHumanoidAlive() then
-                local target = pickTarget()
+                local target = pickTarget(true)
                 if target and not autoActive then
                     autoActive = true
                     pcall(function() ctrl:activate() end)
@@ -991,7 +1005,11 @@ local function buildMenu()
         function() return Config.Silent.Enabled end,
         function(v)
             Config.Silent.Enabled = v
-            notify(v and "Silent aim on - shots redirect to the target" or "Silent aim off")
+            if v and not CTRL_STATE.controller then
+                notify("Silent aim on - equip your blaster to arm it")
+            else
+                notify(v and "Silent aim on - shots redirect to the target" or "Silent aim off")
+            end
         end, HOTKEY_LIST[3])
     keybindRow(pa, HOTKEY_LIST[3])
     toggle(pa, "Auto fire",
@@ -1174,6 +1192,7 @@ local function buildMenu()
             pcall(function()
                 rawset(c, "shoot", nil)
                 rawset(c, "recoil", nil)
+                rawset(c, "__havocAimOwn", nil)
             end)
         end
         if fovCircle then pcall(function() fovCircle:Destroy() end) end
