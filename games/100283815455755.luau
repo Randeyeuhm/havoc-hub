@@ -65,7 +65,7 @@
     Re-run safe: genv generation token, old UI + ESP cleaned on boot.
 ]]
 
-local SCRIPT_VERSION = "vs-v2.3"
+local SCRIPT_VERSION = "vs-v2.4"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -498,27 +498,29 @@ if type(weaponMods) ~= "table" then
     genv.__HAVOC_VS_WEAPONMODS = weaponMods
 end
 
-local function deepCopy(v)
-    if type(v) ~= "table" then return v end
+local function shallowCopy(t)
     local out = {}
-    for k, val in pairs(v) do
-        out[k] = deepCopy(val)
+    for k, v in pairs(t) do
+        out[k] = v
     end
     return out
 end
 
+-- Only the RecoilInfo sub-table is replaced (shallow copy of the rest), so
+-- the frozen originals are never touched and there is nothing to recurse
+-- into - no cycles, no depth blowout, cheap enough for every equip.
 local function moddedGunConfig(cfg)
     if type(cfg) ~= "table" then return cfg end
-    if Config.Weapons.NoRecoil then
-        local copy = deepCopy(cfg)
-        local ri = copy.RecoilInfo
-        if type(ri) == "table" then
-            ri.NudgeX = NumberRange.new(0, 0)
-            ri.NudgeY = NumberRange.new(0, 0)
-        end
-        return copy
+    if not Config.Weapons.NoRecoil then return cfg end
+    local copy = shallowCopy(cfg)
+    local ri = cfg.RecoilInfo
+    if type(ri) == "table" then
+        local ri2 = shallowCopy(ri)
+        ri2.NudgeX = NumberRange.new(0, 0)
+        ri2.NudgeY = NumberRange.new(0, 0)
+        copy.RecoilInfo = ri2
     end
-    return cfg
+    return copy
 end
 
 local function installWeaponMods()
@@ -546,14 +548,18 @@ local function installWeaponMods()
             return false, weaponMods.note
         end
     end
-    local function makeWrapper(orig)
+    local function makeWrapper(name, orig)
         return function(...)
             local okC, cfg = pcall(orig, ...)
             if not okC or type(cfg) ~= "table" then return cfg end
             local okM, res = pcall(moddedGunConfig, cfg)
+            if okM and res ~= cfg then
+                print(("[VS] weapon mods: recoil zeroed for '%s'"):format(tostring(name)))
+            end
             return okM and res or cfg
         end
     end
+    local count = 0
     for name, ctor in pairs(ic) do
         if type(ctor) == "function" then
             local orig = weaponMods.originals[name]
@@ -561,11 +567,13 @@ local function installWeaponMods()
                 orig = ctor
                 weaponMods.originals[name] = orig
             end
-            ic[name] = makeWrapper(orig)
+            ic[name] = makeWrapper(name, orig)
+            count = count + 1
         end
     end
     weaponMods.installed = true
     weaponMods.note = "armed"
+    print(("[VS] weapon mods: %d item configs wrapped (NoRecoil = %s)"):format(count, tostring(Config.Weapons.NoRecoil)))
     return true, weaponMods.note
 end
 
@@ -865,8 +873,8 @@ end
 -- opportunities and keep the silent-aim target cache fresh.
 local function updateAimState()
     local cfg = Config.Aim
-    silentOn = (cfg.SilentAim == true and cfg.Enabled == true) and aimGenOK() or false
-    if not (cfg.Enabled and aimGenOK()) then
+    silentOn = (cfg.SilentAim == true) and aimGenOK() or false
+    if not (aimGenOK() and (cfg.Enabled or cfg.SilentAim)) then
         clearAim()
         AIM.lastCharacter = nil
         return
@@ -991,7 +999,7 @@ end
 -- it always layers over the ORIGINAL __namecall so re-executing can never
 -- stack wrappers. Server validation is unknown - test it.
 -- ============================================================
-local silentShot = { gun = nil, melee = nil, installed = false, note = "off" }
+local silentShot = { gun = nil, melee = nil, installed = false, note = "off", seen = 0, rewrote = 0, miss = 0 }
 
 local function rewriteShotArgs(...)
     local part = AIM.silentPart
@@ -1078,9 +1086,18 @@ local function installSilentAim()
         if silentOn then
             if getnamecallmethod() == "FireServer"
                and (self == silentShot.gun or self == silentShot.melee) then
+                silentShot.seen = silentShot.seen + 1
                 local ok, packed = pcall(rewriteShotArgs, ...)
                 if ok and type(packed) == "table" then
+                    silentShot.rewrote = silentShot.rewrote + 1
+                    if silentShot.rewrote == 1 or silentShot.rewrote % 25 == 0 then
+                        print(("[VS] silent aim: rewrote %d shots (seen %d)"):format(silentShot.rewrote, silentShot.seen))
+                    end
                     return orig(self, table.unpack(packed, 1, packed.n))
+                end
+                silentShot.miss = silentShot.miss + 1
+                if silentShot.miss == 1 or silentShot.miss % 50 == 0 then
+                    print(("[VS] silent aim: %d shots passed through (no target cached)"):format(silentShot.miss))
                 end
             end
         end
@@ -1089,6 +1106,8 @@ local function installSilentAim()
     if type(setreadonly) == "function" then pcall(setreadonly, mt, true) end
     silentShot.installed = true
     silentShot.note = "armed"
+    print(("[VS] silent aim: armed (gun=%s, melee=%s)"):format(
+        tostring(silentShot.gun ~= nil), tostring(silentShot.melee ~= nil)))
     return true, silentShot.note
 end
 
@@ -1445,6 +1464,8 @@ if UILib then
             else
                 AIM.silentPart = nil
                 notify("Silent aim off")
+                print(("[VS] silent aim: saw %d shots, rewrote %d, %d passed through"):format(
+                    silentShot.seen, silentShot.rewrote, silentShot.miss))
             end
         end)
 
@@ -1469,7 +1490,7 @@ if UILib then
             Config.Weapons.NoRecoil = v
             if v then
                 local ok, note = armWeaponMods()
-                notify(ok and "No recoil on (applies next equip)" or ("Weapon mods not armed: " .. tostring(note)))
+                notify(ok and "No recoil on - re-equip your gun" or ("Weapon mods not armed: " .. tostring(note)))
             else
                 notify("No recoil off")
             end
@@ -1612,10 +1633,9 @@ applyFullbright()
 if Config.Aim.SilentAim then
     task.spawn(function() armSilentAim() end)
 end
--- wrap the gun configs when No Recoil was left on
-if Config.Weapons.NoRecoil then
-    task.spawn(function() armWeaponMods() end)
-end
+-- wrap the gun configs every load: the wrapper reads the No Recoil flag at
+-- equip time, so toggling later needs no re-execute
+task.spawn(function() pcall(installWeaponMods) end)
 
 log(("%s loaded | players: %d | aim: %s (%s/%s) | silent: %s | noRecoil: %s | pESP: %s | wESP: %s"):format(
     SCRIPT_VERSION,
