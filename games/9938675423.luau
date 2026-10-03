@@ -55,11 +55,11 @@
         hovers instead of fighting the camera; every exit path (toggle
         off, death, cam teleport) hands the mouse back unlocked.
       • Cam Teleport   - optional: fly the freecam to a spot and press
-        T. On foot it moves the PLAYER there (same teleport family as
-        the store warps - moved instantly, never made non-colliding;
-        landing probed + nudged up + seated on the ground). Seated in
-        a vehicle it pulls the WHOLE vehicle (wheels included) and you
-        straight there. Collection walks the joint graph,
+        T. On foot it moves the PLAYER straight to the camera - exactly
+        where the freecam is, indoors or out (same teleport family as
+        the store warps - moved instantly, never made non-colliding).
+        Seated in a vehicle it pulls the WHOLE vehicle (wheels included)
+        and you straight there. Collection walks the joint graph,
         sweeps the rig model + attachment reverse-lookups, and picks
         wheels up by NAME (FL/FR/BL/BR corner names + anything called
         wheel, tire or tyre - the live car hides them from every joint
@@ -74,7 +74,7 @@
         stutter fest. The wheel sweep itself is scoped to the rig
         model (found via its RigWheels) and hard-capped, so a dragged
         chunk of world can never be counted, scanned or stuttered
-        over again. The
+        over again. The vehicle
         landing nudges up over obstacles; the camera must be >20 studs
         away so the chase cam can never trigger it. The car is pinned
         at the landing spot for a moment (beats physics / server
@@ -166,7 +166,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.22"
+local SCRIPT_VERSION = "oak-v29.23"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -2533,12 +2533,14 @@ end
 -- which is why the name sweep found nothing.
 local WHEEL_SLOTS = { fl = true, fr = true, bl = true, br = true, ml = true, mr = true, rl = true, rr = true }
 
--- Player Cam Teleport (oak-v29.22): the on-foot half of the T key - move
--- the CHARACTER to the freecam spot. Same client-side teleport-skip
--- family as the store warps and the vehicle jump: the character is moved
--- instantly and NEVER made non-colliding. The landing is probed, nudged
--- up over obstacles and seated on the ground; the freecam drops
--- afterwards so you see where you landed.
+-- Player Cam Teleport (oak-v29.22, fixed in v29.23): the on-foot half of
+-- the T key - move the CHARACTER straight to the freecam spot, exactly
+-- where the camera is. Same client-side teleport-skip family as the store
+-- warps and the vehicle jump: the character is moved instantly and NEVER
+-- made non-colliding. No landing probe and no ground-dropping (user
+-- feedback: the probe refused spots inside buildings and the ground-seat
+-- dropped the player when neither was ever asked for) - you go to the
+-- camera, period. The freecam drops afterwards so you see where you land.
 local function playerCameraTeleport(ch)
     if not ch then
         print("[oaklands] cam tp: no character")
@@ -2557,43 +2559,8 @@ local function playerCameraTeleport(ch)
         print("[oaklands] cam tp: camera too close - fly the freecam further out first")
         return
     end
-    -- same landing probe as the vehicle jump - nudge straight up over
-    -- obstacles (a freecam can sit inside a slope); refuse only when
-    -- even +20 studs is buried
-    local function landingClear(pos)
-        local oparams = OverlapParams.new()
-        oparams.FilterType = Enum.RaycastFilterType.Exclude
-        oparams.FilterDescendantsInstances = { ch }
-        oparams.RespectCanCollide = true
-        local okh, hits = pcall(function()
-            return Workspace:GetPartBoundsInRadius(pos, 2.5, oparams)
-        end)
-        return okh and hits and #hits == 0
-    end
-    local landPos = nil
-    for _, dy in ipairs({ 0, 4, 8, 12, 16, 20 }) do
-        local p = camPos + Vector3.new(0, dy, 0)
-        if landingClear(p) then
-            landPos = p
-            break
-        end
-    end
-    if not landPos then
-        print("[oaklands] cam tp: landing spot is blocked - aim the freecam at open space")
-        return
-    end
-    -- ground-seat: cast straight down from the clear spot so you land ON
-    -- the ground instead of falling from camera height
-    local rparams = RaycastParams.new()
-    rparams.FilterType = Enum.RaycastFilterType.Exclude
-    rparams.FilterDescendantsInstances = { ch }
-    rparams.IgnoreWater = true
-    local hit = Workspace:Raycast(landPos + Vector3.new(0, 4, 0), Vector3.new(0, -300, 0), rparams)
-    if hit then
-        landPos = Vector3.new(landPos.X, hit.Position.Y + 3.5, landPos.Z)
-    end
     local look = hrp.CFrame.LookVector
-    ch:PivotTo(CFrame.lookAt(landPos, landPos + look))
+    ch:PivotTo(CFrame.lookAt(camPos, camPos + look))
     pcall(function()
         hrp.AssemblyLinearVelocity = Vector3.new()
         hrp.AssemblyAngularVelocity = Vector3.new()
