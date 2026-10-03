@@ -205,7 +205,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v1.4"
+local SCRIPT_VERSION = "aim-v1.5"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -440,7 +440,7 @@ local function pickTarget(requireLOS)
 end
 
 -- ============================================================
--- BLASTER CONTROLLER  (getgc finder + native shoot/recoil wrappers)
+-- BLASTER CONTROLLER  (module hook + getgc fallback, shoot/recoil wrappers)
 -- ============================================================
 -- The controller is the game's live shooting brain (BlasterController
 -- instance per equipped blaster). Its shoot() takes an OPTIONAL CFrame -
@@ -548,7 +548,80 @@ local function installWrappers(ctrl)
     return true
 end
 
+-- RESPAWN-PROOF CAPTURE: the game hands you a FRESH blaster + brand-new
+-- BlasterController every life (death/respawn/round start), so wrapping
+-- a found controller only survives one life. Hook the game's OWN
+-- BlasterController module instead: every .new() is wrapped the instant
+-- it runs, .equip() re-points tracking, .destroy() clears it. The getgc
+-- finder stays below as a fallback if the module cannot be required.
+local hookOK = false
+local function hookBlasterModule()
+    if hookOK then return true end
+    -- undo a previous session's hook first so OUR closures always win
+    local prev = genv.__HAVOC_AIMBOT_MODULE_HOOK
+    if type(prev) == "table" then
+        pcall(function()
+            local m = prev.module
+            if m then
+                if prev.new then rawset(m, "new", prev.new) end
+                if prev.equip then rawset(m, "equip", prev.equip) end
+                if prev.destroy then rawset(m, "destroy", prev.destroy) end
+            end
+        end)
+        genv.__HAVOC_AIMBOT_MODULE_HOOK = nil
+    end
+    local blasterRoot = ReplicatedStorage:FindFirstChild("Blaster")
+    local scriptsFolder = blasterRoot and blasterRoot:FindFirstChild("Scripts")
+    local moduleScript = scriptsFolder and scriptsFolder:FindFirstChild("BlasterController")
+    if not moduleScript then return false end
+    local ok, BC = pcall(require, moduleScript)
+    if not ok or type(BC) ~= "table" or type(rawget(BC, "new")) ~= "function" then
+        return false
+    end
+    local rec = {
+        module = BC,
+        new = rawget(BC, "new"),
+        equip = rawget(BC, "equip"),
+        destroy = rawget(BC, "destroy"),
+    }
+    genv.__HAVOC_AIMBOT_MODULE_HOOK = rec
+    rawset(BC, "new", function(...)
+        local ctrl = rec.new(...)
+        if type(ctrl) == "table" then
+            pcall(function()
+                CTRL_STATE.controller = ctrl
+                installWrappers(ctrl)
+            end)
+        end
+        return ctrl
+    end)
+    if type(rec.equip) == "function" then
+        rawset(BC, "equip", function(self, ...)
+            local r = rec.equip(self, ...)
+            pcall(function()
+                CTRL_STATE.controller = self
+                installWrappers(self)
+            end)
+            return r
+        end)
+    end
+    if type(rec.destroy) == "function" then
+        rawset(BC, "destroy", function(self, ...)
+            if CTRL_STATE.controller == self then
+                CTRL_STATE.controller = nil
+            end
+            return rec.destroy(self, ...)
+        end)
+    end
+    hookOK = true
+    print("[aimbot] BlasterController hooked at source - survives respawns")
+    return true
+end
+
+hookBlasterModule()
+
 local function ensureController()
+    if not hookOK then pcall(hookBlasterModule) end
     local c = CTRL_STATE.controller
     if c and rawget(c, "blaster") and c.blaster.Parent then
         return c
@@ -1236,6 +1309,21 @@ local function buildMenu()
         end
         pcall(assistRestore)
         if PlayerESP then pcall(function() PlayerESP:Clear() end) end
+        local modHook = genv.__HAVOC_AIMBOT_MODULE_HOOK
+        if type(modHook) == "table" then
+            pcall(function()
+                local m = modHook.module
+                if m then
+                    if modHook.new then rawset(m, "new", modHook.new) end
+                    if modHook.equip then rawset(m, "equip", modHook.equip) end
+                    if modHook.destroy then rawset(m, "destroy", modHook.destroy) end
+                end
+            end)
+            genv.__HAVOC_AIMBOT_MODULE_HOOK = nil
+        end
+        if type(genv.__HAVOC_AIMBOT_CTRL) == "table" then
+            genv.__HAVOC_AIMBOT_CTRL.controller = nil
+        end
         for c in pairs(ORIG) do
             pcall(function()
                 rawset(c, "shoot", nil)
