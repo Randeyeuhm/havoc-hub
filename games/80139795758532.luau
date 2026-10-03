@@ -23,8 +23,8 @@
                         controls: boxes, names, health, distance,
                         chams, tracers - every element customisable
       • Weapon        - no recoil (camera kick), infinite ammo,
-                        rapid fire (hold the trigger), xray bullets
-                        (wallbang - the game's own map-pierce flag)
+                        rapid fire (hold the trigger) with a CHAOS
+                        spam mode, xray bullets (wallbang)
       • Anti-AFK, config persistence, unload button
 
     Recon facts (structure dump 2026-10-03):
@@ -123,6 +123,7 @@ local DEFAULTS = {
         InfAmmo = false,
         RapidFire = false,
         RapidFireRate = 14, -- shots per second while the trigger is held
+        RapidFireChaos = false, -- uncapped burst spam (wrecks the lobby)
         Xray = false,
         MaxAssist = false,
         AntiAFK = true,
@@ -210,7 +211,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v1.9"
+local SCRIPT_VERSION = "aim-v2.0"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -981,28 +982,37 @@ end))
 -- game's own MouseDown/MouseUp handler) call the wrapped shoot directly
 -- at our own cadence; ammo is refilled exactly like the game's spinbot
 -- does, and silent aim redirects each shot on top.
+-- CHAOS SPAM fires a whole burst per engine tick with no inter-shot
+-- wait - hundreds of Shoot:FireServer packets + ray draws per second,
+-- enough to visibly choke the client and the lobby (that's the point).
 track(task.spawn(function()
     while genOK() do
-        local rate = math.clamp(tonumber(Config.Misc.RapidFireRate) or 14, 3, 30)
-        task.wait(1 / rate)
-        if not Config.Misc.RapidFire then continue end
-        local ctrl = CTRL_STATE.controller
-        if not (ctrl and ctrl.activated and ctrl.equipped) then continue end
-        pcall(function()
-            if not ctrl:isHumanoidAlive() then return end
-            local mag = ctrl.blaster and ctrl.blaster:GetAttribute("magazineSize")
-            if mag and (ctrl.ammo <= 0 or ctrl.reloading) then
-                if ctrl.reloadTask then
-                    pcall(task.cancel, ctrl.reloadTask)
-                    ctrl.reloadTask = nil
-                end
-                ctrl.reloading = false
-                ctrl.ammo = mag
-                ctrl.guiController:setReloading(false)
-                ctrl.guiController:setAmmo(ctrl.ammo)
+        local chaos = Config.Misc.RapidFireChaos == true
+        local rate = math.clamp(tonumber(Config.Misc.RapidFireRate) or 14, 3, 200)
+        if not chaos then task.wait(1 / rate) end
+        if Config.Misc.RapidFire or chaos then
+            local burst = chaos and 8 or 1
+            for _ = 1, burst do
+                local ctrl = CTRL_STATE.controller
+                if not (ctrl and ctrl.activated and ctrl.equipped) then break end
+                pcall(function()
+                    if not ctrl:isHumanoidAlive() then return end
+                    local mag = ctrl.blaster and ctrl.blaster:GetAttribute("magazineSize")
+                    if mag and (ctrl.ammo <= 0 or ctrl.reloading) then
+                        if ctrl.reloadTask then
+                            pcall(task.cancel, ctrl.reloadTask)
+                            ctrl.reloadTask = nil
+                        end
+                        ctrl.reloading = false
+                        ctrl.ammo = mag
+                        ctrl.guiController:setReloading(false)
+                        ctrl.guiController:setAmmo(ctrl.ammo)
+                    end
+                    ctrl:shoot()
+                end)
             end
-            ctrl:shoot()
-        end)
+        end
+        if chaos then task.wait() end
     end
 end))
 
@@ -1391,8 +1401,14 @@ local function buildMenu()
         end)
     slider(px, "Rapid fire rate",
         function() return Config.Misc.RapidFireRate end,
-        function(v) Config.Misc.RapidFireRate = v end, 1, 3, 30,
+        function(v) Config.Misc.RapidFireRate = v end, 1, 3, 200,
         function(v) return ("%d shots/s"):format(v) end)
+    toggle(px, "Chaos spam (break the game)",
+        function() return Config.Misc.RapidFireChaos end,
+        function(v)
+            Config.Misc.RapidFireChaos = v
+            notify(v and "CHAOS ON - hold the trigger, this wrecks the lobby" or "Chaos off")
+        end)
     toggle(px, "Xray bullets (wallbang)",
         function() return Config.Misc.Xray end,
         function(v)
