@@ -8,7 +8,7 @@
 
       • Aimbot        - FOV circle, smoothing (0 = straight lock),
                         Hold RMB / Always, head or torso, team +
-                        visibility checks
+                        visibility checks (players and bots)
       • Silent Aim    - shots redirect to the target at the wire with
                         the game's OWN native flow: the BlasterController
                         shoot() takes an optional CFrame, and the shoot
@@ -21,7 +21,8 @@
                         this repo) with the FULL schema as menu
                         controls: boxes, names, health, distance,
                         chams, tracers - every element customisable
-      • Weapon        - no recoil (camera kick), infinite ammo
+      • Weapon        - no recoil (camera kick), infinite ammo,
+                        rapid fire (hold the trigger)
       • Anti-AFK, config persistence, unload button
 
     Recon facts (structure dump 2026-10-03):
@@ -98,6 +99,7 @@ local DEFAULTS = {
         MaxDist = 600,
         TeamCheck = true,
         VisibleOnly = false,
+        TargetBots = true, -- also lock + silent-fire at __ServerBotCharacters
         Part = "Head",     -- Head / Torso
     },
     Silent = {
@@ -115,6 +117,8 @@ local DEFAULTS = {
     Misc = {
         NoRecoil = false,
         InfAmmo = false,
+        RapidFire = false,
+        RapidFireRate = 14, -- shots per second while the trigger is held
         MaxAssist = false,
         AntiAFK = true,
     },
@@ -201,7 +205,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v1.3"
+local SCRIPT_VERSION = "aim-v1.4"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -416,7 +420,7 @@ local function pickTarget(requireLOS)
     local fovPx = Config.Aimbot.FOV
     local maxDist = Config.Aimbot.MaxDist
     local best, bestScore = nil, math.huge
-    for _, t in ipairs(collectTargets(false)) do
+    for _, t in ipairs(collectTargets(Config.Aimbot.TargetBots)) do
         local pos = targetPointOf(t)
         local dist = (pos - origin).Magnitude
         if dist <= maxDist then
@@ -802,6 +806,37 @@ track(task.spawn(function()
     end
 end))
 
+-- RAPID FIRE: shoot() has NO internal cadence check - the game's own
+-- startShooting loop is the only thing waiting 60/rateOfFire between
+-- shots. While the trigger is held (controller.activated, set by the
+-- game's own MouseDown/MouseUp handler) call the wrapped shoot directly
+-- at our own cadence; ammo is refilled exactly like the game's spinbot
+-- does, and silent aim redirects each shot on top.
+track(task.spawn(function()
+    while genOK() do
+        local rate = math.clamp(tonumber(Config.Misc.RapidFireRate) or 14, 3, 30)
+        task.wait(1 / rate)
+        if not Config.Misc.RapidFire then continue end
+        local ctrl = CTRL_STATE.controller
+        if not (ctrl and ctrl.activated and ctrl.equipped) then continue end
+        pcall(function()
+            if not ctrl:isHumanoidAlive() then return end
+            local mag = ctrl.blaster and ctrl.blaster:GetAttribute("magazineSize")
+            if mag and (ctrl.ammo <= 0 or ctrl.reloading) then
+                if ctrl.reloadTask then
+                    pcall(task.cancel, ctrl.reloadTask)
+                    ctrl.reloadTask = nil
+                end
+                ctrl.reloading = false
+                ctrl.ammo = mag
+                ctrl.guiController:setReloading(false)
+                ctrl.guiController:setAmmo(ctrl.ammo)
+            end
+            ctrl:shoot()
+        end)
+    end
+end))
+
 pcall(function()
     LocalPlayer.Idled:Connect(function()
         if not Config.Misc.AntiAFK then return end
@@ -966,6 +1001,9 @@ local function buildMenu()
     toggle(pa, "Visible only",
         function() return Config.Aimbot.VisibleOnly end,
         function(v) Config.Aimbot.VisibleOnly = v end)
+    toggle(pa, "Target bots",
+        function() return Config.Aimbot.TargetBots end,
+        function(v) Config.Aimbot.TargetBots = v end)
     slider(pa, "Max distance",
         function() return Config.Aimbot.MaxDist end,
         function(v) Config.Aimbot.MaxDist = v end, 25, 50, 5000,
@@ -1167,6 +1205,16 @@ local function buildMenu()
             Config.Misc.InfAmmo = v
             notify(v and "Infinite ammo on" or "Ammo normal")
         end)
+    toggle(px, "Rapid fire",
+        function() return Config.Misc.RapidFire end,
+        function(v)
+            Config.Misc.RapidFire = v
+            notify(v and "Rapid fire on - hold the trigger" or "Rapid fire off")
+        end)
+    slider(px, "Rapid fire rate",
+        function() return Config.Misc.RapidFireRate end,
+        function(v) Config.Misc.RapidFireRate = v end, 1, 3, 30,
+        function(v) return ("%d shots/s"):format(v) end)
 
     section(px, "Menu")
     keybindRow(px, HOTKEY_LIST[1], { locked = true, lockNote = "RightShift is the menu key and stays bound" })
