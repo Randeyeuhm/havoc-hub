@@ -158,13 +158,19 @@
       • Client self-reporting anti-cheat ("HAX" RemoteEvent): codes seen
         = 3/4 (client framework called from C/nil contexts), 5 (breath
         over 150), 6 (stamina over baseline+50). Never let a feature
-        trip those. The oak-v29.25 Test tab (packet tier via
-        TellServer/AskServer) was removed again in oak-v29.26 - this
-        script calls the game's client framework nowhere.
-      • _Types (11KB, Ception-VM obfuscated) runs at the start of EVERY
-        TellServer/AskServer/CreateKeyHash and fires canary packets -
-        treat all packet sends as passing an unauditable gate; prefer
-        game-module send paths (InformServer etc.) over raw sends.
+        trip those.
+      • _Types (11KB obfuscated) DECODED in oak-v29.28: runs at the
+        start of every TellServer / AskServer / CreateKeyHash /
+        RequestModule call and scans getfenv(0..3) of the calling stack
+        for the executor globals "getgenv" / "readfile" / "loadfile";
+        on a hit it fires HAX:FireServer(11291) + a {val = 11291} beacon
+        at a RANDOM hashed REM remote, prints "Hello Exploiter!" and
+        hangs the calling thread (while true do end). => never call the
+        client framework from executor stacks; SAFE.fire (fires the
+        hashed remote directly - the scanner never runs) is the channel
+        for any future packet work. The HAX Shield toggle drops HAX
+        reports + the 11291 beacon locally, so nothing reaches the
+        server even if a scan ever trips.
       • _Key (61KB, obfuscated) derives the per-server remote names from
         the INF key handshake - remote names are hashed, not static.
       • Client errors get funneled to TestService:Error (dev-visible).
@@ -180,7 +186,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.27"
+local SCRIPT_VERSION = "oak-v29.28"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -289,6 +295,7 @@ local DEFAULTS = {
         Fullbright          = false,
         FullbrightIntensity = 190,
         AntiAFK             = true,
+        HAXShield           = true,
         TeleportTarget      = "",
     },
 }
@@ -3119,6 +3126,186 @@ pcall(function()
 end)
 
 -- ============================================================
+-- ANTI-CHEAT SHIELD + SAFE PACKET CHANNEL
+-- Decoded from the dump: the game's obfuscated _Types module runs at the
+-- start of every TellServer / AskServer / CreateKeyHash / RequestModule
+-- call and scans getfenv(0..3) of the caller for the executor globals
+-- getgenv / readfile / loadfile. On a hit it fires HAX:FireServer(11291)
+-- plus a {val = 11291} beacon at a RANDOM hashed remote, prints
+-- "Hello Exploiter!" and hangs the calling thread.
+-- The shield drops those reports locally (they never reach the server);
+-- SAFE.fire / SAFE.ask send packets through the game's own hashed REM
+-- remotes directly - the scanner never runs for those at all.
+-- ============================================================
+local shield = genv.__HAVOC_OAKLANDS_SHIELD
+if type(shield) ~= "table" then
+    shield = { installed = false, dropped = 0, lastPrint = 0 }
+    genv.__HAVOC_OAKLANDS_SHIELD = shield
+end
+
+local function shieldNote(msg)
+    shield.dropped = shield.dropped + 1
+    local now = os.clock()
+    if now - shield.lastPrint >= 0.5 then
+        shield.lastPrint = now
+        print(("[oaklands] anti-cheat: %s (dropped %d)"):format(msg, shield.dropped))
+    end
+end
+
+local function installHaxShield()
+    if type(getrawmetatable) ~= "function" or type(setreadonly) ~= "function"
+        or type(getnamecallmethod) ~= "function" then
+        return false
+    end
+    local ok = pcall(function()
+        local mt = getrawmetatable(game)
+        if not mt then error("no metatable") end
+        local raw = rawget(mt, "__namecall")
+        if type(raw) ~= "function" then error("no __namecall") end
+        local orig = genv.__HAVOC_OAKLANDS_NAMECALL
+        if type(orig) ~= "function" then
+            orig = raw
+            genv.__HAVOC_OAKLANDS_NAMECALL = orig
+        end
+        setreadonly(mt, false)
+        mt.__namecall = function(self, ...)
+            if getnamecallmethod() == "FireServer" then
+                local first = ...
+                local isHax = typeof(self) == "Instance" and self.Name == "HAX"
+                if Config.Misc.HAXShield
+                    and (isHax or (type(first) == "table" and first.val == 11291)) then
+                    if isHax then
+                        shieldNote(("HAX report dropped (code %s)"):format(tostring(first)))
+                    else
+                        shieldNote("tripwire beacon dropped")
+                    end
+                    return
+                end
+            end
+            return orig(self, ...)
+        end
+        setreadonly(mt, true)
+    end)
+    shield.installed = ok
+    return ok
+end
+
+local function uninstallHaxShield()
+    local orig = genv.__HAVOC_OAKLANDS_NAMECALL
+    if not shield.installed or type(orig) ~= "function" then return end
+    pcall(function()
+        local mt = getrawmetatable(game)
+        if not mt then return end
+        setreadonly(mt, false)
+        mt.__namecall = orig
+        setreadonly(mt, true)
+    end)
+    shield.installed = false
+end
+
+-- SAFE: fire the game's hashed remotes directly. The client methods
+-- (TellServer/AskServer) run the scanner; the remotes themselves don't.
+local SAFE = genv.__HAVOC_OAKLANDS_SAFE
+if type(SAFE) ~= "table" then
+    SAFE = { key = nil, client = nil, keyMod = nil }
+    genv.__HAVOC_OAKLANDS_SAFE = SAFE
+end
+
+local function safeWatchInf()
+    if SAFE.keyConn and SAFE.watchedInf and SAFE.watchedInf.Parent then return true end
+    local inf = ReplicatedStorage:FindFirstChild("INF") or ReplicatedStorage:WaitForChild("INF", 10)
+    if not inf then return false end
+    if SAFE.keyConn then pcall(function() SAFE.keyConn:Disconnect() end) end
+    SAFE.watchedInf = inf
+    SAFE.keyConn = inf.OnClientEvent:Connect(function(msg)
+        if type(msg) == "table" and msg.Type == "DATA" and type(msg.Key) == "string" then
+            if SAFE.key ~= msg.Key then
+                SAFE.key = msg.Key
+                print("[oaklands] anti-cheat: remote key learned - SAFE sends ready")
+            end
+        end
+    end)
+    return true
+end
+
+local function safeDeps()
+    if not SAFE.client then
+        local ok, c = pcall(function()
+            local node = ReplicatedFirst:WaitForChild("Client", 15)
+            if not node then return nil end
+            return require(node)
+        end)
+        if ok and type(c) == "table" then SAFE.client = c end
+    end
+    if not SAFE.keyMod then
+        local ok, m = pcall(function()
+            local node = ReplicatedFirst:WaitForChild("Client", 15)
+            if not node then return nil end
+            local keyNode = node:WaitForChild("_Key", 15)
+            if not keyNode then return nil end
+            return require(keyNode)
+        end)
+        if ok and type(m) == "function" then SAFE.keyMod = m end
+    end
+    return SAFE.client, SAFE.keyMod
+end
+
+local function safeResolve(name)
+    local client, keyMod = safeDeps()
+    if type(client) ~= "table" or type(keyMod) ~= "function" then
+        return nil, "client dependencies not reachable"
+    end
+    if type(SAFE.key) ~= "string" then
+        safeWatchInf()
+        if type(SAFE.key) ~= "string" then
+            local inf = ReplicatedStorage:FindFirstChild("INF")
+            if inf then pcall(function() inf:FireServer("Req") end) end
+            return nil, "server key not learned yet - requested it, retry in a second"
+        end
+    end
+    local hash = keyMod(name .. SAFE.key, SAFE.key)
+    local child = client.CachedRemotes and client.CachedRemotes[hash]
+    if type(child) ~= "string" then
+        return nil, ("remote not registered: %s"):format(tostring(name))
+    end
+    local rem = ReplicatedStorage:FindFirstChild("REM")
+    local inst = rem and rem:FindFirstChild(child)
+    if not inst then
+        return nil, ("remote instance missing: %s"):format(tostring(name))
+    end
+    return inst, nil
+end
+
+function SAFE.fire(name, data)
+    local inst, err = safeResolve(name)
+    if not inst then
+        print("[oaklands] anti-cheat safe: " .. tostring(err))
+        return false
+    end
+    local ok, res = pcall(function() return inst:FireServer(data) end)
+    if not ok then
+        print(("[oaklands] anti-cheat safe: send '%s' failed - %s"):format(tostring(name), tostring(res)))
+    end
+    return ok
+end
+
+-- SAFE.ask blocks until the server answers - run it on a task.spawn if
+-- that matters
+function SAFE.ask(name, data)
+    local inst, err = safeResolve(name)
+    if not inst then
+        print("[oaklands] anti-cheat safe: " .. tostring(err))
+        return nil
+    end
+    local ok, res = pcall(function() return inst:InvokeServer(data) end)
+    if not ok then
+        print(("[oaklands] anti-cheat safe: ask '%s' failed - %s"):format(tostring(name), tostring(res)))
+        return nil
+    end
+    return res
+end
+
+-- ============================================================
 -- MENU
 -- ============================================================
 local guiControls = {}
@@ -3455,6 +3642,19 @@ local function buildMenu()
         function() return Config.Misc.AntiAFK end,
         function(v) Config.Misc.AntiAFK = v end)
 
+    section(pmi, "Anti-Cheat")
+    toggle(pmi, "HAX Shield",
+        function() return Config.Misc.HAXShield end,
+        function(v)
+            Config.Misc.HAXShield = v
+            if v then
+                local ok = installHaxShield()
+                notify(ok and "HAX shield on" or "HAX shield unavailable on this executor")
+            else
+                notify("HAX shield off")
+            end
+        end)
+
     local function unloadOaklands()
         genv.__HAVOC_OAKLANDS_GEN = nil
         if type(genv.__HAVOC_OAKLANDS_DISCONNECT) == "table" then
@@ -3470,6 +3670,11 @@ local function buildMenu()
         pcall(releaseBucket, ESP_STATE.enemies)
         pcall(releaseBucket, ESP_STATE.players)
         pcall(applyFullbright, false)
+        pcall(uninstallHaxShield)
+        pcall(function()
+            if SAFE.keyConn then SAFE.keyConn:Disconnect() end
+            SAFE.keyConn = nil
+        end)
         if screenGui then pcall(function() screenGui:Destroy() end) end
         print("[oaklands] unloaded")
     end
@@ -3507,5 +3712,15 @@ end
 pcall(function()
     if Config.Misc.Fullbright then applyFullbright(true) end
 end)
+
+-- anti-cheat: start listening for the server's remote key (read-only INF
+-- feed) and arm the report shield if it was left on
+pcall(safeWatchInf)
+if Config.Misc.HAXShield then
+    local ok = installHaxShield()
+    print(ok and "[oaklands] anti-cheat: HAX shield armed" or "[oaklands] anti-cheat: shield unavailable on this executor")
+else
+    print("[oaklands] anti-cheat: HAX shield off")
+end
 
 print(("[Havoc Hub] Oaklands script loaded (%s, PlaceId %d)"):format(SCRIPT_VERSION, game.PlaceId))
