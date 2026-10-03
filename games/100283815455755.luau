@@ -62,7 +62,7 @@
     Re-run safe: genv generation token, old UI + ESP cleaned on boot.
 ]]
 
-local SCRIPT_VERSION = "vs-v2.1"
+local SCRIPT_VERSION = "vs-v2.2"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -1175,9 +1175,6 @@ if UILib then
                 { overlayParent = popupLayer })
         end)
     end
-    local function noteRow(page, text)
-        pcall(function() UILib.makeNote(page, text, "auto") end)
-    end
 
     -- The FULL esp.luau schema as controls - shared by the Player ESP and
     -- the Wildlife ESP so both can be customised end to end.
@@ -1257,7 +1254,6 @@ if UILib then
     toggleRow(plr, "Visible only", function() return Config.ESP.VisibleOnly end,
         function(v) Config.ESP.VisibleOnly = v end)
     buildESPControls(plr, Config.ESP)
-    noteRow(plr, "Opacity sliders: 1 = fully visible. Visible only raycasts to each target and hides the ones behind cover.")
 
     -- ------------------------------------------------------------
     -- Aim
@@ -1307,7 +1303,6 @@ if UILib then
             Config.Aim.AutoFire = v
             if not v then releaseMouse1() end
         end)
-    noteRow(aim, "FOV radius is the pixel circle around your crosshair - the drawn circle IS the lock zone (fixed size, Project Delta style). Mouse method moves your real cursor (hip-fire + ADS); Camera steers the view only. Smoothing 0 = instant.")
 
     section(aim, "TARGETING")
     dropdownRow(aim, "Aim part", { "Head", "UpperTorso", "HumanoidRootPart" },
@@ -1337,7 +1332,6 @@ if UILib then
         function(v) Config.Aim.VelocityOverride = v end, 60, 0, 6000, function(v)
             return v <= 0 and "gun default" or ("%d"):format(v)
         end)
-    noteRow(aim, "Lead + drop reads the equipped gun's own projectile speed + gravity and lifts the aim the amount the shot will fall. Velocity override: 0 = the gun's own value.")
 
     section(aim, "SILENT AIM")
     toggleRow(aim, "Silent aim (experimental)", function() return Config.Aim.SilentAim end,
@@ -1351,7 +1345,6 @@ if UILib then
                 notify("Silent aim off")
             end
         end)
-    noteRow(aim, "Rewrites your gun's own shot messages onto the locked target - hip-fire and ADS both land. Server validation unknown; test carefully.")
 
     section(aim, "FOV CIRCLE")
     toggleRow(aim, "FOV circle", function() return Config.Aim.Circle end,
