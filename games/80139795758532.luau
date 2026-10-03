@@ -209,7 +209,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v1.7"
+local SCRIPT_VERSION = "aim-v1.8"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -321,6 +321,10 @@ local function localHumanoid()
     return ch and ch:FindFirstChildOfClass("Humanoid")
 end
 
+-- team identity = the game's own convention: a TEAM attribute holding
+-- "Red"/"Blue" on the HUMANOID (dump-confirmed on players AND bots in
+-- TDM). Native module first, then the same rule inline, then
+-- player-level attribute / Roblox Team as last resorts.
 local function isTeammate(hum)
     local mine = localHumanoid()
     if not mine or not hum then return false end
@@ -328,9 +332,19 @@ local function isTeammate(hum)
         local ok, res = pcall(TeamShared.areHumanoidsTeammates, mine, hum)
         if ok then return res == true end
     end
+    local mt, ht = mine:GetAttribute("TEAM"), hum:GetAttribute("TEAM")
+    if type(mt) == "string" and type(ht) == "string" and mt ~= "" and ht ~= "" then
+        return mt == ht
+    end
     local other = Players:GetPlayerFromCharacter(hum.Parent)
-    if other and LocalPlayer.Team and other.Team then
-        return other.Team == LocalPlayer.Team
+    if other then
+        local mp, op = LocalPlayer:GetAttribute("TEAM"), other:GetAttribute("TEAM")
+        if type(mp) == "string" and type(op) == "string" and mp ~= "" and op ~= "" then
+            return mp == op
+        end
+        if LocalPlayer.Team and other.Team then
+            return other.Team == LocalPlayer.Team
+        end
     end
     return false
 end
@@ -383,7 +397,9 @@ local function collectTargets(includeBots)
             for _, ch in ipairs(bots:GetChildren()) do
                 if ch:IsA("Model") then
                     local hum = ch:FindFirstChildOfClass("Humanoid")
-                    if isInRound(hum) then
+                    -- bots carry REAL TEAM attrs in TDM ("Red"/"Blue"),
+                    -- so the same team check applies to them
+                    if isInRound(hum) and not (Config.Aimbot.TeamCheck and isTeammate(hum)) then
                         local t = buildTarget(ch, hum, ch.Name, true)
                         if t then list[#list + 1] = t end
                     end
