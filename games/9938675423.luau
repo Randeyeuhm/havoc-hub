@@ -140,6 +140,15 @@
                           All local writes, no packets; server grab
                           checks unknown - creep up.
 
+    Test (oak-v29.25)
+      • Test tab         - the dump-wide exploit sweep: packet tier
+                           (SpawnItem spawner, quest fulfill/claim,
+                           kick/softban, DamageEnemy aura, StoreItem
+                           vacuum) + local tier (weapon stats, saw
+                           fuel, swing speed, golf power, jar reach/
+                           auto, basket reach/full/auto). Packet sends
+                           print every message; server validation
+                           unknown - test category, off by default.
     Misc
       • Fullbright       - grey ambient + no fog, re-applied every second
                            (the game's weather system likes to fight back).
@@ -166,7 +175,7 @@
     old ESP labels are cleaned up on boot.
 ]]
 
-local SCRIPT_VERSION = "oak-v29.23"
+local SCRIPT_VERSION = "oak-v29.25"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -262,6 +271,37 @@ local DEFAULTS = {
     Camera = {
         Free  = false,
         Speed = 120,  -- freecam fly speed (studs/s)
+    },
+    Test = {
+        -- packet tier (game-channel sends; server validation UNKNOWN)
+        SpawnName  = "",
+        SpawnForm  = "Item",
+        Vacuum     = false,
+        VacuumDist = 60,
+        PlayerName = "",
+        Nuke       = false,
+        NukeDamage = 500,
+        NukeDist   = 120,
+        QuestAuto  = false,
+        -- weapon stats (local writes)
+        WpnTune    = false,
+        WpnDamage  = 1,   -- multiplier on the weapon Damage field
+        WpnRadius  = 1,   -- multiplier on HitRadius
+        WpnSpeed   = 1,   -- divisor on Cooldown / SwingTime
+        ProjExtend = false,
+        ProjRange  = 100, -- studs (vanilla clamp = 100)
+        -- tools (local writes)
+        SawFuel    = false, -- chainsaw never stalls on empty fuel
+        SwingSpeed = 1,     -- divisor on MaxSwingTime (axes/pickaxes/chisel)
+        GolfPower  = 1,     -- multiplier on golf SwingPower
+        -- firefly jar
+        JarRadius  = 16,    -- collect reach (16 = vanilla)
+        JarAuto    = false,
+        -- fruit basket
+        BasketReach  = 1,   -- multiplier on the 50-stud fruit clamp
+        BasketFull   = false, -- ignore the client "basket full" gate
+        BasketAuto   = false,
+        BasketRadius = 60,
     },
     Hotkeys = {
         Freecam = "RightControl",
@@ -2187,6 +2227,572 @@ track(RunService.RenderStepped:Connect(function(dt)
 end))
 
 -- ============================================================
+-- TEST / EXTRA (oak-v29.25) - the dump-wide exploit sweep, live.
+-- Two lanes, clearly split:
+--   * packet tier - uses the game's OWN Client singleton to send the
+--     same packets the game itself sends (SpawnItem, quest fulfill/
+--     claim, kick/softban, DamageEnemy, StoreItem pickup...). Server
+--     validation for every one of these is UNKNOWN - that is what
+--     this category is for. Off by default, console prints each send.
+--   * local tier  - the usual no-packet class: rawset overrides +
+--     field tuning (weapon stats, chainsaw fuel, swing speed, golf
+--     power, jar reach/auto, basket reach/full/auto) with recorded
+--     bases and full restore.
+-- ============================================================
+local TEST_STATE = { client = nil, recs = {}, sent = {}, nextQuest = 0, jar = nil }
+genv.__HAVOC_OAKLANDS_TEST = TEST_STATE
+
+-- the game's own Client singleton - require() hits the module cache
+-- and hands back the live instance the game talks through; a getgc
+-- scan is the fallback
+local function findGameClient()
+    if TEST_STATE.client then return TEST_STATE.client end
+    local ok, cl = pcall(function()
+        return require(game:GetService("ReplicatedFirst"):FindFirstChild("Client"))
+    end)
+    if ok and type(cl) == "table" and type(rawget(cl, "TellServer")) == "function" then
+        TEST_STATE.client = cl
+        return cl
+    end
+    local fn = getgc
+    if type(fn) ~= "function" then return nil end
+    local heaps = {}
+    local ok1, g1 = pcall(fn, true)
+    if ok1 and type(g1) == "table" then table.insert(heaps, g1) end
+    local ok2, g2 = pcall(fn)
+    if ok2 and type(g2) == "table" and g2 ~= g1 then table.insert(heaps, g2) end
+    local seen = {}
+    for _, heap in ipairs(heaps) do
+        for _, v in ipairs(heap) do
+            if type(v) == "table" and not seen[v]
+                and type(rawget(v, "TellServer")) == "function"
+                and type(rawget(v, "CreateKeyHash")) == "function"
+                and type(rawget(v, "RequestModule")) == "function" then
+                seen[v] = true
+                TEST_STATE.client = v
+                return v
+            end
+        end
+    end
+    return nil
+end
+
+-- send one packet through the game's own channel. kind = "Ask" uses
+-- AskServer (request/response); default is TellServer (fire/forget).
+local function testPacket(name, data, kind)
+    local cl = findGameClient()
+    if not cl then
+        print("[oaklands] test: game Client not found - packet skipped (" .. tostring(name) .. ")")
+        return false
+    end
+    local ok, err = pcall(function()
+        if kind == "Ask" then
+            cl:AskServer(name, data, function() end)
+        else
+            cl:TellServer(name, data)
+        end
+    end)
+    if not ok then
+        print(("[oaklands] test: %s failed - %s"):format(tostring(name), tostring(err)))
+        return false
+    end
+    return true
+end
+
+-- generic behavior-instance finder: every named field must be present
+local function findTestInstances(fields)
+    local out = {}
+    pcall(function()
+        local fn = getgc
+        if type(fn) ~= "function" then return end
+        local heaps = {}
+        local ok1, g1 = pcall(fn, true)
+        if ok1 and type(g1) == "table" then table.insert(heaps, g1) end
+        local ok2, g2 = pcall(fn)
+        if ok2 and type(g2) == "table" and g2 ~= g1 then table.insert(heaps, g2) end
+        local seen = {}
+        for _, heap in ipairs(heaps) do
+            for _, v in ipairs(heap) do
+                if type(v) == "table" and not seen[v] then
+                    local match = true
+                    for i = 1, #fields do
+                        if rawget(v, fields[i]) == nil then
+                            match = false
+                            break
+                        end
+                    end
+                    if match then
+                        seen[v] = true
+                        out[#out + 1] = v
+                    end
+                end
+            end
+        end
+    end)
+    return out
+end
+
+-- sent-cache for the auto loops (model -> clock), pruned past 8s
+local function testSeen(model)
+    local t = TEST_STATE.sent[model]
+    return t ~= nil and (os.clock() - t) < 8
+end
+local function testMark(model)
+    TEST_STATE.sent[model] = os.clock()
+    local n = 0
+    for _ in pairs(TEST_STATE.sent) do n = n + 1 end
+    if n > 260 then
+        local now = os.clock()
+        for m, c in pairs(TEST_STATE.sent) do
+            if now - c > 8 then TEST_STATE.sent[m] = nil end
+        end
+    end
+end
+
+-- field tuning with recorded bases: factor > 1 tunes (base * factor);
+-- otherwise the recorded base is restored and the record cleared
+local function tuneMult(inst, rec, field, factor)
+    if factor and factor > 1 then
+        if rec[field] == nil then rec[field] = inst[field] end
+        local base = rec[field]
+        if type(base) == "number" then
+            local target = base * factor
+            if inst[field] ~= target then inst[field] = target end
+        end
+    elseif rec[field] ~= nil then
+        pcall(function() inst[field] = rec[field] end)
+        rec[field] = nil
+    end
+end
+
+-- divisor form (speed multipliers: higher factor -> lower field)
+local function tuneDiv(inst, rec, field, factor)
+    if factor and factor > 1 then
+        if rec[field] == nil then rec[field] = inst[field] end
+        local base = rec[field]
+        if type(base) == "number" and base > 0 then
+            local target = base / factor
+            if inst[field] ~= target then inst[field] = target end
+        end
+    elseif rec[field] ~= nil then
+        pcall(function() inst[field] = rec[field] end)
+        rec[field] = nil
+    end
+end
+
+-- set form (jar radius): value nil restores the recorded base
+local function tuneSet(inst, rec, field, value)
+    if value ~= nil then
+        if rec[field] == nil then rec[field] = inst[field] end
+        if inst[field] ~= value then inst[field] = value end
+    elseif rec[field] ~= nil then
+        pcall(function() inst[field] = rec[field] end)
+        rec[field] = nil
+    end
+end
+
+-- Projectile range override: faithful clone of the game's
+-- RaycastForEnemy with the hard 100-stud clamp replaced by the slider,
+-- so the client can hand the server ShootEnemy targets far past
+-- vanilla reach.
+local function testProjRay(self)
+    local range = math.clamp(tonumber(Config.Test.ProjRange) or 100, 100, 5000)
+    local world = Workspace:FindFirstChild("World")
+    local enemies = world and world:FindFirstChild("Enemies")
+    if not enemies then return end
+    local rp = RaycastParams.new()
+    rp.FilterDescendantsInstances = { enemies }
+    rp.FilterType = Enum.RaycastFilterType.Include
+    rp.RespectCanCollide = true
+    local unit = LocalPlayer:GetMouse().UnitRay
+    local rad = tonumber(self.HitRadius) or 6
+    local hit = Workspace:Spherecast(unit.Origin, rad, unit.Direction.Unit * range, rp)
+    if not hit or not hit.Instance then return end
+    local char = LocalPlayer.Character
+    if not char or (hit.Position - char:GetPivot().Position).Magnitude > range then return end
+    local model = hit.Instance:FindFirstAncestorOfClass("Model")
+    while model and not model:FindFirstChildOfClass("Humanoid") do
+        model = model:FindFirstAncestorOfClass("Model")
+    end
+    if not model then return end
+    if model:GetAttribute("AttackableEnemy") then
+        self.Inventory:InformServer("ShootEnemy", { Enemy = model })
+    end
+end
+
+-- Basket reach override: faithful clone of the game's CheckForFruit
+-- with the 50-stud clamp multiplied by the slider and the client
+-- "basket full" gate optional.
+local function testBasketCheck(self)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Sit then return end
+    local unit = LocalPlayer:GetMouse().UnitRay
+    local exclude = { char }
+    local fruit = nil
+    while true do
+        local rp = RaycastParams.new()
+        rp.FilterDescendantsInstances = exclude
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        local hit = Workspace:Raycast(unit.Origin, unit.Direction.Unit * 1024, rp)
+        if not hit or not hit.Instance then break end
+        local parent = hit.Instance.Parent
+        if parent and (parent:GetAttribute("Fruit") or parent:GetAttribute("AttachedFruit")) then
+            fruit = parent
+            break
+        end
+        table.insert(exclude, hit.Instance)
+    end
+    if not fruit then return end
+    local mult = math.clamp(tonumber(Config.Test.BasketReach) or 1, 1, 40)
+    local maxDist = 50 * mult
+    if string.find(fruit.Name, "BombFruit") or string.find(fruit.Name, "Pumpkin") then return end
+    if (fruit:GetPivot().Position - char:GetPivot().Position).Magnitude >= maxDist then return end
+    if fruit:GetAttribute("Anchored") then return end
+    local owner = fruit:FindFirstChild("Owner")
+    if owner and owner.Value then
+        if not self.Permissions or not self.Permissions:GetPermission(owner.Value, LocalPlayer, "Interaction") then
+            return
+        end
+    end
+    if not Config.Test.BasketFull and self.MaxFruits <= self.FruitCount then
+        return "Max_Fruit"
+    end
+    return fruit
+end
+
+local function testWeaponStep()
+    local t = Config.Test
+    for _, inst in ipairs(findTestInstances({ "HitRadius", "Cooldown", "SwingTime", "Inventory" })) do
+        local rec = TEST_STATE.recs[inst]
+        if not rec then rec = {} TEST_STATE.recs[inst] = rec end
+        local dmg = (t.WpnTune == true) and math.clamp(tonumber(t.WpnDamage) or 1, 1, 1000) or 1
+        local rad = (t.WpnTune == true) and math.clamp(tonumber(t.WpnRadius) or 1, 1, 50) or 1
+        local spd = (t.WpnTune == true) and math.clamp(tonumber(t.WpnSpeed) or 1, 1, 20) or 1
+        if inst.Damage ~= nil then tuneMult(inst, rec, "Damage", dmg) end
+        tuneMult(inst, rec, "HitRadius", rad)
+        tuneDiv(inst, rec, "Cooldown", spd)
+        tuneDiv(inst, rec, "SwingTime", spd)
+        if t.ProjExtend == true then
+            if rawget(inst, "__havocTestProj") ~= true then
+                rawset(inst, "__havocTestProj", true)
+                rawset(inst, "RaycastForEnemy", testProjRay)
+            end
+        elseif rawget(inst, "__havocTestProj") then
+            rawset(inst, "__havocTestProj", nil)
+            rawset(inst, "RaycastForEnemy", nil)
+        end
+    end
+end
+
+local function testSawStep()
+    local t = Config.Test
+    if t.SawFuel ~= true then return end
+    for _, inst in ipairs(findTestInstances({ "Fuel", "MaxFuel", "Cutting" })) do
+        local fuel = tonumber(inst.Fuel) or 0
+        if fuel < 1 then
+            local max = tonumber(inst.MaxFuel) or 0
+            inst.Fuel = math.max(max, 1)
+        end
+    end
+end
+
+local function testSwingStep()
+    local t = Config.Test
+    local spd = math.clamp(tonumber(t.SwingSpeed) or 1, 1, 10)
+    for _, inst in ipairs(findTestInstances({ "MaxSwingTime", "Inventory" })) do
+        local rec = TEST_STATE.recs[inst]
+        if not rec then rec = {} TEST_STATE.recs[inst] = rec end
+        tuneDiv(inst, rec, "MaxSwingTime", spd)
+        if rawget(inst, "HitInterval") ~= nil then
+            tuneDiv(inst, rec, "HitInterval", spd)
+        end
+    end
+end
+
+local function testGolfStep()
+    local t = Config.Test
+    local mult = math.clamp(tonumber(t.GolfPower) or 1, 1, 100)
+    for _, inst in ipairs(findTestInstances({ "SwingPower", "SwingDistance" })) do
+        local rec = TEST_STATE.recs[inst]
+        if not rec then rec = {} TEST_STATE.recs[inst] = rec end
+        tuneMult(inst, rec, "SwingPower", mult)
+    end
+end
+
+local function findJarInstance()
+    for _, v in ipairs(findTestInstances({ "MaxDistance", "Inventory" })) do
+        if (rawget(v, "MaxDistance") == 16 or rawget(v, "__havocTestJar") == true)
+            and rawget(v, "PassthroughBatchSize") == nil
+            and rawget(v, "FruitCount") == nil
+            and rawget(v, "HitRadius") == nil then
+            rawset(v, "__havocTestJar", true)
+            return v
+        end
+    end
+end
+
+local function testJarStep()
+    local t = Config.Test
+    local jar = TEST_STATE.jar or findJarInstance()
+    TEST_STATE.jar = jar
+    if not jar then return end
+    local rec = TEST_STATE.recs[jar]
+    if not rec then rec = {} TEST_STATE.recs[jar] = rec end
+    local radius = math.clamp(tonumber(t.JarRadius) or 16, 16, 500)
+    tuneSet(jar, rec, "MaxDistance", radius > 16 and radius or nil)
+    if t.JarAuto ~= true then return end
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local world = Workspace:FindFirstChild("World")
+    local misc = world and world:FindFirstChild("MiscPrefabs")
+    if not root or not misc then return end
+    local sent = 0
+    for _, groupName in ipairs({ "Fireflies", "GlowWorms", "Ghosts" }) do
+        if sent >= 4 then break end
+        local group = misc:FindFirstChild(groupName)
+        if group then
+            for _, model in ipairs(group:GetChildren()) do
+                if sent >= 4 then break end
+                if not testSeen(model) then
+                    local ok, pos = pcall(function() return model:GetPivot().Position end)
+                    if ok and (pos - root.Position).Magnitude <= radius then
+                        testMark(model)
+                        pcall(function() jar.Inventory:InformServer("CollectFireflies", { Model = model }) end)
+                        sent = sent + 1
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function findBasketInstance()
+    for _, v in ipairs(findTestInstances({ "FruitCount", "MaxFruits", "Inventory" })) do
+        return v
+    end
+end
+
+local function testBasketStep()
+    local t = Config.Test
+    local basket = findBasketInstance()
+    if not basket then return end
+    local reach = math.clamp(tonumber(t.BasketReach) or 1, 1, 40)
+    if reach > 1 or t.BasketFull == true then
+        if rawget(basket, "__havocTestBasket") ~= true then
+            rawset(basket, "__havocTestBasket", true)
+            rawset(basket, "CheckForFruit", testBasketCheck)
+        end
+    elseif rawget(basket, "__havocTestBasket") then
+        rawset(basket, "__havocTestBasket", nil)
+        rawset(basket, "CheckForFruit", nil)
+    end
+    if t.BasketAuto ~= true then return end
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local world = Workspace:FindFirstChild("World")
+    if not root or not world then return end
+    local radius = math.clamp(tonumber(t.BasketRadius) or 60, 20, 400)
+    local op = OverlapParams.new()
+    op.FilterType = Enum.RaycastFilterType.Include
+    local include = {}
+    local trees = world:FindFirstChild("TreeRegions")
+    local loose = world:FindFirstChild("LooseItems")
+    if trees then include[#include + 1] = trees end
+    if loose then include[#include + 1] = loose end
+    if #include == 0 then return end
+    op.FilterDescendantsInstances = include
+    local okq, parts = pcall(function() return Workspace:GetPartBoundsInRadius(root.Position, radius, op) end)
+    if not okq or type(parts) ~= "table" then return end
+    local sent = 0
+    for _, part in ipairs(parts) do
+        if sent >= 4 then break end
+        local model = part.Parent
+        local target = nil
+        for _ = 1, 3 do
+            if not model then break end
+            if model:GetAttribute("Fruit") or model:GetAttribute("AttachedFruit") then
+                target = model
+                break
+            end
+            model = model.Parent
+        end
+        if target and not testSeen(target) then
+            if not target:GetAttribute("Anchored")
+                and not string.find(target.Name, "BombFruit")
+                and not string.find(target.Name, "Pumpkin") then
+                testMark(target)
+                pcall(function() basket.Inventory:InformServer("CollectFruit", { Fruit = target }) end)
+                sent = sent + 1
+            end
+        end
+    end
+end
+
+local function testNukeStep()
+    local t = Config.Test
+    if t.Nuke ~= true then return end
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local world = Workspace:FindFirstChild("World")
+    local enemies = world and world:FindFirstChild("Enemies")
+    if not root or not enemies then return end
+    local dmg = math.clamp(tonumber(t.NukeDamage) or 500, 1, 1000000)
+    local dist = math.clamp(tonumber(t.NukeDist) or 120, 10, 2000)
+    local sent = 0
+    for _, e in ipairs(enemies:GetChildren()) do
+        if sent >= 2 then break end
+        if e:IsA("Model") and e:GetAttribute("AttackableEnemy") then
+            local hum = e:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                local ok, pos = pcall(function() return e:GetPivot().Position end)
+                if ok and (pos - root.Position).Magnitude <= dist then
+                    testPacket("DamageEnemy", { Enemy = e, Damage = dmg, WeaponType = "Normal" })
+                    sent = sent + 1
+                end
+            end
+        end
+    end
+end
+
+local function testVacuumStep()
+    local t = Config.Test
+    if t.Vacuum ~= true then return end
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local world = Workspace:FindFirstChild("World")
+    local loose = world and world:FindFirstChild("LooseItems")
+    if not root or not loose then return end
+    local dist = math.clamp(tonumber(t.VacuumDist) or 60, 10, 500)
+    local sent = 0
+    for _, m in ipairs(loose:GetChildren()) do
+        if sent >= 2 then break end
+        if not testSeen(m) then
+            local uuid = m:GetAttribute("UUID")
+            if uuid then
+                local ok, pos = pcall(function() return m:GetPivot().Position end)
+                if ok and (pos - root.Position).Magnitude <= dist then
+                    testMark(m)
+                    testPacket("StoreItem", { UUID = uuid }, "Ask")
+                    sent = sent + 1
+                end
+            end
+        end
+    end
+end
+
+local function findQuestModule()
+    for _, v in ipairs(findTestInstances({ "ActiveLocalTasks", "ActiveLocalQuestlines" })) do
+        if type(rawget(v, "ActiveLocalTasks")) == "table" then return v end
+    end
+end
+
+local function questFulfill(silent)
+    local qm = findQuestModule()
+    if not qm then
+        if not silent then print("[oaklands] test: quest tracker not found - be in a quest first") end
+        return 0
+    end
+    local sent = 0
+    for q, task in pairs(qm.ActiveLocalTasks) do
+        if type(q) == "string" and type(task) == "string" then
+            if testPacket("FulfillQuestV2Task", { QuestName = q, TaskName = task, Amount = 1 }) then
+                sent = sent + 1
+            end
+        end
+    end
+    return sent
+end
+
+local function questClaim()
+    local qm = findQuestModule()
+    if not qm then
+        print("[oaklands] test: quest tracker not found")
+        return 0
+    end
+    local sent = 0
+    for q in pairs(qm.ActiveLocalQuestlines) do
+        if type(q) == "string" then
+            if testPacket("ClaimQuestV2Rewards", { QuestName = q }) then
+                sent = sent + 1
+            end
+        end
+    end
+    return sent
+end
+
+local function resolveTestPlayer(name)
+    name = tostring(name or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return nil end
+    local playersService = game:GetService("Players")
+    for _, p in ipairs(playersService:GetPlayers()) do
+        if p ~= LocalPlayer and (p.Name:lower() == name or p.DisplayName:lower() == name) then
+            return p
+        end
+    end
+    for _, p in ipairs(playersService:GetPlayers()) do
+        if p ~= LocalPlayer and (p.Name:lower():find(name, 1, true) == 1 or p.DisplayName:lower():find(name, 1, true) == 1) then
+            return p
+        end
+    end
+    return nil
+end
+
+local function isOwnPrivateServer()
+    local id = Workspace:GetAttribute("PrivateServerId")
+    local owner = Workspace:GetAttribute("PrivateServerOwnerId")
+    return id ~= nil and id ~= "" and owner == LocalPlayer.UserId
+end
+
+local function testRestoreAll()
+    for inst, rec in pairs(TEST_STATE.recs) do
+        pcall(function()
+            for field, base in pairs(rec) do
+                if type(base) == "number" then inst[field] = base end
+            end
+            if rawget(inst, "__havocTestProj") then
+                rawset(inst, "__havocTestProj", nil)
+                rawset(inst, "RaycastForEnemy", nil)
+            end
+            if rawget(inst, "__havocTestBasket") then
+                rawset(inst, "__havocTestBasket", nil)
+                rawset(inst, "CheckForFruit", nil)
+            end
+        end)
+    end
+    table.clear(TEST_STATE.recs)
+end
+
+local function testStep()
+    if genv.__HAVOC_OAKLANDS_GEN ~= MY_GEN then return end
+    pcall(testWeaponStep)
+    pcall(testSawStep)
+    pcall(testSwingStep)
+    pcall(testGolfStep)
+    pcall(testJarStep)
+    pcall(testBasketStep)
+    pcall(testNukeStep)
+    pcall(testVacuumStep)
+    local t = Config.Test
+    if t.QuestAuto == true and os.clock() >= (TEST_STATE.nextQuest or 0) then
+        TEST_STATE.nextQuest = os.clock() + 1.2
+        local n = questFulfill(true)
+        if n > 0 and TEST_STATE.qPrint ~= true then
+            TEST_STATE.qPrint = true
+            print("[oaklands] test: quest auto-progress active - fulfilling every active task")
+        end
+    end
+end
+
+track(task.spawn(function()
+    while true do
+        task.wait(0.35)
+        pcall(testStep)
+    end
+end))
+
+-- ============================================================
 -- FREECAM (oak-v22) - built in, because the Cam Teleport tool needs
 -- one. RightCtrl toggles; WASD flies, mouse looks, Space/LeftCtrl
 -- up-down, LeftShift is a 3x boost. Movement keys are swallowed while
@@ -3129,7 +3735,7 @@ local function buildMenu()
         subtitle = ("PlaceId %d  ·  %s"):format(game.PlaceId, SCRIPT_VERSION),
         size = UDim2.new(0, winW, 0, winH),
         position = UDim2.new(0, 30, 0, 40),
-        tabs = { "World", "Players", "Movement", "Misc" },
+        tabs = { "World", "Players", "Movement", "Misc", "Test" },
         controls = guiControls,
         footerHint = "RightShift - show / hide this menu",
         onClose = function()
@@ -3144,6 +3750,7 @@ local function buildMenu()
     local pp = win.tab(2)  -- Players
     local pmv = win.tab(3) -- Movement
     local pmi = win.tab(4) -- Misc
+    local pt  = win.tab(5) -- Test
 
     local function guard(what, fn)
         local ok, e = pcall(fn)
@@ -3169,6 +3776,12 @@ local function buildMenu()
     end
     local function button(page, text, onClick, opts)
         guard("button " .. text, function() return UILib.makeButton(page, text, onClick, opts) end)
+    end
+    local function input(page, label, getter, setter, opts)
+        guard("input " .. label, function()
+            if type(UILib.makeInput) ~= "function" then return end
+            return UILib.makeInput(page, label, getter, setter, opts)
+        end)
     end
     local function dropdown(page, label, getItems, getSelected, onSelect)
         guard("dropdown " .. label, function()
@@ -3455,6 +4068,200 @@ local function buildMenu()
         saveConfig()
         notify("Restored vanilla settings")
     end)
+
+    -- ---------------- Test (oak-v29.25) ----------------
+    section(pt, "Item spawner · packet")
+    input(pt, "Object name",
+        function() return Config.Test.SpawnName end,
+        function(v) Config.Test.SpawnName = v end,
+        { placeholder = "e.g. WoodenAxe" })
+    input(pt, "Object form",
+        function() return Config.Test.SpawnForm end,
+        function(v) Config.Test.SpawnForm = v end,
+        { placeholder = "Item" })
+    button(pt, "Spawn x1", function()
+        local name = tostring(Config.Test.SpawnName or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if name == "" then
+            notify("Type an object name first")
+            return
+        end
+        local form = tostring(Config.Test.SpawnForm or "")
+        if form == "" then form = "Item" end
+        if testPacket("SpawnItem", { ObjectName = name, ObjectForm = form, SpawnWith999 = false }) then
+            print("[oaklands] test: SpawnItem sent - " .. name .. " (" .. form .. ")")
+        end
+    end)
+    button(pt, "Spawn x999", function()
+        local name = tostring(Config.Test.SpawnName or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if name == "" then
+            notify("Type an object name first")
+            return
+        end
+        local form = tostring(Config.Test.SpawnForm or "")
+        if form == "" then form = "Item" end
+        if testPacket("SpawnItem", { ObjectName = name, ObjectForm = form, SpawnWith999 = true }) then
+            print("[oaklands] test: SpawnItem x999 sent - " .. name)
+        end
+    end, { danger = true, confirm = true })
+
+    section(pt, "Loot vacuum · packet")
+    toggle(pt, "Auto-store items",
+        function() return Config.Test.Vacuum end,
+        function(v)
+            Config.Test.Vacuum = v
+            notify(v and "Loot vacuum on - nearby items get stored" or "Loot vacuum off")
+        end)
+    slider(pt, "Radius",
+        function() return Config.Test.VacuumDist end,
+        function(v) Config.Test.VacuumDist = v end, 5, 10, 300,
+        function(v) return ("%d studs"):format(v) end)
+
+    section(pt, "Quests · packet")
+    toggle(pt, "Auto-progress",
+        function() return Config.Test.QuestAuto end,
+        function(v)
+            Config.Test.QuestAuto = v
+            if v then TEST_STATE.qPrint = false end
+            notify(v and "Quest auto-progress on" or "Quest auto-progress off")
+        end)
+    button(pt, "Fulfill current tasks", function()
+        local n = questFulfill(false)
+        notify(("Fulfilled %d active task(s) - check console"):format(n))
+    end)
+    button(pt, "Claim all rewards", function()
+        local n = questClaim()
+        notify(("Claim sent for %d quest(s) - check console"):format(n))
+    end)
+
+    section(pt, "Players · packet (private-server powers)")
+    input(pt, "Player name",
+        function() return Config.Test.PlayerName end,
+        function(v) Config.Test.PlayerName = v end,
+        { placeholder = "username" })
+    button(pt, "Kick", function()
+        local target = resolveTestPlayer(Config.Test.PlayerName)
+        if not target then notify("Player not found - check the name"); return end
+        if not isOwnPrivateServer() then
+            print("[oaklands] test: not your private server - the server will most likely reject this")
+        end
+        if testPacket("KickPlayer", { Player = target }) then
+            print("[oaklands] test: KickPlayer sent - " .. target.Name)
+        end
+    end, { danger = true, confirm = true })
+    button(pt, "Softban", function()
+        local target = resolveTestPlayer(Config.Test.PlayerName)
+        if not target then notify("Player not found - check the name"); return end
+        if not isOwnPrivateServer() then
+            print("[oaklands] test: not your private server - the server will most likely reject this")
+        end
+        if testPacket("SoftBanPlayer", { Player = target }) then
+            print("[oaklands] test: SoftBanPlayer sent - " .. target.Name)
+        end
+    end, { danger = true, confirm = true })
+
+    section(pt, "Enemies · packet")
+    toggle(pt, "Damage aura",
+        function() return Config.Test.Nuke end,
+        function(v)
+            Config.Test.Nuke = v
+            notify(v and "Enemy damage aura on" or "Enemy damage aura off")
+        end)
+    slider(pt, "Damage",
+        function() return Config.Test.NukeDamage end,
+        function(v) Config.Test.NukeDamage = v end, 50, 10, 100000,
+        function(v) return ("%d"):format(v) end)
+    slider(pt, "Radius",
+        function() return Config.Test.NukeDist end,
+        function(v) Config.Test.NukeDist = v end, 10, 10, 500,
+        function(v) return ("%d studs"):format(v) end)
+
+    section(pt, "Weapon stats · local")
+    toggle(pt, "Tune weapons",
+        function() return Config.Test.WpnTune end,
+        function(v)
+            Config.Test.WpnTune = v
+            notify(v and "Weapon stats tuned - swing away" or "Weapon stats restored")
+        end)
+    slider(pt, "Damage x",
+        function() return Config.Test.WpnDamage end,
+        function(v) Config.Test.WpnDamage = v end, 1, 1, 1000,
+        function(v) return ("x%d"):format(v) end)
+    slider(pt, "Hit radius x",
+        function() return Config.Test.WpnRadius end,
+        function(v) Config.Test.WpnRadius = v end, 1, 1, 50,
+        function(v) return ("x%d"):format(v) end)
+    slider(pt, "Attack speed x",
+        function() return Config.Test.WpnSpeed end,
+        function(v) Config.Test.WpnSpeed = v end, 1, 1, 20,
+        function(v) return ("x%d"):format(v) end)
+    toggle(pt, "Projectile range override",
+        function() return Config.Test.ProjExtend end,
+        function(v)
+            Config.Test.ProjExtend = v
+            notify(v and "Projectile range override on" or "Projectile range back to vanilla")
+        end)
+    slider(pt, "Range",
+        function() return Config.Test.ProjRange end,
+        function(v) Config.Test.ProjRange = v end, 25, 100, 5000,
+        function(v) return ("%d studs"):format(v) end)
+
+    section(pt, "Tools · local")
+    toggle(pt, "Chainsaw infinite fuel",
+        function() return Config.Test.SawFuel end,
+        function(v)
+            Config.Test.SawFuel = v
+            notify(v and "Chainsaw won't stall on empty" or "Chainsaw fuel normal")
+        end)
+    slider(pt, "Swing speed x",
+        function() return Config.Test.SwingSpeed end,
+        function(v) Config.Test.SwingSpeed = v end, 1, 1, 10,
+        function(v) return ("x%d"):format(v) end)
+
+    section(pt, "Golf · local")
+    slider(pt, "Launch power x",
+        function() return Config.Test.GolfPower end,
+        function(v) Config.Test.GolfPower = v end, 5, 1, 100,
+        function(v) return ("x%d"):format(v) end)
+
+    section(pt, "Firefly jar · local + packet")
+    slider(pt, "Collect radius",
+        function() return Config.Test.JarRadius end,
+        function(v) Config.Test.JarRadius = v end, 4, 16, 500,
+        function(v) return ("%d studs"):format(v) end)
+    toggle(pt, "Auto-collect fireflies",
+        function() return Config.Test.JarAuto end,
+        function(v)
+            Config.Test.JarAuto = v
+            notify(v and "Jar auto-collect on - equip the jar" or "Jar auto-collect off")
+        end)
+
+    section(pt, "Fruit basket · local + packet")
+    slider(pt, "Reach x",
+        function() return Config.Test.BasketReach end,
+        function(v) Config.Test.BasketReach = v end, 1, 1, 40,
+        function(v) return ("x%d (vanilla 50 studs)"):format(v) end)
+    toggle(pt, "Ignore full basket",
+        function() return Config.Test.BasketFull end,
+        function(v)
+            Config.Test.BasketFull = v
+            notify(v and "Basket full gate ignored - server may still refuse" or "Basket full gate back")
+        end)
+    toggle(pt, "Auto-collect fruit",
+        function() return Config.Test.BasketAuto end,
+        function(v)
+            Config.Test.BasketAuto = v
+            notify(v and "Basket auto-collect on - equip a basket" or "Basket auto-collect off")
+        end)
+    slider(pt, "Auto radius",
+        function() return Config.Test.BasketRadius end,
+        function(v) Config.Test.BasketRadius = v end, 10, 20, 400,
+        function(v) return ("%d studs"):format(v) end)
+
+    section(pt, "Danger zone")
+    button(pt, "Restore all test tuning", function()
+        pcall(testRestoreAll)
+        notify("Test tuning restored")
+    end, { danger = true })
 
     return win
 end
