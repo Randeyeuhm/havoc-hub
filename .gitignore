@@ -9,6 +9,9 @@ Project_Delta.Structure
 # --- Empty placeholder ---
 WeaponConfig.luau
 
+# --- Local WIP (instrumented spy build - stays out of the repo) ---
+Cobalt.luau
+
 # --- OS / editor junk ---
 Thumbs.db
 Desktop.ini
