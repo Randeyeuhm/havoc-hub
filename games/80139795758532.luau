@@ -14,7 +14,8 @@
                         shoot() takes an optional CFrame, and the shoot
                         packet carries no aim flag - this is exactly how
                         the game's own spinbot fires, so the server
-                        cannot tell it apart from a legit cheat
+                        cannot tell it apart from a legit cheat;
+                        the 360 mode locks targets in ANY direction
       • Max Aim Assist - cranks the game's own AimAssistController:
                         huge range/FOV, head lock, through walls
       • Player / Bot ESP - the shared esp.luau engine (the only ESP in
@@ -106,6 +107,7 @@ local DEFAULTS = {
     Silent = {
         Enabled = false,
         AutoFire = false,
+        Aim360 = false,
     },
     ESP = {
         Enabled = false,
@@ -207,7 +209,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v1.6"
+local SCRIPT_VERSION = "aim-v1.7"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -409,14 +411,17 @@ local function isVisibleTo(t, fromPos, toPos)
     return hit == nil
 end
 
--- nearest target to the crosshair inside the FOV circle.
+-- nearest target to the crosshair inside the FOV circle. aim360 = true
+-- (360 silent aim) drops the FOV circle AND the camera-facing check and
+-- scores purely by distance - shots redirect at targets in ANY
+-- direction, behind you included.
 -- requireLOS = true is used by SILENT AIM: a redirected shot only
 -- registers when the game's own raycast can actually reach the target
 -- (blocks behind cover would make the shot claim nothing), so silent
 -- only picks targets with a clear line from the camera. With Xray
 -- bullets on, walls are excluded from the shot raycast, so silent
 -- drops the LOS requirement and locks through cover too.
-local function pickTarget(requireLOS)
+local function pickTarget(requireLOS, aim360)
     local cam = Workspace.CurrentCamera
     if not cam then return nil end
     local mouse = UserInputService:GetMouseLocation()
@@ -428,14 +433,20 @@ local function pickTarget(requireLOS)
         local pos = targetPointOf(t)
         local dist = (pos - origin).Magnitude
         if dist <= maxDist then
-            local sp = cam:WorldToViewportPoint(pos)
-            if sp.Z > 0 then
-                local dx, dy = sp.X - mouse.X, sp.Y - mouse.Y
-                local score = math.sqrt(dx * dx + dy * dy)
-                if score <= fovPx and score < bestScore then
-                    if not (Config.Aimbot.VisibleOnly or requireLOS) or isVisibleTo(t, origin, pos) then
-                        best, bestScore = t, score
-                    end
+            local score
+            if aim360 then
+                score = dist
+            else
+                local sp = cam:WorldToViewportPoint(pos)
+                if sp.Z > 0 then
+                    local dx, dy = sp.X - mouse.X, sp.Y - mouse.Y
+                    score = math.sqrt(dx * dx + dy * dy)
+                    if score > fovPx then score = nil end
+                end
+            end
+            if score and score < bestScore then
+                if not (Config.Aimbot.VisibleOnly or requireLOS) or isVisibleTo(t, origin, pos) then
+                    best, bestScore = t, score
                 end
             end
         end
@@ -499,7 +510,7 @@ local function installWrappers(ctrl)
     rawset(ctrl, "shoot", function(self, cf)
         -- silent aim: any real shot can be redirected at the wire
         if Config.Silent.Enabled and rawget(self, "__havocAimOwn") == true then
-            local target = pickTarget(not Config.Misc.Xray)
+            local target = pickTarget(not Config.Misc.Xray, Config.Silent.Aim360)
             if target then
                 local cam = Workspace.CurrentCamera
                 if cam then
@@ -913,7 +924,7 @@ track(task.spawn(function()
         if Config.Silent.AutoFire and Config.Silent.Enabled then
             local ctrl = CTRL_STATE.controller
             if ctrl and ctrl.equipped and ctrl:isHumanoidAlive() then
-                local target = pickTarget(not Config.Misc.Xray)
+                local target = pickTarget(not Config.Misc.Xray, Config.Silent.Aim360)
                 if target and not autoActive then
                     autoActive = true
                     pcall(function() ctrl:activate() end)
@@ -1182,6 +1193,12 @@ local function buildMenu()
         function(v)
             Config.Silent.AutoFire = v
             notify(v and "Auto fire on - fires while a target is in FOV" or "Auto fire off")
+        end)
+    toggle(pa, "360 silent aim",
+        function() return Config.Silent.Aim360 end,
+        function(v)
+            Config.Silent.Aim360 = v
+            notify(v and "360 silent aim on - shots lock targets in ANY direction" or "360 silent aim off")
         end)
 
     section(pa, "In-Game Aim Assist")
