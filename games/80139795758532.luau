@@ -22,7 +22,8 @@
                         controls: boxes, names, health, distance,
                         chams, tracers - every element customisable
       • Weapon        - no recoil (camera kick), infinite ammo,
-                        rapid fire (hold the trigger)
+                        rapid fire (hold the trigger), xray bullets
+                        (wallbang - the game's own map-pierce flag)
       • Anti-AFK, config persistence, unload button
 
     Recon facts (structure dump 2026-10-03):
@@ -119,6 +120,7 @@ local DEFAULTS = {
         InfAmmo = false,
         RapidFire = false,
         RapidFireRate = 14, -- shots per second while the trigger is held
+        Xray = false,
         MaxAssist = false,
         AntiAFK = true,
     },
@@ -205,7 +207,7 @@ local function moduleSource(name)
     return nil
 end
 
-local SCRIPT_VERSION = "aim-v1.5"
+local SCRIPT_VERSION = "aim-v1.6"
 
 local UILIB_FILE = "uilib.luau"
 local UILib
@@ -411,7 +413,9 @@ end
 -- requireLOS = true is used by SILENT AIM: a redirected shot only
 -- registers when the game's own raycast can actually reach the target
 -- (blocks behind cover would make the shot claim nothing), so silent
--- only picks targets with a clear line from the camera.
+-- only picks targets with a clear line from the camera. With Xray
+-- bullets on, walls are excluded from the shot raycast, so silent
+-- drops the LOS requirement and locks through cover too.
 local function pickTarget(requireLOS)
     local cam = Workspace.CurrentCamera
     if not cam then return nil end
@@ -495,7 +499,7 @@ local function installWrappers(ctrl)
     rawset(ctrl, "shoot", function(self, cf)
         -- silent aim: any real shot can be redirected at the wire
         if Config.Silent.Enabled and rawget(self, "__havocAimOwn") == true then
-            local target = pickTarget(true)
+            local target = pickTarget(not Config.Misc.Xray)
             if target then
                 local cam = Workspace.CurrentCamera
                 if cam then
@@ -693,6 +697,53 @@ local function assistRestore()
 end
 
 -- ============================================================
+-- XRAY BULLETS  (wallbang - the game's OWN pierce flag)
+-- ============================================================
+-- castRays() (ReplicatedStorage/Blaster/Utility/castRays) excludes the
+-- ENTIRE map + Terrain from the shot raycast whenever the shooter's
+-- humanoid has xrayBulletsActive == true. It re-reads that attribute
+-- from the LOCAL humanoid on every call, so switching it on locally
+-- makes every shot - manual, silent, rapid fire - claim hits right
+-- through walls while keeping the native shoot story intact.
+local xrayHumanoid = nil
+local xrayOriginal = nil
+
+local function xraySet(on)
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if not hum then
+        xrayHumanoid = nil
+        return false
+    end
+    if hum ~= xrayHumanoid then
+        xrayHumanoid = hum
+        xrayOriginal = hum:GetAttribute("xrayBulletsActive")
+    end
+    if on then
+        pcall(function() hum:SetAttribute("xrayBulletsActive", true) end)
+    else
+        pcall(function() hum:SetAttribute("xrayBulletsActive", xrayOriginal) end)
+    end
+    return true
+end
+
+local function xrayApply()
+    return xraySet(true)
+end
+
+local function xrayRestore()
+    if xrayHumanoid then
+        pcall(function() xrayHumanoid:SetAttribute("xrayBulletsActive", xrayOriginal) end)
+        xrayHumanoid = nil
+    end
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function() hum:SetAttribute("xrayBulletsActive", xrayOriginal) end)
+    end
+end
+
+-- ============================================================
 -- PLAYER / BOT ESP  (esp.luau engine - the shared library)
 -- ============================================================
 local PlayerESP
@@ -849,6 +900,9 @@ track(task.spawn(function()
         if Config.Misc.MaxAssist then
             pcall(assistApply)
         end
+        if Config.Misc.Xray then
+            pcall(xrayApply)
+        end
     end
 end))
 
@@ -859,7 +913,7 @@ track(task.spawn(function()
         if Config.Silent.AutoFire and Config.Silent.Enabled then
             local ctrl = CTRL_STATE.controller
             if ctrl and ctrl.equipped and ctrl:isHumanoidAlive() then
-                local target = pickTarget(true)
+                local target = pickTarget(not Config.Misc.Xray)
                 if target and not autoActive then
                     autoActive = true
                     pcall(function() ctrl:activate() end)
@@ -1288,6 +1342,18 @@ local function buildMenu()
         function() return Config.Misc.RapidFireRate end,
         function(v) Config.Misc.RapidFireRate = v end, 1, 3, 30,
         function(v) return ("%d shots/s"):format(v) end)
+    toggle(px, "Xray bullets (wallbang)",
+        function() return Config.Misc.Xray end,
+        function(v)
+            Config.Misc.Xray = v
+            if v then
+                notify(xraySet(true) and "Xray bullets on - shots pierce walls"
+                    or "Xray on - spawn in, it arms within a second")
+            else
+                xrayRestore()
+                notify("Xray bullets off")
+            end
+        end)
 
     section(px, "Menu")
     keybindRow(px, HOTKEY_LIST[1], { locked = true, lockNote = "RightShift is the menu key and stays bound" })
@@ -1308,6 +1374,7 @@ local function buildMenu()
             table.clear(genv.__HAVOC_AIMBOT_DISCONNECT)
         end
         pcall(assistRestore)
+        pcall(xrayRestore)
         if PlayerESP then pcall(function() PlayerESP:Clear() end) end
         local modHook = genv.__HAVOC_AIMBOT_MODULE_HOOK
         if type(modHook) == "table" then
