@@ -38,8 +38,8 @@
                             parts (head/body) + colour, tracers, and a
                             Visible-only raycast filter per target.
       Aim (Project Delta-style)
-        • Target picking    - screen-space FOV circle (the drawn circle
-                            IS the lock zone), aim part dropdown,
+        • Target picking    - fixed pixel FOV radius (PD style; the drawn
+                            circle IS the lock zone), aim part dropdown,
                             weighted random body parts, one hitchance
                             roll per locked target, kill snap on switch.
         • Aim method        - Mouse: moves the real cursor so BOTH hip-
@@ -52,7 +52,7 @@
                             CommunicateMelee "Hit" onto the locked target
                             through a namecall hook. EXPERIMENTAL: server
                             validation unknown.
-        • Auto Fire, configurable FOV circle (colour/thickness/opacity)
+        • Auto Fire, FOV circle (pixel radius + colour/thickness/opacity)
       Misc
         • Fullbright, Anti-AFK, rebindable hotkeys, unload
 
@@ -62,7 +62,7 @@
     Re-run safe: genv generation token, old UI + ESP cleaned on boot.
 ]]
 
-local SCRIPT_VERSION = "vs-v2"
+local SCRIPT_VERSION = "vs-v2.1"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -126,7 +126,7 @@ local DEFAULT_CONFIG = {
         Enabled = false,
         Mode = "Toggle",      -- Toggle key | Hold RMB | Always
         Method = "Mouse",     -- Mouse (real cursor: hip-fire + ADS) | Camera
-        FOV = 30,
+        FOVRadius = 150,      -- pixel radius of the lock circle (Project Delta style)
         MaxDist = 800,
         TeamCheck = false,
         VisibleCheck = false,
@@ -198,6 +198,12 @@ do
         we.MaxDistance = tonumber(w.WildMaxDist)
     end
     if w.WildChams == true and we.ChamsHead == nil then we.ChamsHead, we.ChamsBody = true, true end
+end
+
+-- the old aimlock's degrees-FOV is gone - the lock zone is the fixed
+-- pixel circle now (Project Delta's FOVRadius); drop the stale saved key
+if type(Config.Aim) == "table" then
+    Config.Aim.FOV = nil
 end
 
 local savePending = false
@@ -692,12 +698,12 @@ local function modelDead(model)
     return (not hum) or hum.Health <= 0
 end
 
-local function fovRadiusPixels(cam)
+-- The lock zone is a FIXED pixel circle around the crosshair (Project
+-- Delta's FOVRadius): it never changes size with camera zoom or FOV, and
+-- the drawn circle uses the exact same radius as the pick test.
+local function fovRadius(cam)
     local vp = cam.ViewportSize
-    local half = math.tan(math.rad(cam.FieldOfView * 0.5))
-    if half <= 0.0001 then return vp.Y * 0.5 end
-    local r = math.tan(math.rad(math.clamp(tonumber(Config.Aim.FOV) or 30, 1, 179))) * (vp.Y * 0.5) / half
-    return math.clamp(r, 4, vp.Y * 1.5)
+    return math.clamp(tonumber(Config.Aim.FOVRadius) or 150, 5, vp.Y * 1.5)
 end
 
 -- Nearest model whose aim head sits inside the screen FOV circle.
@@ -707,7 +713,7 @@ local function pickAimTarget()
     local cfg = Config.Aim
     local vp = cam.ViewportSize
     local center = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
-    local radius = fovRadiusPixels(cam)
+    local radius = fovRadius(cam)
     local camPos = cam.CFrame.Position
     local maxDist = tonumber(cfg.MaxDist) or 800
     local bestChar, bestPart, bestD = nil, nil, radius
@@ -1000,7 +1006,7 @@ local function armSilentAim()
     return false, note
 end
 
--- FOV circle (matches the FOV slider; colour/thickness/opacity from UI)
+-- FOV circle (fixed pixel radius, Project Delta style; colour etc. from UI)
 local fovCircle
 do
     local ok, d = pcall(function() return Drawing.new("Circle") end)
@@ -1029,7 +1035,7 @@ local function updateFovCircle()
     -- opacity passes through as-is (same convention as esp.luau)
     fovCircle.Transparency = math.clamp(tonumber(Config.Aim.CircleOpacity) or 0.6, 0, 1)
     fovCircle.Position = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
-    fovCircle.Radius = fovRadiusPixels(cam)
+    fovCircle.Radius = fovRadius(cam)
     fovCircle.Visible = true
 end
 
@@ -1276,9 +1282,9 @@ if UILib then
     dropdownRow(aim, "Aim method", { "Mouse", "Camera" },
         function() return Config.Aim.Method end,
         function(v) Config.Aim.Method = v end)
-    sliderRow(aim, "FOV (degrees)", function() return Config.Aim.FOV end,
-        function(v) Config.Aim.FOV = v end, 5, 5, 180, function(v)
-            return ("%d°"):format(v)
+    sliderRow(aim, "FOV radius", function() return Config.Aim.FOVRadius end,
+        function(v) Config.Aim.FOVRadius = v end, 5, 20, 600, function(v)
+            return ("%d px"):format(v)
         end)
     sliderRow(aim, "Max distance", function() return Config.Aim.MaxDist end,
         function(v) Config.Aim.MaxDist = v end, 50, 100, 4000, function(v)
@@ -1301,7 +1307,7 @@ if UILib then
             Config.Aim.AutoFire = v
             if not v then releaseMouse1() end
         end)
-    noteRow(aim, "Mouse method moves your real cursor (hip-fire + ADS both aim); Camera steers the view only. Smoothing 0 = instant.")
+    noteRow(aim, "FOV radius is the pixel circle around your crosshair - the drawn circle IS the lock zone (fixed size, Project Delta style). Mouse method moves your real cursor (hip-fire + ADS); Camera steers the view only. Smoothing 0 = instant.")
 
     section(aim, "TARGETING")
     dropdownRow(aim, "Aim part", { "Head", "UpperTorso", "HumanoidRootPart" },
