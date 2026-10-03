@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - ARMORED PATROL                         ap-v1.6
+    HAVOC HUB - ARMORED PATROL                         ap-v1.7
     ============================================================
 
     PlaceId 10518166490  ·  GameId 3826087550  ·  loader hands this in
@@ -22,10 +22,13 @@
         "r-down" / "p-down". AimFirst ("aimfirst", bool) is a legit
         client->server toggle that fires at the intended direction
         before the turret visually catches up.
-      • Drive: LsTeDrive invokes the rig's DriveFunction locally; the
-        physics work happens on the controller's client (chassis velocity
-        writes + helicopter ApplyImpulse) - network ownership inference:
-        when you control a rig, local motion is yours to push.
+      • Drive: LsTeDrive invokes the rig's DriveFunction locally and
+        LsDrive animates/streams; LIVE PROBE (ap-v1.6 tracer) proved the
+        rigs are SERVER-simulated: during every shove storm there were
+        ZERO game-Lua writers on the hull - the forces were pure engine
+        replication, and local hull writes always lose. Driving is done
+        by the server from the RigSvcsURE input stream (see Drive
+        Inject below).
       • Health lives in CntrHealth (0..1) + CntrState (enabled / disabled /
         shutdown / repair). Teams = TeamColor: Bright red / Bright blue,
         neutral = Forest green.
@@ -39,27 +42,25 @@
         • Claim / Release - claim the nearest idle rig (raw "control"
                             request; radius slider), auto-claim, release.
         • Rig Speed       - velocity multiplier while you control a rig.
-        • Rig Fly         - ghost flight: the hull's position is stepped
-                            DIRECTLY every write (we own where the rig
-                            is, so the drive engine's forces/brakes and
-                            gravity cannot drag against us), full level
-                            lock, velocities zeroed and the guard-tracked
-                            treads glued to the hull pose each write.
-                            WASD / Space / LeftCtrl, slider = studs/s.
-                            NOTE: LsDrive's client NaN guard (x112) PINS
-                            the rig's CFrame + zeroes every velocity for
-                            ~2s (120 frames) the moment chassis speed
-                            passes 500 or any tracked part NaNs - that
-                            was the "speed gets corrected" / "fly stops
-                            for a couple seconds" seen live. ap-v1.3+
-                            hooks that guard for our rig: pure over-speed
-                            freezes are skipped, NaN heal kept, and
-                            discovery falls back to a getgc scan (Volt
-                            has no getconnections - v1.3 silently found
-                            nothing, the console proves it).
-        • Rig -> Camera   - slam your rig (and you) to the freecam-ish
-                            camera spot; pinned for a moment, velocities
-                            zeroed. Hotkey V.
+        • Drive Inject    - live probe result: the rigs are simulated
+                            SERVER-side (60+ shoves/second on the hull
+                            with ZERO game-Lua writers = pure engine
+                            replication; local hull writes always lose -
+                            that was the "server teleports back"). The
+                            only movement channel the server listens to is
+                            the RigSvcsURE input stream the game itself
+                            sends (channel 0 = throttle, 1 = steer).
+                            Inject fires those at 5Hz from the value
+                            sliders - the server's own simulation does
+                            the driving; values beyond the legit range
+                            are the experiment. The old hull-flight +
+                            rig-teleport attempts are retired (they only
+                            fought replication).
+                            NOTE from the same probe: a v1.6 auto-
+                            suppressor mistook the __newindex trampoline
+                            for a writer - this build detects and
+                            repairs that on boot ("metamethod
+                            repaired") and never hooks [C] again.
       Aim
         • Aim Assist      - works with the game's own aim pipeline: the
                             mouse UnitRay is redirected to the best enemy
@@ -82,7 +83,7 @@
     "you actually control that rig".
 ]]
 
-local SCRIPT_VERSION = "ap-v1.6"
+local SCRIPT_VERSION = "ap-v1.7"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -160,8 +161,11 @@ local DEFAULT_CONFIG = {
         AutoClaim = false,
         SpeedOn = false,
         SpeedMult = 2,
-        FlyOn = false,
+        FlyOn = false,          -- retired (server-simulated rigs), kept for old configs
         FlySpeed = 80,
+        Inject = false,         -- drive-input injection (RigSvcsURE ch0/ch1)
+        InjThrottle = 60,
+        InjSteer = 0,
     },
     Misc = {
         Fullbright = false,
@@ -196,6 +200,10 @@ do
         pcall(mergeInto, Config, data)
     end
 end
+
+-- live testing proved the rigs are SERVER-simulated: local hull writes
+-- (the old fly) always lose to replication - keep it off for good
+Config.Rig.FlyOn = false
 
 local savePending = false
 local function flushSave()
@@ -299,7 +307,6 @@ local HOTKEYS = {
     { Id = "ToggleMenu", Desc = "Show / hide menu", Key = Enum.KeyCode.RightShift, Enabled = true },
     { Id = "Aim",        Desc = "Aim Assist toggle", Key = Enum.KeyCode.F,          Enabled = true },
     { Id = "Claim",      Desc = "Claim nearest rig", Key = Enum.KeyCode.G,          Enabled = true },
-    { Id = "RigTP",      Desc = "Rig -> Camera",     Key = Enum.KeyCode.V,          Enabled = true },
 }
 local HOTKEY_BY_ID = {}
 do
@@ -785,6 +792,55 @@ local function stepRigFly(dt)
     FLY.lastPos = root.Position
 end
 
+-- ============================================================
+-- DRIVE INJECT (ap-v1.7): the rigs are SERVER-simulated - the hull is
+-- not ours to move (live probe: zero game-Lua chassis writers during
+-- every shove storm). The drive input stream is the channel the server
+-- actually listens to: RigSvcsURE channel 0 = throttle, 1 = steer - the
+-- same packets the game's own drive loop sends. We fire those channels
+-- directly; the server's simulation does the driving.
+-- ============================================================
+local INJ = { acc = 0, sent = 0, wasOn = false }
+
+local function injectFire(throttle, steer)
+    local rig = myRig()
+    if not rig then return false end
+    local ure = rig:FindFirstChild("RigSvcsURE")
+    if not (ure and ure:IsA("UnreliableRemoteEvent")) then return false end
+    return pcall(function()
+        ure:FireServer(0, throttle)
+        ure:FireServer(1, steer)
+    end)
+end
+
+local function injectOnce()
+    return injectFire(Config.Rig.InjThrottle, Config.Rig.InjSteer)
+end
+
+local function stepInject(dt)
+    if not Config.Rig.Inject then
+        if INJ.wasOn then
+            INJ.wasOn = false
+            injectFire(0, 0)
+        end
+        return
+    end
+    if not INJ.wasOn then
+        INJ.wasOn = true
+        INJ.sent = 0
+        log(("inject on: throttle=%s steer=%s"):format(tostring(Config.Rig.InjThrottle), tostring(Config.Rig.InjSteer)))
+    end
+    INJ.acc = INJ.acc + dt
+    if INJ.acc < 0.2 then return end
+    INJ.acc = 0
+    if injectFire(Config.Rig.InjThrottle, Config.Rig.InjSteer) then
+        INJ.sent = INJ.sent + 1
+        if INJ.sent % 25 == 0 then
+            log(("inject: throttle=%s steer=%s (x%d)"):format(tostring(Config.Rig.InjThrottle), tostring(Config.Rig.InjSteer), INJ.sent))
+        end
+    end
+end
+
 local rigTpBusy = false
 local function rigToCamera()
     if rigTpBusy then return end
@@ -874,12 +930,20 @@ local function noteChassisWriter(fn)
     if not rec then
         local src = "?"
         pcall(function() src = tostring(debug.info(fn, "s")) .. "@" .. tostring(debug.info(fn, "l")) end)
-        rec = { src = src, n = 0 }
+        rec = { src = src, n = 0, logged = false }
         CHW.seen[fn] = rec
     end
     rec.n = rec.n + 1
     CHW.total = CHW.total + 1
-    if FLY.active and rec.n >= 5 and not CHW.suppressed[fn] and type(hookfunction) == "function" then
+    if FLY.active and not rec.logged then
+        rec.logged = true
+        log(("chassis writer seen: %s"):format(rec.src))
+    end
+    -- NEVER hookfunction [C] sources - that trampoline is the instance
+    -- metamethod itself; v1.6 hooked it and killed every Lua property
+    -- write. Only real Lua writers (with a source file) get silenced.
+    if FLY.active and rec.n >= 5 and not CHW.suppressed[fn]
+        and type(hookfunction) == "function" and rec.src:sub(1, 3) ~= "[C]" then
         local orig
         local ok = pcall(function()
             orig = hookfunction(fn, function(...)
@@ -958,6 +1022,89 @@ if type(hookmetamethod) == "function" then
     end)
     if okW then
         log("seated-character write blocker + chassis tracer installed")
+    end
+end
+
+-- v1.6 left a broken __newindex for anyone who ran it live: its tracer
+-- had hooked the metamethod trampoline ([C]) and dropped all property
+-- writes while a stale flag was true. Detect that with a probe write
+-- and restore the trampoline through the hook chain (the wrapper still
+-- holds the original as an upvalue).
+if type(hookmetamethod) == "function" then
+    local probe = Instance.new("Folder")
+    local broken = false
+    pcall(function()
+        probe.Name = "HavocProbe"
+        broken = probe.Name ~= "HavocProbe"
+    end)
+    pcall(function() probe:Destroy() end)
+    if broken then
+        local repaired, reason = false, "?"
+        pcall(function()
+            local mt = getrawmetatable(game)
+            if type(mt) ~= "table" or type(mt.__newindex) ~= "function" then
+                reason = "no metatable __newindex"
+                return
+            end
+            local cur = mt.__newindex
+            local wrapper = nil
+            for _ = 1, 12 do
+                if type(cur) ~= "function" then
+                    reason = "chain ran into non-function"
+                    return
+                end
+                local nxt = nil
+                for i = 1, 16 do
+                    local okU, uname, v = pcall(debug.getupvalue, cur, i)
+                    if not okU or uname == nil then break end
+                    if uname == "oldW" and type(v) == "function" then
+                        nxt = v
+                        break
+                    end
+                end
+                if not nxt then
+                    wrapper = cur
+                    break
+                end
+                cur = nxt
+            end
+            if not wrapper then
+                reason = "chain did not terminate"
+                return
+            end
+            local orig = nil
+            for i = 1, 16 do
+                local okU, uname, v = pcall(debug.getupvalue, wrapper, i)
+                if not okU or uname == nil then break end
+                if type(v) == "function" and v ~= wrapper then
+                    local vsrc = "?"
+                    pcall(function() vsrc = tostring(debug.info(v, "s")) end)
+                    if vsrc == "[C]" then
+                        orig = v
+                        break
+                    end
+                end
+            end
+            if not orig then
+                reason = "no captured original in the trampoline wrapper"
+                return
+            end
+            hookfunction(wrapper, function(self, key, value)
+                return orig(self, key, value)
+            end)
+            repaired = true
+            local probe2 = Instance.new("Folder")
+            pcall(function()
+                probe2.Name = "HavocProbe2"
+                if probe2.Name ~= "HavocProbe2" then repaired = false end
+            end)
+            pcall(function() probe2:Destroy() end)
+        end)
+        if repaired then
+            log("metamethod repaired (v1.6 trampoline hook undone)")
+        else
+            warn("[AP] property-write metamethod still broken (" .. tostring(reason) .. ") - RE-EXECUTE the executor / rejoin the game before testing")
+        end
     end
 end
 
@@ -1433,14 +1580,33 @@ if UILib then
         function(v) Config.Rig.SpeedMult = v end, 0.5, 1, 10, function(v)
             return ("%.1fx"):format(v)
         end)
-    toggleRow(veh, "Rig Fly", function() return Config.Rig.FlyOn end,
-        function(v) Config.Rig.FlyOn = v end)
-    sliderRow(veh, "Fly speed", function() return Config.Rig.FlySpeed end,
-        function(v) Config.Rig.FlySpeed = v end, 10, 30, 400, function(v)
+    UILib.makeSectionHeader(veh, "DRIVE INJECT")
+    toggleRow(veh, "Inject drive inputs", function() return Config.Rig.Inject end,
+        function(v)
+            Config.Rig.Inject = v
+            notify(v and "Drive injection on" or "Drive injection off")
+        end)
+    sliderRow(veh, "Throttle value", function() return Config.Rig.InjThrottle end,
+        function(v) Config.Rig.InjThrottle = v end, 10, 0, 5000, function(v)
             return ("%d"):format(v)
         end)
-    UILib.makeButton(veh, "Rig -> Camera", function()
-        rigToCamera()
+    sliderRow(veh, "Steer value", function() return Config.Rig.InjSteer end,
+        function(v) Config.Rig.InjSteer = v end, 0.1, -1, 1, function(v)
+            return ("%.1f"):format(v)
+        end)
+    UILib.makeButton(veh, "Send input once", function()
+        if injectOnce() then notify("Input sent") else notify("No rig / no RigSvcsURE") end
+    end)
+    UILib.makeButton(veh, "Stop (send 0 / 0)", function()
+        local rig = myRig()
+        local ure = rig and rig:FindFirstChild("RigSvcsURE")
+        if ure then
+            pcall(function()
+                ure:FireServer(0, 0)
+                ure:FireServer(1, 0)
+            end)
+        end
+        notify("Stop sent")
     end)
 
     -- ------------------------------------------------------------
@@ -1512,7 +1678,6 @@ if UILib then
     UILib.makeSectionHeader(misc, "HOTKEYS")
     UILib.makeKeybindRow(misc, HOTKEY_BY_ID.Aim, {})
     UILib.makeKeybindRow(misc, HOTKEY_BY_ID.Claim, {})
-    UILib.makeKeybindRow(misc, HOTKEY_BY_ID.RigTP, {})
     UILib.makeKeybindRow(misc, HOTKEY_BY_ID.ToggleMenu, {})
 
     UILib.makeSectionHeader(misc, "WORLD")
@@ -1538,6 +1703,7 @@ end
 -- ============================================================
 function CLEANUP()
     genv.__HAVOC_AP_GEN = nil          -- kills loops + the mouse hook
+    FLY.active = false                 -- release any stale write wrappers
     pcall(releaseMouse1)
     pcall(disconnectAll)
     pcall(releaseVehESP)
@@ -1591,8 +1757,6 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
             notify(Config.Aim.Enabled and "Aim Assist on" or "Aim Assist off")
         elseif fired("Claim") then
             claimNearest(false)
-        elseif fired("RigTP") then
-            rigToCamera()
         end
     end)
 end))
@@ -1608,6 +1772,7 @@ track(RunService.Heartbeat:Connect(function(dt)
     if genv.__HAVOC_AP_GEN ~= MY_GEN then return end
     pcall(stepGuard, dt)
     pcall(stepRigFly, dt)
+    pcall(stepInject, dt)
 
     claimAccum = claimAccum + dt
     if claimAccum >= 3 then
