@@ -53,6 +53,9 @@
                             through a namecall hook. EXPERIMENTAL: server
                             validation unknown.
         • Auto Fire, FOV circle (pixel radius + colour/thickness/opacity)
+      Weapons
+        • No Recoil - the gun configs are wrapped so every equip gets
+                            zeroed recoil nudges (original tables untouched)
       Misc
         • Fullbright, Anti-AFK, rebindable hotkeys, unload
 
@@ -62,7 +65,7 @@
     Re-run safe: genv generation token, old UI + ESP cleaned on boot.
 ]]
 
-local SCRIPT_VERSION = "vs-v2.2"
+local SCRIPT_VERSION = "vs-v2.3"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -146,6 +149,9 @@ local DEFAULT_CONFIG = {
         LeadBlend = 1.0,          -- 0 = aim at the body, 1 = full physics lead
         VelocityOverride = 0,     -- 0 = read the gun's own muzzle velocity
         SilentAim = false,        -- experimental remote shot rewrite
+    },
+    Weapons = {
+        NoRecoil = false,
     },
     Misc = {
         Fullbright = false,
@@ -475,6 +481,96 @@ local function solveLaunch(origin, point, targetVel, velocity, gravity)
     local r = (aimPt - origin) + Vector3.new(0, 0.5 * g * t * t, 0)
     if r.Magnitude < 0.5 then return nil end
     return r.Unit
+end
+
+-- ============================================================
+-- WEAPON MODS
+-- The gun client builds its config through GameConfiguration.ItemConfigs
+-- (a plain table of constructor functions the game calls on every equip),
+-- so the mods replace those constructors with wrappers that hand the game
+-- a modified copy. The original frozen config tables are never touched,
+-- and a toggle change applies from the next equip. Wrappers are re-built
+-- over the saved originals on every re-execute, so they never stack.
+-- ============================================================
+local weaponMods = genv.__HAVOC_VS_WEAPONMODS
+if type(weaponMods) ~= "table" then
+    weaponMods = { installed = false, note = "off", originals = {} }
+    genv.__HAVOC_VS_WEAPONMODS = weaponMods
+end
+
+local function deepCopy(v)
+    if type(v) ~= "table" then return v end
+    local out = {}
+    for k, val in pairs(v) do
+        out[k] = deepCopy(val)
+    end
+    return out
+end
+
+local function moddedGunConfig(cfg)
+    if type(cfg) ~= "table" then return cfg end
+    if Config.Weapons.NoRecoil then
+        local copy = deepCopy(cfg)
+        local ri = copy.RecoilInfo
+        if type(ri) == "table" then
+            ri.NudgeX = NumberRange.new(0, 0)
+            ri.NudgeY = NumberRange.new(0, 0)
+        end
+        return copy
+    end
+    return cfg
+end
+
+local function installWeaponMods()
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local shared = modules and modules:FindFirstChild("Shared")
+    local gcNode = shared and shared:FindFirstChild("GameConfiguration")
+    if not gcNode then
+        weaponMods.note = "GameConfiguration not found"
+        return false, weaponMods.note
+    end
+    local ok, gc = pcall(require, gcNode)
+    if not ok or type(gc) ~= "table" then
+        weaponMods.note = "GameConfiguration require failed"
+        return false, weaponMods.note
+    end
+    local ic = gc.ItemConfigs
+    if type(ic) ~= "table" then
+        weaponMods.note = "ItemConfigs missing"
+        return false, weaponMods.note
+    end
+    if table.isfrozen and table.isfrozen(ic) then
+        if type(setreadonly) == "function" then pcall(setreadonly, ic, false) end
+        if table.isfrozen(ic) then
+            weaponMods.note = "ItemConfigs is readonly"
+            return false, weaponMods.note
+        end
+    end
+    local function makeWrapper(orig)
+        return function(...)
+            local okC, cfg = pcall(orig, ...)
+            if not okC or type(cfg) ~= "table" then return cfg end
+            local okM, res = pcall(moddedGunConfig, cfg)
+            return okM and res or cfg
+        end
+    end
+    for name, ctor in pairs(ic) do
+        if type(ctor) == "function" then
+            local orig = weaponMods.originals[name]
+            if type(orig) ~= "function" then
+                orig = ctor
+                weaponMods.originals[name] = orig
+            end
+            ic[name] = makeWrapper(orig)
+        end
+    end
+    weaponMods.installed = true
+    weaponMods.note = "armed"
+    return true, weaponMods.note
+end
+
+local function armWeaponMods()
+    return installWeaponMods()
 end
 
 -- ============================================================
@@ -830,6 +926,7 @@ local function aimStep(dt)
         alpha = 1
         AIM.killSnap = false
     end
+    local hard = alpha >= 1
     if Config.Aim.Method == "Mouse" and canMoveMouse() then
         local sp = cam:WorldToViewportPoint(aimPos)
         if sp.Z > 0 then
@@ -840,9 +937,14 @@ local function aimStep(dt)
                 pcall(mousemoverel, dx, dy)
             end
         end
+        -- Smoothing 0 = STRAIGHT LOCK: the mouse move alone would still be
+        -- eased in by the game's own mouse input, so pin the view too
+        if hard then
+            cam.CFrame = CFrame.new(origin, aimPos)
+        end
     else
         local goal = CFrame.new(origin, aimPos)
-        cam.CFrame = cam.CFrame:Lerp(goal, alpha)
+        cam.CFrame = hard and goal or cam.CFrame:Lerp(goal, alpha)
     end
 end
 
@@ -1119,7 +1221,7 @@ if UILib then
         subtitle = SCRIPT_VERSION,
         size = UDim2.new(0, math.clamp(viewport.X - 60, 380, 560), 0, math.clamp(viewport.Y - 80, 340, 720)),
         position = UDim2.new(0, 30, 0, 40),
-        tabs = { "Players", "Aim", "World", "Misc" },
+        tabs = { "Players", "Aim", "Weapons", "World", "Misc" },
         footerHint = "RightShift toggles the menu",
     }
     local popupLayer = window.popupLayer
@@ -1358,6 +1460,22 @@ if UILib then
     colorRow(aim, "Circle colour", Config.Aim, "Circle")
 
     -- ------------------------------------------------------------
+    -- Weapons
+    -- ------------------------------------------------------------
+    local wep = window.tab("Weapons")
+    section(wep, "WEAPON MODS")
+    toggleRow(wep, "No Recoil", function() return Config.Weapons.NoRecoil end,
+        function(v)
+            Config.Weapons.NoRecoil = v
+            if v then
+                local ok, note = armWeaponMods()
+                notify(ok and "No recoil on (applies next equip)" or ("Weapon mods not armed: " .. tostring(note)))
+            else
+                notify("No recoil off")
+            end
+        end)
+
+    -- ------------------------------------------------------------
     -- World
     -- ------------------------------------------------------------
     local world = window.tab("World")
@@ -1494,14 +1612,19 @@ applyFullbright()
 if Config.Aim.SilentAim then
     task.spawn(function() armSilentAim() end)
 end
+-- wrap the gun configs when No Recoil was left on
+if Config.Weapons.NoRecoil then
+    task.spawn(function() armWeaponMods() end)
+end
 
-log(("%s loaded | players: %d | aim: %s (%s/%s) | silent: %s | pESP: %s | wESP: %s"):format(
+log(("%s loaded | players: %d | aim: %s (%s/%s) | silent: %s | noRecoil: %s | pESP: %s | wESP: %s"):format(
     SCRIPT_VERSION,
     #Players:GetPlayers(),
     Config.Aim.Enabled and "on" or "off",
     tostring(Config.Aim.Mode),
     tostring(Config.Aim.Method),
     silentShot.installed and "armed" or "off",
+    weaponMods.installed and "armed" or "off",
     Config.Players.ESP and "on" or "off",
     Config.World.Wildlife and "on" or "off"
 ))
