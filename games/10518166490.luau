@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - ARMORED PATROL                         ap-v1.4
+    HAVOC HUB - ARMORED PATROL                         ap-v1.5
     ============================================================
 
     PlaceId 10518166490  ·  GameId 3826087550  ·  loader hands this in
@@ -82,7 +82,7 @@
     "you actually control that rig".
 ]]
 
-local SCRIPT_VERSION = "ap-v1.4"
+local SCRIPT_VERSION = "ap-v1.5"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -599,7 +599,7 @@ end
 -- treads leave the ground instead of dragging. While flying, the rig's
 -- own drive/steer invokes are suppressed (see the __namecall hook in the
 -- aim section) so the game's drive loop cannot fight the flight.
-local FLY = { active = false, rig = nil, liftT = 0, logT = 0, freezeLog = 0, pos = nil, glue = nil, lastPos = nil }
+local FLY = { active = false, rig = nil, liftT = 0, logT = 0, freezeLog = 0, pos = nil, glue = nil, lastPos = nil, lastSet = nil, lastVel = nil, pushCount = 0, pushMax = 0, jarLog = 0, hrp = nil }
 
 -- guard bookkeeping lives here (early) so the fly stepper can see it -
 -- the actual guard hunt + hook lives further down (aim section)
@@ -612,7 +612,18 @@ end
 
 local function stepRigFly(dt)
     if not Config.Rig.FlyOn then
-        FLY.active = false
+        if FLY.active then
+            -- hand the rig back to physics at rest, not at fly speed
+            FLY.active = false
+            local rig = myRig()
+            local chassis = rig and chassisOf(rig)
+            if chassis then
+                pcall(function()
+                    chassis.AssemblyLinearVelocity = Vector3.zero
+                    chassis.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end
         return
     end
     local rig = myRig()
@@ -631,7 +642,12 @@ local function stepRigFly(dt)
         FLY.liftT = 0.35
         FLY.pos = (chassis.AssemblyRootPart or chassis).Position
         FLY.glue = nil
+        FLY.lastSet = nil
+        FLY.lastVel = nil
+        FLY.pushCount, FLY.pushMax = 0, 0
     end
+    local chNow = LocalPlayer.Character
+    FLY.hrp = (chNow and chNow:FindFirstChild("HumanoidRootPart")) or nil
 
     local root = chassis.AssemblyRootPart or chassis
     local speed = math.clamp(Config.Rig.FlySpeed, 20, 400)
@@ -671,17 +687,42 @@ local function stepRigFly(dt)
     end
     FLY.pos = FLY.pos + step
 
-    -- write: absolute position + full level lock (yaw kept). Velocity is
-    -- zeroed right after so nothing accumulates between writes.
+    -- write: absolute position + full level lock (yaw kept). The matching
+    -- velocity is written too (NOT zeroed) so position and velocity stay
+    -- consistent - a server validating "moving while velocity says 0"
+    -- cannot flag it.
     local fwd = root.CFrame.LookVector
     local flat = Vector3.new(fwd.X, 0, fwd.Z)
     if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
     local newCF = CFrame.lookAt(FLY.pos, FLY.pos + flat.Unit, Vector3.new(0, 1, 0))
+    local setVel = (dt and dt > 0) and (step / dt) or Vector3.zero
+    if setVel.Magnitude > 480 then setVel = setVel.Unit * 480 end
+    -- external push detection: residual beyond our own velocity's progress
+    local pre = root.Position
+    if FLY.lastSet then
+        local expected = FLY.lastSet + (FLY.lastVel or Vector3.zero) * (dt or 0)
+        local residual = (pre - expected).Magnitude
+        if residual > 3 then
+            FLY.pushCount = FLY.pushCount + 1
+            FLY.pushMax = math.max(FLY.pushMax, residual)
+            if residual > 20 and (os.clock() - FLY.jarLog) > 5 then
+                FLY.jarLog = os.clock()
+                local own = "?"
+                pcall(function()
+                    local o = root:GetNetworkOwner()
+                    own = o and o.Name or "server"
+                end)
+                log(("JAR %.0f studs owner=%s state=%s"):format(residual, tostring(own), tostring(stateOf(rig))))
+            end
+        end
+    end
     pcall(function() root.CFrame = newCF end)
     pcall(function()
-        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyLinearVelocity = setVel
         root.AssemblyAngularVelocity = Vector3.zero
     end)
+    FLY.lastSet = newCF.Position
+    FLY.lastVel = setVel
 
     -- glue the guard's tracked parts (void-linked treads/wheels) to the
     -- hull pose so they can never stretch the solver into a NaN freeze
@@ -718,8 +759,9 @@ local function stepRigFly(dt)
             local o = root:GetNetworkOwner()
             owner = o and o.Name or "server"
         end)
-        log(("fly moved=%.0f/s drift=%.1f owner=%s state=%s"):format(
-            moved, drift, tostring(owner), tostring(stateOf(rig))))
+        log(("fly moved=%.0f/s drift=%.1f push=%d/%.0f owner=%s state=%s"):format(
+            moved, drift, FLY.pushCount, FLY.pushMax, tostring(owner), tostring(stateOf(rig))))
+        FLY.pushCount, FLY.pushMax = 0, 0
         if dir.Magnitude > 0.01 and moved < 10 and (os.clock() - FLY.freezeLog) > 3 then
             FLY.freezeLog = os.clock()
             local p = root.Position
@@ -819,6 +861,9 @@ if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" 
         oldN = hookmetamethod(game, "__namecall", function(self, ...)
             if HAS_CHECKCALLER and checkcaller() then return oldN(self, ...) end
             if genv.__HAVOC_AP_GEN ~= MY_GEN then return oldN(self, ...) end
+            if FLY.active and self == FLY.hrp and getnamecallmethod() == "PivotTo" then
+                return nil -- seated-character rubber-bands cannot yank the rig
+            end
             if FLY.active and getnamecallmethod() == "Invoke" and self ~= nil and self.Name == "DriveFunction" then
                 local cmd = ...
                 if cmd == "drive-forward" or cmd == "drive-reverse" or cmd == "drive-stop"
@@ -833,6 +878,28 @@ if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" 
         log("drive suppression hook installed")
     else
         warn("[AP] __namecall hook failed - drive loop keeps running while flying")
+    end
+end
+
+-- While flying, the character rides in the seat: if the server-pushed
+-- SpeedUpdate corrector (or anything else) clamps the seated character's
+-- velocity, the seat weld drags the WHOLE rig - that is the "server
+-- teleports back" feel. Drop those writes while flying.
+if type(hookmetamethod) == "function" then
+    local oldW
+    local okW = pcall(function()
+        oldW = hookmetamethod(game, "__newindex", function(self, key, value)
+            if HAS_CHECKCALLER and checkcaller() then return oldW(self, key, value) end
+            if genv.__HAVOC_AP_GEN ~= MY_GEN then return oldW(self, key, value) end
+            if FLY.active and self == FLY.hrp
+                and (key == "AssemblyLinearVelocity" or key == "AssemblyAngularVelocity") then
+                return
+            end
+            return oldW(self, key, value)
+        end)
+    end)
+    if okW then
+        log("seated-character write blocker installed")
     end
 end
 
