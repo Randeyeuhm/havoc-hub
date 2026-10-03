@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    HAVOC HUB - ARMORED PATROL                           ap-v1
+    HAVOC HUB - ARMORED PATROL                         ap-v1.1
     ============================================================
 
     PlaceId 10518166490  ·  GameId 3826087550  ·  loader hands this in
@@ -39,8 +39,14 @@
         • Claim / Release - claim the nearest idle rig (raw "control"
                             request; radius slider), auto-claim, release.
         • Rig Speed       - velocity multiplier while you control a rig.
-        • Rig Fly         - camera-relative hoverflight (WASD / Space /
-                            LeftCtrl) while you control a rig.
+        • Rig Fly         - hoverflight, same recipe as the Oaklands
+                            hovercar: per-frame velocity blend toward a
+                            camera-relative target + gravity comp, level
+                            lock (no tumble, rights a flipped rig) and a
+                            short take-off bump on engage. The rig's own
+                            drive/steer invokes are suppressed while
+                            flying so nothing fights the flight
+                            (WASD / Space / LeftCtrl).
         • Rig -> Camera   - slam your rig (and you) to the freecam-ish
                             camera spot; pinned for a moment, velocities
                             zeroed. Hotkey V.
@@ -66,7 +72,7 @@
     "you actually control that rig".
 ]]
 
-local SCRIPT_VERSION = "ap-v1"
+local SCRIPT_VERSION = "ap-v1.1"
 
 -- ============================================================
 -- SERVICES / GLOBALS
@@ -558,44 +564,98 @@ end
 -- RIG DRIVE: SPEED / FLY / TELEPORT (only while you control a rig)
 -- ============================================================
 local function stepRigDrive()
-    if not (Config.Rig.SpeedOn or Config.Rig.FlyOn) then return end
+    if not Config.Rig.SpeedOn or Config.Rig.FlyOn then return end
     local rig = myRig()
     if not rig then return end
     local chassis = chassisOf(rig)
     if not chassis then return end
+    local v = chassis.AssemblyLinearVelocity
+    local flat = Vector3.new(v.X, 0, v.Z)
+    if flat.Magnitude > 4 then
+        local mult = Config.Rig.SpeedMult
+        local newMag = math.min(flat.Magnitude * mult, 60 * mult)
+        pcall(function()
+            chassis.AssemblyLinearVelocity = flat.Unit * newMag + Vector3.new(0, v.Y, 0)
+        end)
+    end
+end
 
-    if Config.Rig.FlyOn then
-        local cam = Workspace.CurrentCamera
-        if cam then
-            local move = Vector3.zero
-            local cf = cam.CFrame
-            if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += cf.LookVector end
-            if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= cf.LookVector end
-            if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += cf.RightVector end
-            if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= cf.RightVector end
-            local up = 0
-            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then up += 1 end
-            if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then up -= 1 end
-            local speed = Config.Rig.FlySpeed
-            local vel = Vector3.zero
-            if move.Magnitude > 0.01 then vel = move.Unit * speed end
-            vel += Vector3.new(0, up * speed * 0.8, 0)
-            pcall(function() chassis.AssemblyLinearVelocity = vel end)
-        end
-        return -- fly overrides speed while on
+-- Rig Fly (ap-v1.1): hoverflight done the proven way (same recipe as the
+-- Oaklands hovercar, which the user validated): per-frame velocity blend
+-- toward a camera-relative target + gravity compensation so it never
+-- sags between physics steps, a level lock that kills roll/pitch tumble
+-- and rights a flipped rig, and a short take-off bump on engage so the
+-- treads leave the ground instead of dragging. While flying, the rig's
+-- own drive/steer invokes are suppressed (see the __namecall hook in the
+-- aim section) so the game's drive loop cannot fight the flight.
+local FLY = { active = false, rig = nil, liftT = 0 }
+
+local function stepRigFly(dt)
+    if not Config.Rig.FlyOn then
+        FLY.active = false
+        return
+    end
+    local rig = myRig()
+    if not rig then
+        FLY.active = false
+        return
+    end
+    local chassis = chassisOf(rig)
+    if not chassis then
+        FLY.active = false
+        return
+    end
+    if not FLY.active or FLY.rig ~= rig then
+        FLY.active = true
+        FLY.rig = rig
+        FLY.liftT = 0.35
     end
 
-    if Config.Rig.SpeedOn then
-        local v = chassis.AssemblyLinearVelocity
-        local flat = Vector3.new(v.X, 0, v.Z)
-        if flat.Magnitude > 4 then
-            local mult = Config.Rig.SpeedMult
-            local newMag = math.min(flat.Magnitude * mult, 60 * mult)
-            pcall(function()
-                chassis.AssemblyLinearVelocity = flat.Unit * newMag + Vector3.new(0, v.Y, 0)
-            end)
-        end
+    local root = chassis.AssemblyRootPart or chassis
+    local speed = math.clamp(Config.Rig.FlySpeed, 20, 400)
+    local cam = Workspace.CurrentCamera
+    local look = (cam and cam.CFrame.LookVector) or root.CFrame.LookVector
+    local right = (cam and cam.CFrame.RightVector) or root.CFrame.RightVector
+
+    local throttle, strafe, lift = 0, 0, 0
+    pcall(function()
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then throttle += 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then throttle -= 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then strafe += 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then strafe -= 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then lift += 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then lift -= 1 end
+    end)
+
+    local target = look * (throttle * speed) + right * (strafe * speed)
+        + Vector3.new(0, Workspace.Gravity * (dt or 0), 0)
+    if lift > 0 then
+        target += Vector3.new(0, speed, 0)
+    elseif lift < 0 then
+        target -= Vector3.new(0, speed, 0)
     end
+    if FLY.liftT > 0 then
+        FLY.liftT = FLY.liftT - (dt or 0)
+        target += Vector3.new(0, speed * 0.9, 0)
+    end
+
+    local v = root.AssemblyLinearVelocity
+    root.AssemblyLinearVelocity = v + (target - v) * 0.35
+
+    -- level lock: kill roll/pitch tumble, right the rig if flipped
+    local up = root.CFrame.UpVector
+    local d = math.clamp(up:Dot(Vector3.new(0, 1, 0)), -1, 1)
+    local axis = up:Cross(Vector3.new(0, 1, 0))
+    if d < -0.98 then
+        axis = root.CFrame.RightVector
+    elseif axis.Magnitude < 1e-4 then
+        axis = Vector3.new()
+    else
+        axis = axis.Unit
+    end
+    local corr = math.min(math.acos(d) * 6, 12)
+    local av = root.AssemblyAngularVelocity
+    root.AssemblyAngularVelocity = Vector3.new(0, av.Y * 0.7, 0) + axis * corr
 end
 
 local rigTpBusy = false
@@ -675,6 +735,33 @@ if type(hookmetamethod) == "function" then
     log("mouse UnitRay redirect installed")
 else
     warn("[AP] hookmetamethod unavailable - aim assist disabled")
+end
+
+-- Rig Fly support: while flying, drop the rig's own drive/steer invokes
+-- (BindableFunction "DriveFunction" -> "drive-forward", "steer", ...) so
+-- the local drive loop cannot fight the flight. "hello", "unseat" and
+-- everything else passes straight through.
+if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
+    local oldN
+    local okN = pcall(function()
+        oldN = hookmetamethod(game, "__namecall", function(self, ...)
+            if HAS_CHECKCALLER and checkcaller() then return oldN(self, ...) end
+            if genv.__HAVOC_AP_GEN ~= MY_GEN then return oldN(self, ...) end
+            if FLY.active and getnamecallmethod() == "Invoke" and self ~= nil and self.Name == "DriveFunction" then
+                local cmd = ...
+                if cmd == "drive-forward" or cmd == "drive-reverse" or cmd == "drive-stop"
+                    or cmd == "drive-forward-incr" or cmd == "drive-reverse-incr" or cmd == "steer" then
+                    return nil
+                end
+            end
+            return oldN(self, ...)
+        end)
+    end)
+    if okN then
+        log("drive suppression hook installed")
+    else
+        warn("[AP] __namecall hook failed - drive loop keeps running while flying")
+    end
 end
 
 local function aimWanted()
@@ -1165,8 +1252,6 @@ local aimFirstAccum = 0
 
 track(RunService.Heartbeat:Connect(function(dt)
     if genv.__HAVOC_AP_GEN ~= MY_GEN then return end
-    pcall(stepRigDrive)
-
     claimAccum = claimAccum + dt
     if claimAccum >= 3 then
         claimAccum = 0
@@ -1192,6 +1277,8 @@ end))
 
 track(RunService.RenderStepped:Connect(function(dt)
     if genv.__HAVOC_AP_GEN ~= MY_GEN then return end
+    pcall(stepRigDrive)
+    pcall(stepRigFly, dt)
     pcall(scanAim)
     pcall(stepAutoFire)
     pcall(updateFovCircle)
