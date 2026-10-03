@@ -158,18 +158,32 @@
                            loaded.
       • Anti-AFK.
 
-    Notes from recon (why no damage/speed/inventory hacks):
-      • Every gameplay action flows through ByteNetMax packets the SERVER
-        validates; the interesting ones (SpawnItem etc) are dev-gated.
-      • The client has self-reporting anti-cheat ("HAX" remote): it reports
-        module-loader misuse from C contexts, stamina over baseline+50, and
-        breath over 150. This script no longer calls the game's client
-        framework at all - nothing here can trip those.
+    Notes from recon (anti-cheat map - why most hacks stay client-side):
+      • Server validation is the real anti-cheat: every gameplay action
+        flows through packets the SERVER validates, and the devs pull
+        "logs of what you tried to execute" when bans get appealed -
+        attempts themselves get logged. 0 server scripts exist in the
+        dump - every server check is invisible from here.
+      • Client self-reporting anti-cheat ("HAX" RemoteEvent): codes seen
+        = 3/4 (client framework called from C/nil contexts), 5 (breath
+        over 150), 6 (stamina over baseline+50). Never let a feature
+        trip those. Up to oak-v29.24 nothing here called the client
+        framework; the oak-v29.25 Test tab's packet tier does
+        (TellServer/AskServer) - that tier is the only part touching it.
+      • _Types (11KB, Ception-VM obfuscated) runs at the start of EVERY
+        TellServer/AskServer/CreateKeyHash and fires canary packets -
+        treat all packet sends as passing an unauditable gate; prefer
+        game-module send paths (InformServer etc.) over raw sends.
+      • _Key (61KB, obfuscated) derives the per-server remote names from
+        the INF key handshake - remote names are hashed, not static.
+      • Client errors get funneled to TestService:Error (dev-visible).
+      • Public record (oaklands-feedback repo): permanent bans + ALT
+        bans; appeals only via the devs on Discord; devs verify from
+        logs before anyone gets unbanned.
       • No getenv tripwire in this game (checked - zero hits).
       • Removed so far: Auto Chop (oak-v2 - crashed + valid channel),
         experimental movement (oak-v2 - bans), Infinite Stamina (oak-v4 -
-        detected + crashed). Nothing here sends packets or writes
-        server-checked values anymore.
+        detected + crashed). Server-watched values stay untouched.
 
     Re-run safe: old loops die via the genv generation token, old UI and
     old ESP labels are cleaned up on boot.
